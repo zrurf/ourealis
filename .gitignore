@@ -1,0 +1,10 @@
+/target
+/data
+.tmp/
+
+.idea/
+.vscode/
+
+.env
+
+dev-notes/
