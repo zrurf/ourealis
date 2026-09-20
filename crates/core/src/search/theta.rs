@@ -235,10 +235,12 @@ impl<'a, 'g> ThetaStar<'a, 'g> {
             if !closed.insert(current) {
                 continue;
             }
-            expanded += 1;
-            if expanded > self.config.max_expansions {
+            // The budget counts expansions, so it is checked before the node is
+            // expanded: `max_expansions = 1` must expand one node, not two.
+            if expanded >= self.config.max_expansions {
                 break;
             }
+            expanded += 1;
 
             // Lazy line-of-sight repair: if the incoming shortcut is blocked,
             // fall back to the best visited neighbour, which is what makes the

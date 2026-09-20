@@ -59,6 +59,14 @@ pub fn channel_encode(
             "channel delta needs at least two channels; use another codec",
         ));
     }
+    // Bit-packed chunks pad every row to a byte boundary, so one cell's packed
+    // bytes are not `channels * element_size` apart; the stride below would walk
+    // past the payload.
+    if shape.is_bit_packed() {
+        return Err(MapError::invalid(
+            "channel delta is not defined for bit-packed chunks; use run-length coding",
+        ));
+    }
     let elem = shape.dtype.element_size();
     let mut out = payload.to_vec();
     let cells = shape.width as usize * shape.height as usize;
@@ -84,6 +92,13 @@ pub fn channel_decode(
     if shape.channels < 2 {
         return Err(MapError::invalid(
             "channel delta needs at least two channels; use another codec",
+        ));
+    }
+    // See `channel_encode`: the cell stride below is only valid for a dense
+    // layout, and a crafted header must not be able to drive it out of bounds.
+    if shape.is_bit_packed() {
+        return Err(MapError::invalid(
+            "channel delta is not defined for bit-packed chunks; use run-length coding",
         ));
     }
     let elem = shape.dtype.element_size();

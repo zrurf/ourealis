@@ -134,6 +134,17 @@ impl LayerKind {
             _ => None,
         }
     }
+
+    /// Name used in diagnostics.
+    pub const fn name(self) -> &'static str {
+        match self {
+            LayerKind::Raster => "raster",
+            LayerKind::Vector => "vector",
+            LayerKind::Graph => "graph",
+            LayerKind::Bitmap => "bitmap",
+            LayerKind::RegionPolygons => "region",
+        }
+    }
 }
 
 /// Element type of a raster channel.

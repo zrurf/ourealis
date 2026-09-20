@@ -424,29 +424,9 @@ impl Simulator {
         // timeline level: the profile, the noise processes and the bounce phase
         // then continue across the seam with no special case, which is exactly
         // the continuity the design asks for.
-        // A reversal needs to be a zero-speed point: the forward-backward sweep
-        // then produces the deceleration into it and the acceleration out of it,
-        // instead of the runner arriving at speed and stopping instantly for the
-        // turn.
-        if let PlanMode::Standard(_) | PlanMode::Dynamic { .. } = &self.mode {
-            for candidate in crate::motion::maneuvers::detect_turns(
-                &route.path,
-                motion_config.maneuver.turn_window_m,
-                motion_config.maneuver.turn_angle_deg,
-            ) {
-                motion_config
-                    .profile
-                    .stops
-                    .push(crate::motion::profile::StopHold {
-                        s: candidate.s,
-                        duration_s: 0.0,
-                    });
-            }
-            motion_config
-                .profile
-                .stops
-                .sort_by(|a, b| a.s.partial_cmp(&b.s).unwrap_or(std::cmp::Ordering::Equal));
-        }
+        // Reversals get their zero-speed point from the motion stage itself
+        // (`Trajectory::build`), which covers every planning mode and keeps the
+        // pivot arc equal to the arc the profile brakes to.
 
         let route = match &self.mode {
             PlanMode::Loop(request) if request.laps > 1 => {
@@ -624,26 +604,13 @@ impl Simulator {
                         .clamp(0.0, output.trajectory.duration_s()),
                 )
                 .map(|sample| sample.speed);
-            // A reversal on the new leg needs the same zero-speed point the
-            // initial route gets in `finish_run`; without it the runner arrives at
-            // the turn at full speed and stops in a single sample.
-            for candidate in crate::motion::maneuvers::detect_turns(
-                &new_route.path,
-                motion_config.maneuver.turn_window_m,
-                motion_config.maneuver.turn_angle_deg,
-            ) {
-                motion_config
-                    .profile
-                    .stops
-                    .push(crate::motion::profile::StopHold {
-                        s: candidate.s,
-                        duration_s: 0.0,
-                    });
-            }
-            motion_config
-                .profile
-                .stops
-                .sort_by(|a, b| a.s.partial_cmp(&b.s).unwrap_or(std::cmp::Ordering::Equal));
+            // Reversals on the new leg register their own zero-speed points in the
+            // motion stage, so nothing is added here.
+            // The replacement runs with the individual's own index: the step phase
+            // is per-individual and shared by the bounce, the accelerometer
+            // harmonic and the gyroscope, so perturbing it here would put the
+            // accelerometer of the whole recording out of phase with the height
+            // that the barometer sees.
             let replacement = Trajectory::build_with_backend(
                 connector_lift::lift_connector_elevations(
                     &new_route.path,
@@ -656,7 +623,7 @@ impl Simulator {
                 &self.person,
                 &motion_config,
                 self.seed,
-                self.individual ^ 0xA5A5,
+                self.individual,
                 self.batch_backend(backend.as_deref()),
             )?;
             let blended = dynamic::blend_trajectories(
@@ -664,6 +631,7 @@ impl Simulator {
                 &replacement,
                 checkpoint.issued_at_s,
                 self.config.dynamic.blend_window_s,
+                &environment.hard,
             )?;
             let bundle = sensor::generate(
                 &blended,

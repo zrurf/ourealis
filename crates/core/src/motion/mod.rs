@@ -250,6 +250,31 @@ impl Trajectory {
         config.adapt_to(person);
         person.validate()?;
 
+        // Every reversal has to be a zero-speed point of the profile, whatever
+        // planning mode produced the path: the forward-backward sweep then brakes
+        // into the pivot and accelerates out of it, instead of the runner arriving
+        // at speed and freezing for the turn. Registering here rather than in the
+        // callers keeps the profile and the maneuver list in one place, so the two
+        // cannot disagree about where the reversal is.
+        if config.maneuver.enabled {
+            for candidate in maneuvers::detect_turns(
+                &path,
+                config.maneuver.turn_window_m,
+                config.maneuver.turn_angle_deg,
+            ) {
+                config.profile.stops.push(StopHold {
+                    s: candidate.s,
+                    duration_s: 0.0,
+                });
+            }
+        }
+        // The timeline consumes the stops in order and clamps each step to the next
+        // one, so they must be sorted whatever order the caller supplied.
+        config
+            .profile
+            .stops
+            .sort_by(|a, b| a.s.partial_cmp(&b.s).unwrap_or(std::cmp::Ordering::Equal));
+
         // Pace drift: the intended pace wanders slowly, which is what makes two
         // laps differ and gives the speed residual its Ornstein-Uhlenbeck colour
         // rather than a deterministic trend. The process is indexed by elapsed
@@ -296,6 +321,27 @@ impl Trajectory {
 
         let mut maneuver_rng = Rng::stream(seed, Stream::Maneuver, individual, 0);
         let maneuvers = maneuvers::schedule(&path, &config.maneuver, &mut maneuver_rng);
+        // The profile can only stop on its own sample grid, so the pivot is moved
+        // to the arc the profile actually brakes to. Turning at the detection arc
+        // instead leaves up to one sample spacing of acceleration between the stop
+        // and the pivot, which the turn then cancels in a single sample.
+        let maneuvers: Vec<Maneuver> = maneuvers
+            .into_iter()
+            .map(|maneuver| match maneuver {
+                Maneuver::Turn {
+                    arc_s,
+                    position,
+                    exit_heading,
+                    profile: turn_profile,
+                } => Maneuver::Turn {
+                    arc_s: profile.stop_arc_near(arc_s).unwrap_or(arc_s),
+                    position,
+                    exit_heading,
+                    profile: turn_profile,
+                },
+                other => other,
+            })
+            .collect();
 
         let laps = config.loop_laps.max(1);
         let lap_length = if laps > 1 {
@@ -405,7 +451,13 @@ impl Trajectory {
     }
 
     /// Samples of a time window.
+    ///
+    /// An inverted range yields an empty slice rather than a panic: the bounds come
+    /// from the caller, and a window that ends before it starts holds no samples.
     pub fn window(&self, from_s: f64, to_s: f64) -> &[TrajectorySample] {
+        if from_s > to_s {
+            return &[];
+        }
         let start = self
             .samples
             .partition_point(|sample| sample.time_s < from_s);
@@ -499,6 +551,7 @@ fn assemble_timeline(
         for _ in 0..steps {
             samples.push(standing_sample(
                 time,
+                0.0,
                 stand_position,
                 *position,
                 stand_z,
@@ -799,6 +852,38 @@ fn assemble_timeline(
         time += dt;
     }
 
+    // A stop registered at the very end of the path is never reached by the walk
+    // above: the last step is clamped to the remaining length, so the arc lands on
+    // the total length and the loop exits before the stop check can run at that
+    // arc. Its hold is emitted here instead — otherwise a requested dwell at the
+    // goal was silently dropped while the profile still counted its duration.
+    while let Some(stop) = profile.stops.get(next_stop).copied()
+        && (stop.s - total_length).abs() <= 1e-9
+    {
+        let dwell_steps = (stop.duration_s / dt).round().max(1.0) as usize;
+        if let Some(base) = samples.last().copied() {
+            for _ in 0..dwell_steps {
+                time += dt;
+                let mut held = base;
+                held.time_s = time;
+                held.standing = true;
+                held.speed = 0.0;
+                held.bounce_z = 0.0;
+                held.z = base.terrain_z;
+                samples.push(held);
+                attitude_inputs.push(attitude::AttitudeInput {
+                    time_s: time,
+                    tangent_angle: held.tangent_angle,
+                    grade: held.grade,
+                    kappa_eff: held.kappa_eff,
+                    speed: 0.0,
+                    turning: false,
+                });
+            }
+        }
+        next_stop += 1;
+    }
+
     // Standing end.
     if let Some(Maneuver::StandEnd {
         duration_s,
@@ -817,6 +902,7 @@ fn assemble_timeline(
         for _ in 0..steps {
             samples.push(standing_sample(
                 time,
+                total_length,
                 stand_position,
                 *position,
                 z,
@@ -1325,12 +1411,16 @@ fn apply_turns(
         let centre = base.center;
         let offset = base.offset_m;
         let magnitude = offset.abs();
+        // A negative offset puts the runner on the body's right; the legality of a
+        // magnitude is only meaningful on the side actually occupied, so every probe
+        // below runs along the mirrored normal.
+        let side = if offset < 0.0 { -1.0 } else { 1.0 };
 
         // Largest magnitude legal in every direction the body passes through.
         let mut floor = magnitude;
         for angle in &render.angles {
             let heading = base.tangent_angle + angle;
-            let normal = crate::math::left_normal(crate::math::dir_of(heading));
+            let normal = crate::math::left_normal(crate::math::dir_of(heading)) * side;
             floor = floor.min(legal_limit(centre, normal, magnitude));
         }
 
@@ -1348,7 +1438,7 @@ fn apply_turns(
             let normal = crate::math::left_normal(crate::math::dir_of(heading));
             let shape = 1.0 - (2.0 * step as f64 / span - 1.0).abs();
             let wanted = magnitude + (floor - magnitude) * shape;
-            applied = legal_limit(centre, normal, wanted).min(wanted) * offset.signum();
+            applied = legal_limit(centre, normal * side, wanted).min(wanted) * side;
             let sample = &mut samples[index];
             sample.heading = heading;
             sample.tangent_angle = heading;
@@ -1426,6 +1516,7 @@ fn offset_at(offsets: &[OffsetSample], arc: f64) -> OffsetSample {
 
 fn standing_sample(
     time: f64,
+    arc_s: f64,
     position: DVec2,
     center: DVec2,
     z: f64,
@@ -1434,7 +1525,7 @@ fn standing_sample(
 ) -> TrajectorySample {
     TrajectorySample {
         time_s: time,
-        arc_s: 0.0,
+        arc_s,
         position,
         center,
         terrain_z: z,

@@ -758,3 +758,21 @@ fn the_ks_p_value_does_not_invert_at_small_deviations() {
         "a statistic this small is not evidence of anything, got {small}"
     );
 }
+
+#[test]
+fn the_ks_statistic_ignores_non_finite_samples() {
+    // The merge advances by comparing against the smaller of the two current values,
+    // and every comparison against a NaN is false — so one NaN in each series at the
+    // same position leaves both indices standing still and the loop never ends.
+    // Non-finite samples carry no distributional information and are dropped.
+    let a = [1.0, f64::NAN, 3.0, 5.0, f64::INFINITY];
+    let b = [1.0, f64::NAN, f64::NEG_INFINITY, 4.0, 6.0];
+    let d = eval::ks_statistic(&a, &b);
+    assert!(
+        d.is_finite() && (0.0..=1.0).contains(&d),
+        "expected a usable statistic, got {d}"
+    );
+
+    // With nothing finite left there is no distribution to compare.
+    assert_eq!(eval::ks_statistic(&[f64::NAN], &[1.0]), 1.0);
+}

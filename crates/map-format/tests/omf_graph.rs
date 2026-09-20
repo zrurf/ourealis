@@ -242,6 +242,40 @@ fn region_lookup_and_loss_probability() {
 }
 
 #[test]
+fn an_outline_whose_spatial_index_would_explode_is_rejected() {
+    // The bucket index is a nested loop over the outline's extent, so an extent of
+    // continental scale would hang the loader. Such an outline is rejected outright.
+    let feature = RegionFeature {
+        tag_id: RegionTag::HighRise as u16,
+        geom_ref: 0,
+        p_mp: 0.5,
+        mp_bias_m: 10.0,
+        p_loss: 0.0,
+        mp_mode: TriggerMode::Probabilistic,
+    };
+    let huge = vec![
+        [-1.0e9, -1.0e9],
+        [1.0e9, -1.0e9],
+        [1.0e9, 1.0e9],
+        [-1.0e9, 1.0e9],
+    ];
+    match RegionSet::new(vec![feature], vec![huge]) {
+        Err(MapError::Invalid(reason)) => {
+            assert!(
+                reason.contains("spatial-index buckets"),
+                "unexpected rejection reason: {reason}"
+            );
+        }
+        other => panic!("an unbounded outline must be rejected, got {other:?}"),
+    }
+
+    // Non-finite coordinates are rejected before the bounds are computed, because
+    // they make the bucket arithmetic meaningless.
+    let nan = vec![[f32::NAN, 0.0], [1.0, 0.0], [1.0, 1.0]];
+    assert!(RegionSet::new(vec![feature], vec![nan]).is_err());
+}
+
+#[test]
 fn deterministic_events_repeat_for_the_same_seed() {
     let first = spatial_event(42, 3, 0, 0.5);
     let second = spatial_event(42, 3, 0, 0.5);

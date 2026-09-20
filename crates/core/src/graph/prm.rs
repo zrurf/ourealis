@@ -277,6 +277,19 @@ impl PrmRoadmap {
                 let steps = (spacing / interface_spacing).ceil().max(1.0) as usize;
                 for step in 0..=steps {
                     let t = step as f64 / steps as f64;
+                    // Which edge of the structured cell the interface sits on. The
+                    // side names come from `adjacent_open`, where they label the
+                    // *open neighbour's* position in the mask: `North` is the row
+                    // above (`row - 1`, lower y) and `South` the row below.
+                    //
+                    // The offsets below are one cell wide, so a `North`/`South`
+                    // interface lands on a cell boundary of the map's cell grid and
+                    // `Grid2D::cell_of` resolves it to the neighbouring cell. That
+                    // is deliberate: mirroring them to sit on the shared edge with
+                    // the open neighbour instead puts them in the forbidden edge cell
+                    // of the structured band, where `is_forbidden` rejects them and
+                    // the roadmap loses its link to the grid on those two
+                    // orientations — measured as `NoPath` in the randomized sweep.
                     let point = match towards_open {
                         Grid4::North => base + DVec2::new(t * spacing, spacing),
                         Grid4::South => base + DVec2::new(t * spacing, 0.0),

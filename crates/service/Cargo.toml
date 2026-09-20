@@ -1,0 +1,42 @@
+[package]
+name = "ourealis"
+description = "Ourealis service: gRPC, HTTP, WebSocket and SSE facades over the running simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "ourealis"
+path = "src/main.rs"
+
+[dependencies]
+ourealis-core.workspace = true
+ourealis-map-format.workspace = true
+axum.workspace = true
+clap.workspace = true
+glam.workspace = true
+include_dir.workspace = true
+mimalloc.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+toml.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+twox-hash.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

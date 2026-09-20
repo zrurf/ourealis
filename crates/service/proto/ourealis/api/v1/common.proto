@@ -1,0 +1,34 @@
+// Shared value types for the Ourealis API.
+//
+// The gRPC surface mirrors the HTTP JSON API: the same logical resource is
+// returned by both facades, and the field names here match the JSON field names
+// one for one. Structures that the web client only inspects (a map's full
+// metadata tree, the evaluation report) travel as a JSON payload instead of a
+// hand-written message tree; those fields are marked in the comments.
+
+syntax = "proto3";
+
+package ourealis.api.v1;
+
+// An empty request or reply.
+message Empty {}
+
+// A point or vector in the map's local metre plane.
+message Vec2 {
+  double x = 1;
+  double y = 2;
+}
+
+// An axis-aligned bounding box in the local metre plane.
+message Aabb {
+  double min_x = 1;
+  double min_y = 2;
+  double max_x = 3;
+  double max_y = 4;
+}
+
+// Health of the service process.
+message HealthReply {
+  // "ok" while the process serves requests.
+  string status = 1;
+}

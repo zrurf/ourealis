@@ -1,0 +1,132 @@
+@import 'tailwindcss';
+@import './theme.css';
+
+/* The theme store toggles this class on <html>; tdesign keys off `theme-mode` on the same element. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Explicit sources keep the scan inside this package instead of walking up into the Rust workspace. */
+@source '../**/*.vue';
+@source '../**/*.ts';
+
+/*
+ * Semantic names only; the values come from theme.css so a component never
+ * carries a colour literal. `inline` makes the utilities expand to the
+ * `--ourealis-*` variable, which is what re-resolves under the dark tokens.
+ */
+@theme inline {
+  --color-page: var(--ourealis-page);
+  --color-surface: var(--ourealis-surface);
+  --color-line: var(--ourealis-line);
+  --color-ink: var(--ourealis-ink);
+  --color-muted: var(--ourealis-muted);
+  --color-brand: var(--ourealis-brand);
+  --color-success: var(--ourealis-success);
+  --color-warning: var(--ourealis-warning);
+  --color-danger: var(--ourealis-danger);
+
+  --font-sans:
+    -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei',
+    sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Code', Consolas, monospace;
+
+  --radius-control: 6px;
+  --radius-card: 10px;
+}
+
+@layer base {
+  html,
+  body {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--ourealis-page);
+    color: var(--ourealis-ink);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1 {
+    font-size: 24px;
+    line-height: 1.3;
+  }
+
+  h2 {
+    font-size: 20px;
+    line-height: 1.3;
+  }
+
+  /* Motion is limited to short state transitions and yields to the OS setting. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+/*
+ * Spacing written on a tdesign root.
+ *
+ * Every tdesign component resets its own box (`.t-alert`, `.t-card`, `.t-progress`
+ * and `.t-radio-group` declare `margin: 0`; `.t-select__wrap` and `.t-input-number`
+ * declare their own width) and tdesign's sheets are code-split, so they reach the
+ * document after this file. Order therefore decides between two declarations of
+ * equal specificity, and the utility always loses: `<TAlert class="mt-4">` and
+ * `<TCard class="mt-6">` render glued to whatever precedes them, and a width class
+ * on a `<TSelect>` never applies.
+ *
+ * Each rule below restates one pair the views ask for, with the component class in
+ * front so the reset cannot win. A new pair has to be added here: a utility on a
+ * tdesign root cannot take effect from the call site.
+ */
+.t-alert.m-4 {
+  margin: calc(var(--spacing) * 4);
+}
+
+.t-alert.mt-2,
+.t-progress.mt-2,
+.t-radio-group.mt-2 {
+  margin-top: calc(var(--spacing) * 2);
+}
+
+.t-alert.mt-3 {
+  margin-top: calc(var(--spacing) * 3);
+}
+
+.t-alert.mt-4,
+.t-card.mt-4 {
+  margin-top: calc(var(--spacing) * 4);
+}
+
+.t-card.mt-6 {
+  margin-top: calc(var(--spacing) * 6);
+}
+
+.t-radio-group.mt-1 {
+  margin-top: calc(var(--spacing) * 1);
+}
+
+.t-divider.my-3 {
+  margin: calc(var(--spacing) * 3) 0;
+}
+
+.t-divider.my-4 {
+  margin: calc(var(--spacing) * 4) 0;
+}
+
+.t-select__wrap.w-24,
+.t-input-number.w-24 {
+  width: calc(var(--spacing) * 24);
+}
+
+.t-select__wrap.w-32,
+.t-input-number.w-32 {
+  width: calc(var(--spacing) * 32);
+}

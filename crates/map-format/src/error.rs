@@ -85,6 +85,15 @@ pub enum MapError {
     #[error("derived layer {layer_id:#06x} is stale and must be rebuilt: {reason}")]
     StaleDerived { layer_id: u16, reason: String },
 
+    /// A cell-shaped read was asked of a layer that stores one opaque payload.
+    ///
+    /// Regions, vectors and graphs have no grid: asking for their chunk would derive
+    /// a shape from the chunk grid and compare it against the section bytes, which
+    /// reads as corruption. Naming it keeps the caller's mistake distinguishable from
+    /// a damaged file.
+    #[error("layer {layer_id:#06x} is not a cell layer but a {kind} one")]
+    NotACellLayer { layer_id: u16, kind: &'static str },
+
     /// Patch was produced for a different base file.
     #[error("patch base hash {patch:#018x} does not match base file {base:#018x}")]
     PatchBaseMismatch { patch: u64, base: u64 },

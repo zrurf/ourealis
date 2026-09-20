@@ -1,0 +1,177 @@
+// Map library and OMF inspection.
+
+syntax = "proto3";
+
+package ourealis.api.v1;
+
+import "ourealis/api/v1/common.proto";
+
+// One map in the library.
+message MapSummary {
+  // Server-assigned identifier, stable for the lifetime of the entry.
+  string id = 1;
+  // Human-readable name: the map's own name when it carries one, otherwise the
+  // name given at import.
+  string name = 2;
+  // Map extent in the local metre plane.
+  Aabb bounds = 3;
+  // Finest resolution, metres per cell.
+  double base_res_m = 4;
+  // Chunk side length in cells.
+  uint32 chunk_size = 5;
+  // Declared LOD level count.
+  uint32 lod_count = 6;
+  // Number of resistance feature dimensions.
+  uint32 feature_dim = 7;
+  // Number of registered layers.
+  uint32 layer_count = 8;
+  // How the map entered the library: "import", "synthetic" or "inline".
+  string source = 9;
+  // Creation time of the library entry, Unix milliseconds.
+  int64 created_at_unix_ms = 10;
+  // Size of the OMF image in bytes.
+  uint64 size_bytes = 11;
+}
+
+// Full metadata of one map.
+message MapMetadata {
+  // Library entry.
+  MapSummary summary = 1;
+  // Header fields as a JSON object, keys are the header field names.
+  string header_json = 2;
+  // Map information record as JSON, when the file carries one.
+  string map_info_json = 3;
+  // Feature schema as JSON, when the file carries one.
+  string feature_schema_json = 4;
+  // Registered layer descriptors as JSON.
+  string layers_json = 5;
+  // Global statistics as JSON, when the file carries them.
+  string global_stats_json = 6;
+  // Counts of the optional sections, all zero when the section is absent.
+  uint32 connector_count = 7;
+  uint32 region_count = 8;
+  uint32 vector_count = 9;
+  uint32 skeleton_node_count = 10;
+  // Whether the file carries each optional section.
+  bool has_prm = 11;
+  bool has_kpath_library = 12;
+  bool has_magnetic_field = 13;
+}
+
+// Request for a page of the map library.
+message ListMapsRequest {
+  uint32 offset = 1;
+  uint32 limit = 2;
+}
+
+message ListMapsReply {
+  repeated MapSummary items = 1;
+  uint32 total = 2;
+}
+
+message GetMapRequest {
+  string id = 1;
+}
+
+message DeleteMapRequest {
+  string id = 1;
+}
+
+// One chunk of an uploaded OMF image.
+message ImportChunk {
+  // Name to register the map under, sent with the first chunk.
+  string name = 1;
+  // A slice of the image; the upload ends when the client closes the stream.
+  bytes data = 2;
+}
+
+message ChunkRequest {
+  string map_id = 1;
+  // Layer id in the file's numbering, for example 0x1002.
+  uint32 layer_id = 2;
+  uint32 level = 3;
+  uint32 chunk_id = 4;
+}
+
+// One raster chunk.
+message ChunkReply {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 channels = 3;
+  // Element type of the stored payload.
+  string dtype = 4;
+  // Quantisation contract: real = raw * scale + bias.
+  double scale = 5;
+  double bias = 6;
+  // Dequantised samples in channel-contiguous order `[y][x][channel]`.
+  repeated float data = 7;
+}
+
+// Geometry of a raster layer plus the chunks it actually stores.
+message LayerGridReply {
+  uint32 layer_id = 1;
+  // Cell size at each level, metres, indexed by level.
+  repeated double level_res_m = 2;
+  // Cell dimensions at each level: `2 * levels` values, `(x, y)` pairs.
+  repeated uint32 level_dims = 3;
+  // Chunk grid dimensions at level 0.
+  uint32 chunk_dim_x = 4;
+  uint32 chunk_dim_y = 5;
+  // Levels present in the file and the chunk ids stored at each, as JSON
+  // `{"<level>":[chunk_id, ...]}`.
+  string chunks_json = 6;
+}
+
+// The quadtree skeleton, as JSON.
+message SkeletonReply {
+  string nodes_json = 1;
+}
+
+// Regions, connectors, vectors or the roadmap graph of a map, as JSON. The
+// structure-heavy optional sections are passed through as JSON because the web
+// client renders them directly and a hand-written message tree would duplicate
+// the map-format definitions without adding type safety at the boundary.
+message SectionReply {
+  string json = 1;
+}
+
+// Result of inspecting an OMF image.
+message InspectReply {
+  // Structure tree of the image as JSON: header, footer, metadata records,
+  // directory, layers, skeleton, fingerprints and patch availability.
+  string structure_json = 1;
+}
+
+// An edit to apply to an OMF image.
+message EditRequest {
+  // The image to edit.
+  bytes image = 1;
+  // The edit script as JSON, matching the HTTP request body.
+  string edits_json = 2;
+}
+
+message ImageReply {
+  bytes image = 1;
+}
+
+service MapService {
+  rpc List(ListMapsRequest) returns (ListMapsReply);
+  rpc Get(GetMapRequest) returns (MapMetadata);
+  // Imports an OMF image; the client streams the bytes.
+  rpc Import(stream ImportChunk) returns (MapSummary);
+  rpc Delete(DeleteMapRequest) returns (Empty);
+  rpc Chunk(ChunkRequest) returns (ChunkReply);
+  rpc LayerGrid(ChunkRequest) returns (LayerGridReply);
+  rpc Skeleton(GetMapRequest) returns (SkeletonReply);
+  // Regions, connectors, vectors or the roadmap graph; `ChunkRequest.layer_id`
+  // selects which one is not used here — every section is returned by its own
+  // call below.
+  rpc Regions(GetMapRequest) returns (SectionReply);
+  rpc Connectors(GetMapRequest) returns (SectionReply);
+  rpc Vectors(GetMapRequest) returns (SectionReply);
+  rpc Roadmap(GetMapRequest) returns (SectionReply);
+  // Structure tree of an OMF image without importing it.
+  rpc Inspect(EditRequest) returns (InspectReply);
+  // Applies an edit script and returns the new image.
+  rpc Edit(EditRequest) returns (ImageReply);
+}

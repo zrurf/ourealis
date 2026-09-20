@@ -31,9 +31,12 @@ Ourealis 在静态地图上模拟人类跑步轨迹，以及由这些轨迹派�
 |---|---|
 | `ourealis-map-format` | OMF 静态地图容器：读取器、写入器、构建器、编码器、指纹、补丁。 |
 | `ourealis-core` | 模拟器：环境、规划、运动学、传感器、评价、计算后端。 |
+| `ourealis` | 服务层：配置、作业队列，以及在模拟器之上暴露的 gRPC / HTTP / WebSocket / SSE 门面；Web 界面内嵌在二进制中。 |
 
 依赖单向：`ourealis-core` 通过 `ourealis-map-format` 读地图，反向不存在依赖。地图工具可以只依赖
-格式 crate 构建。
+格式 crate 构建。`ourealis` 是唯一感知网络的 crate，且不向上游两个 crate 添加任何依赖。
+
+前端位于 `web/`（Vite、Vue、TypeScript、tdesign、BabylonJS），由服务 crate 的构建脚本编译进二进制。
 
 ## 快速开始
 
@@ -106,6 +109,43 @@ flowchart LR
 成本场合成、批量噪声生成与批量约束查询各有一个 wgpu 实现与一个 rayon 实现。CPU 实现是语义参考，
 始终可用；`Backend::Auto` 在存在适配器时使用 GPU，否则告警并降级。图搜索本身留在 CPU：节点扩展
 存在严重分支依赖，GPU 化没有收益。`tests/gpu_cpu.rs` 比对两条路径，无适配器时自行跳过。
+
+## 服务与 Web 界面
+
+```bash
+# 前端首次安装依赖，其余交给 Cargo。
+pnpm --dir web install --frozen-lockfile
+cargo build --release -p ourealis          # build.rs 执行 Vite 构建并把 web/dist 内嵌进二进制
+
+./target/release/ourealis                   # 读取二进制同目录的 config.toml
+./target/release/ourealis --config dev.toml --print-config
+./target/release/ourealis --log debug
+```
+
+服务只读一个 TOML 文件，并独立启用三个门面：
+
+| 门面 | 开关 | 承载 |
+|---|---|---|
+| RPC | `server.rpc_enabled` | gRPC，包名 `ourealis.api.v1` |
+| HTTP | `server.http_enabled` | `/api/v1` 下的 REST，外加 WebSocket 与 SSE |
+| Web | `server.web_enabled` | 内嵌的单页应用（要求 HTTP 启用） |
+
+所有 HTTP API 路由位于 `/api/v1`；页面挂在 `/`。两个门面默认只监听回环地址，因此默认配置不会暴露到网络。
+浏览器打开 HTTP 地址即可看到界面——不需要单独部署前端，也不必担心页面与它调用的 API 版本错位，
+因为两者在同一次构建、同一个二进制里。
+
+开发期用热更新跑前端，并把 API 代理到服务：
+
+```bash
+pnpm --dir web dev                          # http://localhost:5173，/api 代理到 :8080
+cargo run -p ourealis -- --config web/tests/fixtures/service.toml
+```
+
+前端检查命令：`pnpm --dir web run typecheck`、`run lint`、`run format:check`、`run build`、
+`run test:unit`、`run test:e2e`、`run test:fuzz`、`run test:monkey`。
+
+环境变量：`OUREALIS_CONFIG`（配置路径）、`OUREALIS_SKIP_WEB=1`（跳过前端构建）、
+`OUREALIS_REQUIRE_WEB=1`（前端构建失败时直接报错，而不是内嵌占位页）、`OUREALIS_PNPM`（pnpm 可执行文件）、`RUST_LOG`。
 
 ## 测试
 

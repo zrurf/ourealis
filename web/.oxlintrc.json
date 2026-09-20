@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint", "typescript", "unicorn", "oxc", "import", "promise", "vue"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "env": {
+    "builtin": true,
+    "browser": true,
+    "node": true
+  },
+  "ignorePatterns": ["dist/**", "node_modules/**", "test-results/**", "playwright-report/**"],
+  "rules": {
+    "no-console": "off"
+  },
+  "overrides": [
+    {
+      "files": ["**/*.ts", "**/*.vue"],
+      "rules": { "import/no-unassigned-import": ["error", { "allow": ["**/*.css"] }] }
+    },
+    {
+      // The monkey lane checks its invariants after every step, so its awaits are sequential by design.
+      "files": ["tests/**/*.ts"],
+      "rules": { "no-await-in-loop": "off" }
+    }
+  ]
+}

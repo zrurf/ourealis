@@ -11,8 +11,8 @@ use ourealis_core::motion::limits::{
 };
 use ourealis_core::motion::maneuvers::{self, TurnProfile};
 use ourealis_core::motion::{
-    LimitModifier, ManeuverConfig, MotionConfig, ProfileConfig, SpeedLimitParams, SpeedProfile,
-    Trajectory,
+    LimitModifier, Maneuver, ManeuverConfig, MotionConfig, ProfileConfig, SpeedLimitParams,
+    SpeedProfile, Trajectory,
 };
 use ourealis_core::path::Path;
 use ourealis_core::person::{PaceStrategy, PersonParams, Preset};
@@ -739,6 +739,156 @@ fn a_dwell_is_reached_without_a_position_step() {
         entry < speed_before * 0.02 + 1e-3,
         "the runner moved {entry:.4} m into the hold at {speed_before:.3} m/s"
     );
+}
+
+#[test]
+fn a_dwell_at_the_goal_is_held_for_its_duration() {
+    // The timeline walk clamps its last step to the remaining length, so it lands
+    // *on* the total length and leaves the loop without ever testing a stop at that
+    // arc. A dwell requested at the goal therefore needs its own handling; without
+    // it the hold was silently dropped while the profile still counted its time.
+    let environment = flat_environment(&[]);
+    let person = PersonParams::preset(Preset::Moderate);
+    // The fixture clamps its length to the flat grid, so the goal's arc comes from
+    // the path itself rather than from the request.
+    let path = straight_path(120.0);
+    let length = path.total_length();
+    let build = |stops: Vec<ourealis_core::motion::StopHold>| {
+        let config = MotionConfig {
+            profile: ProfileConfig {
+                stops,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        Trajectory::build(
+            path.clone(),
+            &environment.terrain,
+            &environment.hard,
+            &environment.distance,
+            &person,
+            &config,
+            11,
+            0,
+        )
+        .expect("trajectory")
+    };
+
+    let without = build(Vec::new());
+    let dwell_s = 20.0;
+    let with_dwell = build(vec![ourealis_core::motion::StopHold {
+        s: length,
+        duration_s: dwell_s,
+    }]);
+
+    let extra = with_dwell.duration_s() - without.duration_s();
+    assert!(
+        (extra - dwell_s).abs() < 0.5,
+        "a {dwell_s} s dwell at the goal added {extra:.3} s to the run"
+    );
+
+    // The hold sits on the goal's own arc, and the run ends on it.
+    let last = *with_dwell.samples.last().expect("samples");
+    assert!(last.standing, "the run must end standing");
+    assert!(
+        (last.arc_s - length).abs() < 1e-6,
+        "the final sample is at arc {:.6}, not at the goal",
+        last.arc_s
+    );
+}
+
+#[test]
+fn a_reversal_pivots_on_the_sample_the_profile_brakes_to() {
+    // The profile can only hold a stop on its own sample grid, while the turn is
+    // detected at an arbitrary arc. Pivoting at the detected arc instead of the
+    // executed stop leaves the runner accelerating across the gap and then frozen
+    // by the turn, which reads as a deceleration far beyond the individual's budget.
+    let environment = flat_environment(&[]);
+    let person = PersonParams::preset(Preset::Moderate);
+    // A hairpin: east along y = 0, then west along y = 1, so the reversal is a
+    // genuine 180 degree turn rather than a return that overlaps the outbound leg.
+    let mut points: Vec<DVec2> = (0..=20)
+        .map(|step| DVec2::new(step as f64 * 2.0, 0.0))
+        .collect();
+    points.extend(
+        (0..=20)
+            .rev()
+            .map(|step| DVec2::new(step as f64 * 2.0, 1.0)),
+    );
+    let path = Path::new(points).expect("folded path");
+
+    let trajectory = Trajectory::build(
+        path,
+        &environment.terrain,
+        &environment.hard,
+        &environment.distance,
+        &person,
+        &MotionConfig::default(),
+        13,
+        0,
+    )
+    .expect("trajectory");
+
+    let samples = &trajectory.samples;
+    assert!(
+        trajectory
+            .maneuvers
+            .iter()
+            .any(|maneuver| matches!(maneuver, Maneuver::Turn { .. })),
+        "the path's reversal must schedule a turn maneuver"
+    );
+    let turn_at = samples
+        .iter()
+        .position(|sample| sample.turning)
+        .expect("the reversal must be turned on the spot");
+
+    // The runner brakes into the pivot rather than being stopped by it: the pivot is
+    // the sample the profile holds at zero speed, so the last moving sample before it
+    // carries no more than the profile's own crawl out of a standstill.
+    let arrival = samples[..turn_at]
+        .iter()
+        .rposition(|sample| sample.is_moving())
+        .unwrap_or(turn_at);
+    let dt = samples[1].time_s - samples[0].time_s;
+    let residual = samples[arrival]
+        .position
+        .distance(samples[arrival.saturating_sub(1)].position)
+        / dt;
+    assert!(
+        residual < 0.25,
+        "the runner enters the turn at {residual:.3} m/s (sample {arrival} of {turn_at})"
+    );
+}
+
+#[test]
+fn an_inverted_time_window_is_empty_instead_of_a_panic() {
+    let environment = flat_environment(&[]);
+    let trajectory = Trajectory::build(
+        straight_path(50.0),
+        &environment.terrain,
+        &environment.hard,
+        &environment.distance,
+        &PersonParams::preset(Preset::Jog),
+        &MotionConfig::default(),
+        3,
+        0,
+    )
+    .expect("trajectory");
+
+    assert!(trajectory.window(10.0, 5.0).is_empty());
+    assert!(trajectory.window(0.0, 1.0).len() > 1);
+}
+
+#[test]
+fn sampling_with_a_non_positive_spacing_returns_the_endpoints() {
+    // The step count is `total / spacing`, so a zero spacing asks for an infinite
+    // number of samples instead of failing.
+    let path = straight_path(40.0);
+    assert_eq!(path.sample_positions(0.0).len(), 2);
+    assert_eq!(path.sample_positions(-1.0).len(), 2);
+    let sampled = path.sample_positions(8.0);
+    assert!(sampled.len() >= 5);
+    assert_eq!(*sampled.last().expect("end"), path.end());
 }
 
 #[test]

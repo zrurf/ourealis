@@ -530,6 +530,29 @@ impl SpeedProfile {
             .find(|stop| (stop.s - s).abs() <= tolerance_m)
     }
 
+    /// Arc length of the executed stop nearest to `arc`, within one sample spacing.
+    ///
+    /// The profile places stops on its own sample grid, so a caller that keeps the
+    /// requested arc (a turn maneuver, for example) refers to a point up to half a
+    /// spacing away from the sample the runner actually brakes to. The tolerance is
+    /// a whole spacing so the association survives the rounding in either direction.
+    pub fn stop_arc_near(&self, arc: f64) -> Option<f64> {
+        let spacing = match (self.s.first(), self.s.get(1)) {
+            (Some(first), Some(second)) => second - first,
+            _ => return None,
+        };
+        self.stops
+            .iter()
+            .map(|stop| stop.s)
+            .filter(|s| (s - arc).abs() <= spacing + 1e-9)
+            .min_by(|a, b| {
+                (a - arc)
+                    .abs()
+                    .partial_cmp(&(b - arc).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
     /// Position and speed at an elapsed time.
     pub fn sample_at_time(&self, t: f64, path: &Path) -> (DVec2, f64) {
         if self.t.is_empty() {

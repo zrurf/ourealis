@@ -347,6 +347,92 @@ fn library_with_stored_sizes(
 }
 
 #[test]
+fn a_far_candidate_does_not_discard_the_rest_of_its_stored_set() {
+    // The attach threshold applies to each candidate separately (implementation doc
+    // 6.6). Aborting the lookup on the first candidate that is too far loses a usable
+    // neighbour stored under the same OD key, and the leg is regenerated online even
+    // though the library had a path for it.
+    let spec = SyntheticMapSpec::compact();
+    let (_, _, environment) = load(&spec);
+    let corners = corners(&spec);
+    let (start, goal) = (corners[0], corners[1]);
+    let params = CandidateParams::default();
+    // Shares the query's OD key cell but sits well beyond a tight threshold.
+    let far_start = start + DVec2::new(-6.0, -14.0);
+    let library_params = KPathParams {
+        param_set_id: ourealis_core::search::ksp::param_set_id(&params),
+        ..KPathParams::default()
+    };
+    assert_eq!(
+        library_params.key_of(start.x, start.y),
+        library_params.key_of(far_start.x, far_start.y),
+        "both candidates must share the query's OD key"
+    );
+
+    let mut library = KPathLibrary {
+        params: library_params,
+        ..Default::default()
+    };
+    let near = library.push_nodes(&[
+        [start.x as f32, start.y as f32, 0.0],
+        [goal.x as f32, goal.y as f32, 0.0],
+    ]);
+    let far = library.push_nodes(&[
+        [far_start.x as f32, far_start.y as f32, 0.0],
+        [goal.x as f32, goal.y as f32, 0.0],
+    ]);
+    let path = |range, length: f64| KPath {
+        total_cost_equiv_m: 100.0,
+        length_m: length as f32,
+        path_size: 1.0,
+        node_range: range,
+    };
+    library.insert_set(
+        OdEntry {
+            start_key: library_params.key_of(start.x, start.y),
+            goal_key: library_params.key_of(goal.x, goal.y),
+            set_index: 0,
+        },
+        // The unusable candidate comes first, so a lookup that gives up on it never
+        // reaches the usable one.
+        vec![
+            path(far, (goal - far_start).length()),
+            path(near, (goal - start).length()),
+        ],
+    );
+
+    let mut graph = graph(&environment);
+    let set = lookup_within(&mut graph, Some(&library), start, goal, &params, 5.0)
+        .expect("no error")
+        .expect("the near candidate is inside the threshold");
+    assert_eq!(
+        set.candidates.len(),
+        1,
+        "only the candidate whose endpoints are close enough may be attached"
+    );
+
+    // When no candidate of the set is within range the lookup still reports the
+    // distance rather than an empty set, which is what tells the caller to fall back
+    // to an online route.
+    let elsewhere = start + DVec2::new(2.0, -3.0);
+    assert_eq!(
+        library_params.key_of(elsewhere.x, elsewhere.y),
+        library_params.key_of(start.x, start.y),
+        "the query must still hit the stored set"
+    );
+    let miss = lookup_within(&mut graph, Some(&library), elsewhere, goal, &params, 1.0)
+        .expect("no error")
+        .expect_err("no candidate can be attached at this threshold");
+    match miss {
+        LibraryMiss::TooFar { start_m, .. } => assert!(
+            (3.0..4.0).contains(&start_m),
+            "the reported distance {start_m} should be the gap to the nearest start"
+        ),
+        other => panic!("expected a distance miss, got {other:?}"),
+    }
+}
+
+#[test]
 fn stored_path_sizes_survive_the_attach_segments() {
     // The implementation doc requires `PS_j` to come from the stored set (6.6,
     // 12.2.3): the attach segments extend the same routes, so the overlap

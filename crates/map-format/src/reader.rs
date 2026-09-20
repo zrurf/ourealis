@@ -472,6 +472,15 @@ impl Map {
         let desc = self.layer_desc(layer_id).ok_or(MapError::LayerNotFound {
             layer_id: layer_id.raw(),
         })?;
+        // A region, vector or graph layer is one opaque payload, not a grid of cells:
+        // its "chunk" shape would be derived from the chunk grid and disagree with the
+        // bytes actually stored, which reads as corruption. Name the mistake instead.
+        if !desc.kind.is_chunked() {
+            return Err(MapError::NotACellLayer {
+                layer_id: layer_id.raw(),
+                kind: desc.kind.name(),
+            });
+        }
         let payload = match self.chunk_payload(layer_id, level, chunk_id)? {
             Some(bytes) => bytes,
             None => return Ok(None),
@@ -541,6 +550,15 @@ impl Map {
             layer_id: layer_id.raw(),
         })?;
         let shape: ChunkShape = if desc.kind.is_chunked() {
+            // A level outside the declared pyramid is a malformed file rather
+            // than an absent chunk; serving it would let the directory describe
+            // geometry the header never promised.
+            if level >= self.header.lod_count.max(1) {
+                return Err(MapError::invalid(format!(
+                    "layer {layer_id} chunk {chunk_id} records LOD level {level}, but the header declares {}",
+                    self.header.lod_count
+                )));
+            }
             let shape = self.grid.chunk_shape(desc, level);
             // The directory records the decompressed payload length, so it must
             // agree with the shape. Besides rejecting corrupt records, this is

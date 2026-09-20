@@ -1,0 +1,51 @@
+# Service configuration for the front-end end-to-end lane.
+#
+# The Playwright `webServer` entry starts the real binary with this file, so the
+# browser tests exercise the same stack a deployment runs: the API, the event
+# streams and the embedded page. Ports are fixed rather than ephemeral because the
+# test runner has to know where to look.
+#
+# Storage is on disk under a temporary directory: a test that imports a map must be
+# able to delete it again without touching the repository, and a leftover map from
+# an interrupted run must not break the next one.
+
+config_version = 1
+
+[log]
+level = "info"
+format = "pretty"
+ansi = false
+
+[server]
+rpc_enabled = true
+rpc_listen = "127.0.0.1:50051"
+http_enabled = true
+http_listen = "127.0.0.1:8080"
+web_enabled = true
+shutdown_grace_s = 5.0
+
+[http]
+max_body_mb = 64
+request_timeout_s = 120.0
+compression = true
+# The Vite development server runs on a different origin, so a development lane
+# that points at this service needs the origin allowed.
+cors_allow_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+[simulation]
+# One worker keeps the runs deterministic in wall-clock terms and small enough for
+# a CI machine; the tests submit one job at a time except the queue test.
+max_concurrent = 1
+queue_capacity = 8
+stream_frame_samples = 4096
+keep_results = 16
+with_metrics = true
+
+[storage]
+mode = "disk"
+data_dir = "../.tmp/e2e-service-data"
+keep_maps = 8
+
+[web]
+spa_fallback = true
+cache_control = "no-store"

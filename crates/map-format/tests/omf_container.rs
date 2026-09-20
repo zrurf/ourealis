@@ -341,6 +341,137 @@ fn lod_levels_are_stored_and_readable() {
 }
 
 #[test]
+fn a_builder_declares_every_lod_level_it_wrote() {
+    // The header's `lod_count` is what makes a level legal, so a builder that
+    // generates a pyramid must not leave the caller's smaller count in place: the
+    // reader rejects a directory record whose level the header never promised.
+    let spec = MapHeaderSpec {
+        lod_count: 1,
+        ..raster_spec(32, 64.0)
+    };
+    let cells = 64u32;
+    let elevation: Vec<f32> = (0..cells * cells)
+        .map(|index| {
+            let x = (index % cells) as f32;
+            let y = (index / cells) as f32;
+            10.0 + 0.05 * x + 0.02 * y
+        })
+        .collect();
+    let mut builder = MapBuilder::new(spec, FeatureSchema::default()).with_lod_levels(2);
+    builder
+        .add_layer(
+            LayerDesc::new(
+                LayerId::ELEVATION,
+                LayerKind::Raster,
+                1,
+                DType::I16,
+                codec_id::DELTA_VERTICAL,
+            )
+            .with_quantisation(0.1, 0.0),
+            cells,
+            cells,
+            elevation,
+        )
+        .expect("elevation layer");
+
+    let map = Map::from_bytes(builder.build_to_bytes().expect("build")).expect("open");
+    assert_eq!(
+        map.header().lod_count,
+        3,
+        "levels 0..=2 were written, so the header must declare three"
+    );
+    let view = map.layer(LayerId::ELEVATION).expect("layer view");
+    assert!(view.levels().contains(&2), "LOD level 2 expected");
+    assert!(
+        map.chunk(LayerId::ELEVATION, 2, 0)
+            .expect("read level 2")
+            .is_some(),
+        "the declared level must be readable"
+    );
+}
+
+#[test]
+fn synthetic_feature_channels_survive_the_round_trip() {
+    // These channels are continuous (traffic, crowding, lighting) or need the whole
+    // 16-bit range (the packed direction). A layer descriptor whose quantisation
+    // cannot carry them destroys them silently at write time, which no test that
+    // only inspects the source raster would notice.
+    let spec = SyntheticMapSpec::compact();
+    let (bytes, source) = synthetic::build_with_layers(&spec).expect("build");
+    let map = Map::from_bytes(bytes).expect("open");
+    let grid = map.grid();
+    let read = |layer: LayerId, cell_x: u32, cell_y: u32| -> f32 {
+        let (px, py) = grid.cell_center(cell_x, cell_y, 0);
+        let id = grid.chunk_id_at(px, py, 0).expect("chunk id");
+        let (ox, oy) = grid.chunk_origin_cell(id);
+        map.chunk(layer, 0, id)
+            .expect("read")
+            .expect("chunk present")
+            .get(cell_x - ox, cell_y - oy, 0)
+    };
+
+    let scalars = [
+        (
+            "traffic",
+            LayerId::feature(synthetic::feature::TRAFFIC),
+            source.traffic.as_slice(),
+        ),
+        (
+            "crowding",
+            LayerId::feature(synthetic::feature::CROWDING),
+            source.crowding.as_slice(),
+        ),
+        (
+            "lighting",
+            LayerId::feature(synthetic::feature::LIGHTING),
+            source.lighting.as_slice(),
+        ),
+    ];
+    for (name, layer, values) in scalars {
+        let mut fractional = 0usize;
+        for y in (0..source.dims.1).step_by(3) {
+            for x in (0..source.dims.0).step_by(3) {
+                let expected = values[(y * source.dims.0 + x) as usize];
+                let actual = read(layer, x, y);
+                // One 1/255 quantisation step at each end.
+                assert!(
+                    (actual - expected).abs() <= 2.0 / 255.0 + 1e-6,
+                    "{name} at ({x}, {y}) is {actual}, expected {expected}"
+                );
+                if (expected - expected.round()).abs() > 0.05 {
+                    fractional += 1;
+                }
+            }
+        }
+        assert!(
+            fractional > 0,
+            "{name} kept no fractional value: the channel collapsed to whole numbers"
+        );
+    }
+
+    // `angle_index * 256 + strength` overflows a byte, so a layer that cannot hold
+    // more than 255 decodes every constrained cell as angle 0.
+    let mut beyond_a_byte = 0usize;
+    for y in (0..source.dims.1).step_by(3) {
+        for x in (0..source.dims.0).step_by(3) {
+            let expected = source.direction[(y * source.dims.0 + x) as usize];
+            let actual = read(LayerId::DIRECTION, x, y);
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "direction at ({x}, {y}) is {actual}, expected {expected}"
+            );
+            if expected > 255.0 {
+                beyond_a_byte += 1;
+            }
+        }
+    }
+    assert!(
+        beyond_a_byte > 0,
+        "the packing must exercise values above one byte"
+    );
+}
+
+#[test]
 fn skeleton_leaves_describe_uniform_ground() {
     // A leaf *without* the drill-down hint is the builder's statement "this block
     // is uniform and may be used at coarse granularity", and the partition proxy

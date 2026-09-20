@@ -1,0 +1,133 @@
+/*
+ * Design tokens for both appearances.
+ *
+ * Two layers live here: `--ourealis-*` carries the palette the app itself uses
+ * (mapped to Tailwind utilities in index.css), and the tdesign tokens map the
+ * same values onto its components. Only the brand green and the status colours
+ * are chromatic; no surface takes a blue cast, which is why the brand ramp is
+ * redefined rather than only re-aliased — tdesign derives every tint from the
+ * ramp, and its own ramp is blue.
+ *
+ * The selectors deliberately outrank tdesign's own blocks (`:root,
+ * :root[theme-mode='light']` and `:root.dark, :root[theme-mode='dark']`). Equal
+ * specificity is not enough: the bundler's CSS minifier drops a later
+ * declaration that repeats a property from an equally specific block, which
+ * would silently keep tdesign's blue ramp. The two blocks are also mutually
+ * exclusive, so only one of them ever matches.
+ *
+ * The theme store writes the `dark` class and the `theme-mode` attribute onto
+ * <html> together; tdesign honours either.
+ */
+
+html:root:not(.dark):not([theme-mode='dark']) {
+  --ourealis-page: #ffffff;
+  --ourealis-surface: #f6f6f7;
+  --ourealis-line: #e5e5e6;
+  --ourealis-ink: #1c1c1e;
+  --ourealis-muted: #6e6e73;
+  --ourealis-brand: #3f7d4e;
+  --ourealis-success: #2e7d4f;
+  --ourealis-warning: #b7791f;
+  --ourealis-danger: #b4342f;
+
+  /* Lightest to darkest; tdesign reads -7 as the brand colour. */
+  --td-brand-color-1: #f1f5f2;
+  --td-brand-color-2: #e2ebe5;
+  --td-brand-color-3: #c9dbce;
+  --td-brand-color-4: #a9c5b2;
+  --td-brand-color-5: #85ae91;
+  --td-brand-color-6: #629670;
+  --td-brand-color-7: #3f7d4e;
+  --td-brand-color-8: #35693f;
+  --td-brand-color-9: #2c5734;
+  --td-brand-color-10: #23452a;
+
+  --td-success-color: var(--ourealis-success);
+  --td-warning-color: var(--ourealis-warning);
+  --td-error-color: var(--ourealis-danger);
+
+  --td-bg-color-page: var(--ourealis-page);
+  --td-bg-color-container: var(--ourealis-surface);
+  --td-bg-color-container-hover: #efeff0;
+  --td-bg-color-container-active: #e8e8ea;
+  --td-bg-color-secondarycontainer: #f0f0f1;
+  --td-bg-color-secondarycontainer-hover: #e8e8ea;
+  --td-bg-color-secondarycomponent: #f0f0f1;
+  --td-bg-color-component: #efeff0;
+  --td-bg-color-component-hover: #e8e8ea;
+  --td-bg-color-specialcomponent: #ffffff;
+
+  --td-text-color-primary: var(--ourealis-ink);
+  --td-text-color-secondary: var(--ourealis-muted);
+  --td-text-color-placeholder: #8e8e93;
+  --td-text-color-disabled: #a1a1a6;
+  --td-text-color-anti: #ffffff;
+
+  --td-border-level-1-color: var(--ourealis-line);
+  --td-border-level-2-color: #d9d9db;
+  --td-component-stroke: var(--ourealis-line);
+  --td-component-border: #d9d9db;
+
+  --td-radius-default: 6px;
+  --td-radius-medium: 6px;
+  --td-radius-large: 10px;
+  --td-radius-extraLarge: 10px;
+
+  --td-font-family:
+    -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei',
+    sans-serif;
+
+  color-scheme: light;
+}
+
+html:root:where(.dark, [theme-mode='dark']):not([theme-mode='light']) {
+  --ourealis-page: #0e0e10;
+  --ourealis-surface: #17171a;
+  --ourealis-line: #2a2a2e;
+  --ourealis-ink: #e8e8ea;
+  --ourealis-muted: #9a9aa0;
+  --ourealis-brand: #5aa46a;
+  --ourealis-success: #4f9d6b;
+  --ourealis-warning: #d0a03c;
+  --ourealis-danger: #d05c56;
+
+  /* Darkest to lightest; tdesign reads -8 as the brand colour. */
+  --td-brand-color-1: #131d16;
+  --td-brand-color-2: #18261c;
+  --td-brand-color-3: #1e3123;
+  --td-brand-color-4: #25402c;
+  --td-brand-color-5: #2d5035;
+  --td-brand-color-6: #3a6743;
+  --td-brand-color-7: #4a8257;
+  --td-brand-color-8: #5aa46a;
+  --td-brand-color-9: #77b985;
+  --td-brand-color-10: #9ccfa6;
+
+  --td-success-color: var(--ourealis-success);
+  --td-warning-color: var(--ourealis-warning);
+  --td-error-color: var(--ourealis-danger);
+
+  --td-bg-color-page: var(--ourealis-page);
+  --td-bg-color-container: var(--ourealis-surface);
+  --td-bg-color-container-hover: #232327;
+  --td-bg-color-container-active: #2a2a2e;
+  --td-bg-color-secondarycontainer: #1e1e22;
+  --td-bg-color-secondarycontainer-hover: #232327;
+  --td-bg-color-secondarycomponent: #26262a;
+  --td-bg-color-component: #232327;
+  --td-bg-color-component-hover: #2a2a2e;
+  --td-bg-color-specialcomponent: #1e1e22;
+
+  --td-text-color-primary: var(--ourealis-ink);
+  --td-text-color-secondary: var(--ourealis-muted);
+  --td-text-color-placeholder: #7c7c82;
+  --td-text-color-disabled: #5c5c62;
+  --td-text-color-anti: #0e0e10;
+
+  --td-border-level-1-color: var(--ourealis-line);
+  --td-border-level-2-color: #3a3a40;
+  --td-component-stroke: var(--ourealis-line);
+  --td-component-border: #3a3a40;
+
+  color-scheme: dark;
+}

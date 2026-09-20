@@ -102,9 +102,14 @@ pub fn from_library(
 
     // The attach threshold is the design's distortion bound. It applies to both
     // ends, and to each candidate separately: a candidate whose own endpoints are
-    // far from the query is as unusable as a mismatched key.
+    // far from the query is as unusable as a mismatched key. Movement within one
+    // stored set is not evidence about the others — the set is keyed by a coarse
+    // OD cell, so it can hold one path 40 m away and another 5 m away — hence a
+    // candidate over the threshold is skipped and the rest of the set is still
+    // examined. `farthest` remembers the worst rejection for the miss report.
     let mut candidates = Vec::with_capacity(paths.len());
     let mut attach_length = 0.0f64;
+    let mut nearest: Option<(f64, f64)> = None;
     for path in paths {
         let (Some(stored_start), Some(stored_end)) = (
             path.start_point(&library.nodes),
@@ -117,10 +122,11 @@ pub fn from_library(
         let to_start = (stored_start - start).length();
         let to_goal = (goal - stored_end).length();
         if to_start > d_attach_m || to_goal > d_attach_m {
-            return Ok(Err(LibraryMiss::TooFar {
-                start_m: to_start,
-                goal_m: to_goal,
-            }));
+            nearest = Some(match nearest {
+                Some((best_start, best_goal)) => (best_start.min(to_start), best_goal.min(to_goal)),
+                None => (to_start, to_goal),
+            });
+            continue;
         }
 
         // Attach at both ends, in a window around the pair so the search stays
@@ -159,7 +165,12 @@ pub fn from_library(
         });
     }
     if candidates.is_empty() {
-        return Ok(Err(LibraryMiss::NoEntry));
+        // Every candidate was either rejected by distance or unusable; the
+        // distance report keeps the caller's diagnostics meaningful.
+        return Ok(Err(match nearest {
+            Some((start_m, goal_m)) => LibraryMiss::TooFar { start_m, goal_m },
+            None => LibraryMiss::NoEntry,
+        }));
     }
     // The path-size factors came from the stored set and must be kept: the attach
     // segments only extend the same candidate routes, so the overlap relationships

@@ -456,8 +456,10 @@ pub fn feature_schema() -> FeatureSchema {
                 kind: FeatureKind::Direction,
                 layer_id: LayerId::DIRECTION,
                 channel: 0,
+                // Matches the layer descriptor: the stored element is the packed
+                // `angle_index * 256 + strength`, biased to fit a signed element.
                 scale: 1.0,
-                bias: 0.0,
+                bias: 32768.0,
                 norm_min: 0.0,
                 norm_max: 1.0,
                 palette: Vec::new(),
@@ -664,7 +666,8 @@ pub fn build(spec: &SyntheticMapSpec) -> Result<Vec<u8>> {
             1,
             DType::U8,
             codec_id::ZSTD,
-        ),
+        )
+        .with_quantisation(1.0 / 255.0, 0.0),
         dims.0,
         dims.1,
         layers.traffic.clone(),
@@ -676,7 +679,8 @@ pub fn build(spec: &SyntheticMapSpec) -> Result<Vec<u8>> {
             1,
             DType::U8,
             codec_id::ZSTD,
-        ),
+        )
+        .with_quantisation(1.0 / 255.0, 0.0),
         dims.0,
         dims.1,
         layers.crowding.clone(),
@@ -688,19 +692,25 @@ pub fn build(spec: &SyntheticMapSpec) -> Result<Vec<u8>> {
             1,
             DType::U8,
             codec_id::ZSTD,
-        ),
+        )
+        .with_quantisation(1.0 / 255.0, 0.0),
         dims.0,
         dims.1,
         layers.lighting.clone(),
     )?;
+    // The direction channel stores `angle_index * 256 + strength`, so it needs
+    // the whole unsigned 16-bit range. A signed 16-bit element carries it exactly
+    // once the bias moves zero to the bottom of that range; as `U8` every track
+    // cell was clamped to 255, which decodes as angle 0 with full strength.
     builder.add_layer(
         LayerDesc::new(
             LayerId::DIRECTION,
             LayerKind::Raster,
             1,
-            DType::U8,
+            DType::I16,
             codec_id::ZSTD,
-        ),
+        )
+        .with_quantisation(1.0, 32768.0),
         dims.0,
         dims.1,
         layers.direction.clone(),

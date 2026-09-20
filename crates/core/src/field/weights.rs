@@ -131,10 +131,17 @@ impl AttentionGating {
         }
         let alphas = softmax(&scores);
 
-        // Normalised modulation factor, clipped and renormalised to mean one.
+        // Normalised modulation factor, clipped and renormalised to mean one. The
+        // clip bounds are public fields, so they are ordered here rather than
+        // trusted: `f64::clamp` panics when the minimum exceeds the maximum.
+        let (clip_min, clip_max) = if self.clip_min <= self.clip_max {
+            (self.clip_min, self.clip_max)
+        } else {
+            (self.clip_max, self.clip_min)
+        };
         let mut factors: Vec<f64> = alphas
             .iter()
-            .map(|alpha| (dim as f64 * alpha).clamp(self.clip_min, self.clip_max))
+            .map(|alpha| (dim as f64 * alpha).clamp(clip_min, clip_max))
             .collect();
         let sum: f64 = factors.iter().sum();
         if sum <= f64::EPSILON {

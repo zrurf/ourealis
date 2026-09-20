@@ -15,20 +15,20 @@ cargo test --workspace --all-features
 
 | Suite | Question it answers |
 |---|---|
-| `map-format::omf_container` (21) | Do header and footer offsets, CRCs, directory ordering and binary search, missing-chunk semantics, skeleton keys and location, writer metadata freezing and the LOD levels behave? |
-| `map-format::omf_codecs` (14) | Do all codecs round-trip, does bit packing agree with the shape, and are unknown codecs and malformed payloads handled? |
-| `map-format::omf_graph` (11) | Do the roadmap, connector, path-library and vector layers round-trip, do region inclusion and the spatial hash work, and do derived-layer fingerprints verify and go stale correctly? |
+| `map-format::omf_container` (23) | Do header and footer offsets, CRCs, directory ordering and binary search, missing-chunk semantics, skeleton keys and location, writer metadata freezing and the LOD levels behave? |
+| `map-format::omf_codecs` (15) | Do all codecs round-trip, does bit packing agree with the shape, and are unknown codecs and malformed payloads handled? |
+| `map-format::omf_graph` (12) | Do the roadmap, connector, path-library and vector layers round-trip, do region inclusion and the spatial hash work, and do derived-layer fingerprints verify and go stale correctly? |
 | `map-format::omf_patch` (6) | Does a patch apply, refuse a foreign base file, refuse to touch a derived layer, and survive a reload? |
 | `map-format::prop_roundtrip` (2) | Property tests: any raster content survives encode → decode, any metadata survives write → read. |
 | `core::math_terrain` (11) | Do projection, terrain, slope, the distance transform and the FFT match closed-form references? |
 | `core::field_search` (25) | Do cost synthesis, hard-constraint enforcement, the sampler, Lazy Theta\*, candidate generation, the Logit model, the elastic band and corner rounding behave? |
-| `core::motion` (24) | Do the speed limits, profile, stop handling, fatigue iteration, offset, attitude, bounce and turn profile behave? |
+| `core::motion` (28) | Do the speed limits, profile, stop handling, fatigue iteration, offset, attitude, bounce and turn profile behave? |
 | `core::sensors` (15) | Do sample rates, reproduction, GNSS errors and correlation, the resting accelerometer reading, the step spectrum, the gyroscope's turn rate, the magnetometer's magnitude and the barometer's ripple behave? |
 | `core::simulator` (13) | Does a whole run hold its invariants, replay bit-identically, honour waypoint semantics, close a loop, follow a redirect, batch reproducibly, export correctly and report metrics? |
 | `core::coarse` (7) | Are coarse blocks internally passable, do they replace the fine cells they cover, do they reduce the search, and are routes feasible with them on and off? |
-| `core::library` (7) | Do stored candidate libraries obey the last-mile attach contract? |
+| `core::library` (8) | Do stored candidate libraries obey the last-mile attach contract? |
 | `core::connector_lift` (4) | Do Z-axis links reach the height, the barometer and the pitch, while a route without links keeps the terrain profile? |
-| `core::realism` (13) | Does one route run by one individual stay inside human physiology bands? |
+| `core::realism` (14) | Does one route run by one individual stay inside human physiology bands? |
 | `core::randomized` (3) | Do the invariants, physical consistency and realism bands hold for randomly drawn individuals and routes? |
 | `core::real_data` (4) | Does the simulator match public IMU recordings on the calibrated gait quantities? |
 | `core::calibration` (5) | Do the estimator and the optimiser work, does the loss behave, and do the shipped presets match the reference table? |

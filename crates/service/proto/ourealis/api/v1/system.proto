@@ -1,0 +1,42 @@
+// System information and capability discovery.
+
+syntax = "proto3";
+
+package ourealis.api.v1;
+
+import "ourealis/api/v1/common.proto";
+
+// Build and capability information of the running service.
+message SystemInfo {
+  // Service version, from the crate manifest.
+  string version = 1;
+  // API path version, for example "v1".
+  string api_version = 2;
+  // Version of the simulator crate this build linked.
+  string core_version = 3;
+  // Version of the map-format crate this build linked.
+  string map_format_version = 4;
+  // Build timestamp as an RFC 3339 string, when the build script provided one.
+  string build_time = 5;
+  // Facade switches in effect.
+  bool rpc_enabled = 6;
+  bool http_enabled = 7;
+  bool web_enabled = 8;
+  // Compute backend the simulator resolved to, for example "wgpu:NVIDIA ..." or
+  // "cpu-rayon".
+  string backend = 9;
+  // Worker threads available to the simulation stages.
+  uint32 worker_threads = 10;
+  // Person parameter presets this build accepts.
+  repeated string presets = 11;
+  // True when the embedded web assets were built from a real front-end build
+  // rather than the placeholder page.
+  bool web_assets_built = 12;
+}
+
+service SystemService {
+  // Build and capability information.
+  rpc Info(Empty) returns (SystemInfo);
+  // Liveness probe.
+  rpc Health(Empty) returns (HealthReply);
+}

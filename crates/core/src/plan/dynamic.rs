@@ -11,8 +11,11 @@
 //!    velocity are continuous across the switch. After the window the runner
 //!    follows the new route exactly.
 
+use glam::DVec2;
+
 use crate::environment::Environment;
 use crate::error::{CoreError, Result};
+use crate::field::HardMask;
 use crate::graph::MixedGraph;
 use crate::math::sampling::smoothstep;
 use crate::motion::Trajectory;
@@ -58,11 +61,17 @@ pub struct ReplanRecord {
 /// smoothstep weight, whose derivative vanishes at both ends, which is what keeps
 /// position *and* velocity continuous across the switch. Beyond the old
 /// trajectory's end the new one is followed as is.
+///
+/// `hard` is the map's forbidden-cell mask: the blend is a straight line between
+/// two routes, and where they turn a corner the chord between them can cut through
+/// the obstacle both of them go around. The weight is reduced along such a chord so
+/// the reported truth never sits in a forbidden cell.
 pub fn blend_trajectories(
     old: &Trajectory,
     new: &Trajectory,
     switch_s: f64,
     window_s: f64,
+    hard: &HardMask,
 ) -> Result<Trajectory> {
     if new.samples.is_empty() {
         return Ok(old.clone());
@@ -95,6 +104,12 @@ pub fn blend_trajectories(
         if alpha < 1.0
             && let Some(old_sample) = old.sample_at(time_s)
         {
+            // The same weight drives position, centre and the vertical channels:
+            // mixing them with different weights would put the runner's height at
+            // the other route's terrain.
+            let alpha = alpha
+                * passable_weight(old_sample.position, sample.position, hard)
+                * passable_weight(old_sample.center, sample.center, hard);
             let position = old_sample.position * (1.0 - alpha) + sample.position * alpha;
             let center = old_sample.center * (1.0 - alpha) + sample.center * alpha;
             let speed = old_sample.speed * (1.0 - alpha) + sample.speed * alpha;
@@ -127,6 +142,28 @@ pub fn blend_trajectories(
 /// Interpolates two angles the short way round.
 fn blend_angle(a: f64, b: f64, alpha: f64) -> f64 {
     a + alpha * crate::math::angle_difference(b, a)
+}
+
+/// Largest fraction of the segment `from -> to` whose point is passable.
+///
+/// Returns `1.0` when the whole segment is usable. Otherwise the passable prefix is
+/// bisected: the interpolation stays on the straight chord between the two routes
+/// instead of inventing a detour the planner never produced, and the reported truth
+/// stays inside the passable set.
+fn passable_weight(from: DVec2, to: DVec2, hard: &HardMask) -> f64 {
+    if hard.is_passable(to) {
+        return 1.0;
+    }
+    let (mut low, mut high) = (0.0f64, 1.0f64);
+    for _ in 0..16 {
+        let middle = 0.5 * (low + high);
+        if hard.is_passable(from + (to - from) * middle) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    low
 }
 
 /// Re-plans a run for a new checkpoint.

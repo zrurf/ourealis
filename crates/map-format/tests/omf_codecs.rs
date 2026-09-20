@@ -119,6 +119,23 @@ fn bit_packed_shapes_round_trip() {
 }
 
 #[test]
+fn channel_delta_rejects_bit_packed_shapes() {
+    // A bit-packed chunk pads every row to a byte boundary, so its cells are not
+    // `channels * element_size` apart. Both directions must refuse such a shape
+    // instead of walking past the payload.
+    let shape = ChunkShape::new(64, 4, 2, DType::Bit);
+    let data = payload(&ChunkShape::new(64, 4, 2, DType::U8), 7);
+    assert!(
+        codec::encode(id::DELTA_CHANNEL, &shape, &data, &CodecContext::none()).is_err(),
+        "encoding a bit-packed shape must fail"
+    );
+    assert!(
+        codec::decode(id::DELTA_CHANNEL, &shape, &data, &CodecContext::none()).is_err(),
+        "decoding a bit-packed shape must fail"
+    );
+}
+
+#[test]
 fn pyramid_uses_the_parent_chunk_as_dictionary() {
     let shape = ChunkShape::new(32, 32, 1, DType::I16);
     let data = smooth_payload(&shape);

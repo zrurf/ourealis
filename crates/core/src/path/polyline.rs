@@ -287,9 +287,12 @@ impl Path {
     }
 
     /// Samples every `spacing` metres, always including the end point.
+    ///
+    /// A non-positive spacing cannot describe a sampling interval, so the
+    /// endpoints are returned instead of dividing by it.
     pub fn sample_positions(&self, spacing: f64) -> Vec<DVec2> {
         let total = self.total_length();
-        if total <= spacing {
+        if spacing.is_nan() || spacing <= 0.0 || total <= spacing {
             return vec![self.start(), self.end()];
         }
         let steps = (total / spacing).ceil().max(1.0) as usize;

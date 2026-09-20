@@ -608,13 +608,20 @@ impl<'a> MixedGraph<'a> {
             })
             .collect();
 
-        // An interface waypoint also attaches to its grid cell, priced by the
-        // same line-of-sight test as the grid's own edges so both directions of
-        // the link cost the same and neither can cross a hard constraint.
+        // An interface waypoint also attaches to the node that stands for its grid
+        // cell, priced by the same line-of-sight test as the grid's own edges so
+        // both directions of the link cost the same and neither can cross a hard
+        // constraint. When a coarse block covers the cell, the block *is* that
+        // cell's node — linking the fine node instead would point the edge at a
+        // node that has no edges of its own.
         if let Some(cell) = prm.interface_cell(index) {
             let cell_index = cell[1] as usize * self.grid().width + cell[0] as usize;
             if cell_index < self.grid().len() && !self.hard.mask()[cell_index] {
-                let target = NodeId::grid(cell_index as u32);
+                let point = self.grid().cell_center(cell[0] as usize, cell[1] as usize);
+                let target = match self.coarse.cell_at(point) {
+                    Some(block) => NodeId::coarse(block),
+                    None => NodeId::grid(cell_index as u32),
+                };
                 if let (Some(from), Some(to)) = (
                     prm.nodes.get(index as usize).copied(),
                     self.position(target),

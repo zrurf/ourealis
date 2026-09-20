@@ -43,10 +43,15 @@ that needs data whose errors, cadence and motion are known exactly.
 |---|---|
 | `ourealis-map-format` | OMF: the static map container. Reader, writer, builder, codecs, fingerprints, patches. |
 | `ourealis-core` | The simulator: environment, planning, motion, sensors, evaluation, compute backends. |
+| `ourealis` | The service: configuration, job queue, and the gRPC, HTTP, WebSocket and SSE facades over the simulator, with the web interface embedded in the binary. |
 
 Dependencies point one way: `ourealis-core` reads maps through
 `ourealis-map-format`, never the reverse. Map tooling can be built against the
-format crate alone.
+format crate alone. The service is the only crate that knows about the network,
+and it adds no dependency to the other two.
+
+The front-end lives in `web/` — Vite, Vue, TypeScript, tdesign, BabylonJS — and is
+compiled into the service binary by its build script.
 
 ## Quick start
 
@@ -134,6 +139,46 @@ adapter is present and otherwise falls back with a warning. The graph search
 itself stays on the CPU: node expansion is branch-bound and gains nothing from a
 device. `tests/gpu_cpu.rs` compares the two backends and skips itself when no
 adapter exists.
+
+## Service and web interface
+
+```bash
+# One-time front-end install, then Cargo builds everything else.
+pnpm --dir web install --frozen-lockfile
+cargo build --release -p ourealis          # build.rs runs the Vite build and embeds web/dist
+
+./target/release/ourealis                   # reads config.toml next to the binary
+./target/release/ourealis --config dev.toml --print-config
+./target/release/ourealis --log debug
+```
+
+The service reads one TOML file and enables three facades independently:
+
+| Facade | Switch | Carries |
+|---|---|---|
+| RPC | `server.rpc_enabled` | gRPC, package `ourealis.api.v1` |
+| HTTP | `server.http_enabled` | REST under `/api/v1`, plus WebSocket and SSE |
+| Web | `server.web_enabled` | the embedded single-page application (requires HTTP) |
+
+Every HTTP API route lives under `/api/v1`; the page is served at `/`. Both
+facades listen on loopback by default, so a default configuration is not reachable
+from the network. Point a browser at the HTTP address and the interface is there —
+no separate front-end deployment, and the page cannot drift from the API it calls
+because the two ship in one binary.
+
+Development runs the front-end with hot reload and proxies the API:
+
+```bash
+pnpm --dir web dev                          # http://localhost:5173, /api proxied to :8080
+cargo run -p ourealis -- --config web/tests/fixtures/service.toml
+```
+
+Front-end checks: `pnpm --dir web run typecheck`, `run lint`, `run format:check`,
+`run build`, `run test:unit`, `run test:e2e`, `run test:fuzz`, `run test:monkey`.
+
+Environment variables: `OUREALIS_CONFIG` (configuration path), `OUREALIS_SKIP_WEB=1`
+(skip the front-end build), `OUREALIS_REQUIRE_WEB=1` (fail instead of embedding a
+placeholder page), `OUREALIS_PNPM` (pnpm executable), `RUST_LOG`.
 
 ## Testing
 

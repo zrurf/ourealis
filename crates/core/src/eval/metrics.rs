@@ -86,8 +86,13 @@ pub fn ks_statistic(sample_a: &[f64], sample_b: &[f64]) -> f64 {
     if sample_a.is_empty() || sample_b.is_empty() {
         return 1.0;
     }
-    let mut a = sample_a.to_vec();
-    let mut b = sample_b.to_vec();
+    // Only finite values take part: a NaN sorts to an arbitrary place and, worse,
+    // compares false against every value, so the merge below would stop advancing.
+    let mut a: Vec<f64> = sample_a.iter().copied().filter(|v| v.is_finite()).collect();
+    let mut b: Vec<f64> = sample_b.iter().copied().filter(|v| v.is_finite()).collect();
+    if a.is_empty() || b.is_empty() {
+        return 1.0;
+    }
     a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
     b.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
 

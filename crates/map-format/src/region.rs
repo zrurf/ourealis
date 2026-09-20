@@ -19,6 +19,12 @@ use crate::bytes::{Reader, Writer};
 use crate::error::{MapError, Result};
 use crate::geometry::Aabb;
 
+/// Largest number of spatial-index buckets a single region may occupy.
+///
+/// A campus-scale region covers a few thousand buckets at the default bucket
+/// size; the cap only rejects outlines whose extent cannot come from a real map.
+pub const MAX_REGION_BUCKETS: u64 = 1 << 22;
+
 /// Semantic tag of an environment region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u16)]
@@ -176,6 +182,16 @@ impl RegionSet {
                 polygons.len()
             )));
         }
+        // Non-finite coordinates make the bucket index meaningless and would
+        // saturate the `as i32` conversion in `bucket_of` into a bucketing loop
+        // over the whole integer range.
+        if polygons
+            .iter()
+            .flatten()
+            .any(|point| !point[0].is_finite() || !point[1].is_finite())
+        {
+            return Err(MapError::invalid("region outline has a non-finite point"));
+        }
         let bounds: Vec<Aabb> = polygons.iter().map(|p| outline_bounds(p)).collect();
         let mut set = Self {
             features,
@@ -184,7 +200,7 @@ impl RegionSet {
             buckets: HashMap::new(),
             bucket_size_m: 50.0,
         };
-        set.rebuild_index();
+        set.rebuild_index()?;
         Ok(set)
     }
 
@@ -211,9 +227,9 @@ impl RegionSet {
     }
 
     /// Sets the spatial index bucket size.
-    pub fn set_bucket_size(&mut self, size_m: f32) {
+    pub fn set_bucket_size(&mut self, size_m: f32) -> Result<()> {
         self.bucket_size_m = size_m.max(1.0);
-        self.rebuild_index();
+        self.rebuild_index()
     }
 
     /// Fills the spatial index with *feature* indices.
@@ -222,7 +238,11 @@ impl RegionSet {
     /// the polygon order need not match the feature order. Indexing the polygons
     /// directly would therefore hand `regions_at` a foreign index, so the bucket
     /// is filled per feature, from the bounds of the outline it references.
-    fn rebuild_index(&mut self) {
+    ///
+    /// Fails when one feature would span more than [`MAX_REGION_BUCKETS`] buckets:
+    /// the index is only useful for region-scale outlines, and an outline that
+    /// large is either corrupt or a denial of service against the loader.
+    fn rebuild_index(&mut self) -> Result<()> {
         self.buckets.clear();
         for (index, feature) in self.features.iter().enumerate() {
             let Some(bounds) = self.bounds.get(feature.geom_ref as usize) else {
@@ -230,12 +250,21 @@ impl RegionSet {
             };
             let (ix0, iy0) = self.bucket_of(bounds.min_x, bounds.min_y);
             let (ix1, iy1) = self.bucket_of(bounds.max_x, bounds.max_y);
+            let span =
+                (ix1 as i64 - ix0 as i64 + 1) as u128 * (iy1 as i64 - iy0 as i64 + 1) as u128;
+            if span > MAX_REGION_BUCKETS as u128 {
+                return Err(MapError::invalid(format!(
+                    "region {} spans {} spatial-index buckets, over the {MAX_REGION_BUCKETS} limit",
+                    index, span
+                )));
+            }
             for iy in iy0..=iy1 {
                 for ix in ix0..=ix1 {
                     self.buckets.entry((ix, iy)).or_default().push(index as u32);
                 }
             }
         }
+        Ok(())
     }
 
     fn bucket_of(&self, x: f64, y: f64) -> (i32, i32) {

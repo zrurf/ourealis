@@ -595,7 +595,18 @@ impl MapBuilder {
         let skeleton = self.partition_skeleton()?;
         let derived = self.derived_layers(&records);
 
-        let mut writer = MapWriter::new(sink, self.spec)?;
+        // The header must declare every level the directory holds: a record whose
+        // level is outside `lod_count` is a malformed file, and the generated
+        // pyramid is not optional once `with_lod_levels` asked for it.
+        let mut spec = self.spec;
+        let generated = if self.lod_levels > 0 {
+            self.lod_levels.saturating_add(1)
+        } else {
+            1
+        };
+        spec.lod_count = spec.lod_count.max(generated).max(1);
+
+        let mut writer = MapWriter::new(sink, spec)?;
         if let Some(info) = &self.map_info {
             writer.set_map_info(info)?;
         }
