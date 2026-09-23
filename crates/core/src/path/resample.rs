@@ -30,11 +30,16 @@ pub fn deduplicate(points: &[DVec2], tolerance: f64) -> Vec<DVec2> {
 ///
 /// The original endpoints are preserved exactly; the interior points are placed
 /// on the arc-length parameterisation, which is what the speed profile assumes.
+///
+/// The spacing is floored at [`MIN_SEGMENT_M`]: the output holds one point per
+/// spacing, so a smaller request asks for a point count that grows without bound
+/// while carrying no shape the millimetre tolerance would keep.
 pub fn resample(points: &[DVec2], spacing: f64) -> Vec<DVec2> {
     let points = deduplicate(points, MIN_SEGMENT_M);
-    if points.len() < 2 || spacing <= 0.0 {
+    if points.len() < 2 || !spacing.is_finite() {
         return points;
     }
+    let spacing = spacing.max(MIN_SEGMENT_M);
     let cumulative = cumulative_lengths(&points);
     let total = *cumulative.last().unwrap_or(&0.0);
     if total <= spacing {

@@ -1,161 +1,133 @@
 /*
- * Vector overlays: region outlines, connectors, skeleton blocks and roadmap edges.
+ * Vector overlays: the drawing half.
  *
- * Each family is one line system plus, where a marker helps, a small block at the
- * point that carries meaning — a connector endpoint, an interface node. A family
- * is disposed when its toggle flips rather than kept alive hidden, because a
- * region set of a large map is a few hundred thousand vertices and an invisible
- * mesh still costs memory.
+ * Each family is one line mesh plus, where a marker helps, a symbol at the point that
+ * carries meaning — a connector endpoint, an interface node. A family is disposed when its
+ * toggle flips rather than kept alive hidden, because a region set of a large map is a few
+ * hundred thousand vertices and an invisible mesh still costs memory.
  *
- * Geometry is built as plain `[x, y, z]` triples and converted to Babylon vectors
- * only when a mesh is created, so the shape of an overlay can be reasoned about —
- * and tested — without an engine.
+ * The lines are *ribbons*, not screen-space lines: `GreasedLine` builds a strip of
+ * triangles along each path, so a width in metres means something. The plain `LinesMesh`
+ * this replaced ignored the width it was given on most backends, which is why the
+ * annotations were one pixel wide — and why making them visible meant making them huge, up
+ * to a 1.2 m cube per connector endpoint.
+ *
+ * Geometry comes from `render/overlayGeometry.ts`; this file owns the colours, the widths
+ * and the depth offsets.
  */
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
 import { Color3 } from '@babylonjs/core/Maths/math.color'
 import { Vector3 } from '@babylonjs/core/Maths/math.vector'
-import { CreateBox } from '@babylonjs/core/Meshes/Builders/boxBuilder'
-import { CreateLineSystem } from '@babylonjs/core/Meshes/Builders/linesBuilder'
+import { CreateDisc } from '@babylonjs/core/Meshes/Builders/discBuilder'
+import { CreateGreasedLine } from '@babylonjs/core/Meshes/Builders/greasedLineBuilder'
+import { GreasedLineMeshColorMode } from '@babylonjs/core/Materials/GreasedLine/greasedLineMaterialInterfaces'
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh'
-import type { LinesMesh } from '@babylonjs/core/Meshes/linesMesh'
-import type { Scene } from '@babylonjs/core/scene'
-import type { Aabb, SkeletonNode } from '@/api/types'
+import type { SkeletonNode } from '@/api/types'
+import type { Connector, PrmEdge, PrmNode, RegionOutline } from '@/types/sections'
+import type { MapScene } from './scene'
 import {
-  skeletonBlocks,
-  type Connector,
-  type PrmEdge,
-  type PrmNode,
-  type RegionOutline,
-} from '@/types/sections'
+  NO_SURFACE,
+  OVERLAY_LIFT,
+  connectorEndpoints,
+  connectorSegments,
+  prmSegments,
+  regionPaths,
+  skeletonEdges,
+  type OverlayKind,
+  type SurfaceHeight,
+  type WorldPoint,
+} from './overlayGeometry'
 
-/** Overlay families a viewer can toggle. */
-export type OverlayKind = 'regions' | 'connectors' | 'skeleton' | 'prm'
+export {
+  NO_SURFACE,
+  OVERLAY_LIFT,
+  connectorEndpoints,
+  connectorSegments,
+  prmSegments,
+  rectEdges,
+  regionPaths,
+  skeletonEdges,
+  type OverlayKind,
+  type SurfaceHeight,
+  type WorldPoint,
+} from './overlayGeometry'
 
-/** A point in world metres. */
-export type WorldPoint = [number, number, number]
-
-/** Colours of the overlay families, drawn as lines over the terrain. */
+/** Colours of the overlay families, drawn over the terrain in the series palette. */
 const OVERLAY_COLORS: Readonly<Record<OverlayKind, readonly [number, number, number]>> = {
-  regions: [0.72, 0.47, 0.2],
-  connectors: [0.42, 0.35, 0.63],
-  skeleton: [0.42, 0.42, 0.45],
-  prm: [0.25, 0.5, 0.54],
+  // Saturated annotation colours: the surface itself is neutral, so a family is
+  // identified by its colour alone rather than by being darker than a green ramp.
+  regions: [0.87, 0.42, 0.12],
+  connectors: [0.55, 0.28, 0.75],
+  skeleton: [0.38, 0.4, 0.44],
+  prm: [0.05, 0.48, 0.55],
+  // The direction field is drawn by its own class (`render/directionArrows.ts`); this colour
+  // is the one a marker or a legend entry for the family uses.
+  direction: [0.16, 0.45, 0.72],
 }
 
-/** Height above the terrain at which the overlays are drawn, metres. */
-const OVERLAY_LIFT = 1.5
-
-/** Outlines of the regions, as closed polylines lifted off the ground. */
-export function regionPaths(outlines: RegionOutline[]): WorldPoint[][] {
-  return outlines.map((outline) =>
-    outline.points.map((point): WorldPoint => [point.x, OVERLAY_LIFT, point.y]),
-  )
+/** Width of each family's lines, metres. */
+const OVERLAY_WIDTH_M: Readonly<Record<OverlayKind, number>> = {
+  regions: 0.8,
+  connectors: 1.0,
+  skeleton: 0.3,
+  prm: 0.28,
+  direction: 0.6,
 }
 
-/** Segments of the connectors, lifted off the ground. */
-export function connectorSegments(connectors: Connector[]): WorldPoint[][] {
-  return connectors.map((connector) => [
-    [connector.a[0], connector.a[1] + OVERLAY_LIFT, connector.a[2]],
-    [connector.b[0], connector.b[1] + OVERLAY_LIFT, connector.b[2]],
-  ])
+/** Opacity of each family: annotations, not obstacles. */
+const OVERLAY_ALPHA: Readonly<Record<OverlayKind, number>> = {
+  regions: 0.95,
+  connectors: 0.9,
+  skeleton: 0.45,
+  prm: 0.5,
+  direction: 0.85,
 }
 
-/** Segments of the roadmap edges, lifted off the ground. */
-export function prmSegments(nodes: PrmNode[], edges: PrmEdge[]): WorldPoint[][] {
-  const segments: WorldPoint[][] = []
-  for (const edge of edges) {
-    const from = nodes[edge.from]
-    const to = nodes[edge.to]
-    if (from === undefined || to === undefined) {
-      continue
-    }
-    segments.push([
-      [from.position[0], from.position[1] + OVERLAY_LIFT, from.position[2]],
-      [to.position[0], to.position[1] + OVERLAY_LIFT, to.position[2]],
-    ])
-  }
-  return segments
-}
+/** Size of a connector endpoint disc, metres. */
+const CONNECTOR_DISC_M = 1.4
 
-/** Edges of one skeleton block: a bottom and a top rectangle joined at the corners. */
-export function boxEdges(bounds: Aabb, height = 2, lift = 0): WorldPoint[][] {
-  const corners: Array<[number, number]> = [
-    [bounds.min_x, bounds.min_y],
-    [bounds.max_x, bounds.min_y],
-    [bounds.max_x, bounds.max_y],
-    [bounds.min_x, bounds.max_y],
-  ]
-  const edges: WorldPoint[][] = []
-  for (let index = 0; index < corners.length; index += 1) {
-    const current = corners[index]
-    const next = corners[(index + 1) % corners.length]
-    if (current === undefined || next === undefined) {
-      continue
-    }
-    edges.push([
-      [current[0], lift, current[1]],
-      [next[0], lift, next[1]],
-    ])
-    edges.push([
-      [current[0], lift + height, current[1]],
-      [next[0], lift + height, next[1]],
-    ])
-    edges.push([
-      [current[0], lift, current[1]],
-      [current[0], lift + height, current[1]],
-    ])
-  }
-  return edges
-}
-
-/** Edges of every skeleton block a viewer draws. */
-export function skeletonEdges(nodes: SkeletonNode[], maxDepth = 6): WorldPoint[][] {
-  const edges: WorldPoint[][] = []
-  for (const node of skeletonBlocks(nodes, maxDepth)) {
-    edges.push(...boxEdges(node.bounds, 2, OVERLAY_LIFT))
-  }
-  return edges
-}
+/** Radius of a roadmap node dot, metres. */
+const PRM_NODE_M = 0.9
 
 /** Every overlay family of one map, keyed by kind. */
 export class OverlaySet {
-  private readonly scene: Scene
+  private readonly mapScene: MapScene
+  private readonly scene: MapScene['scene']
   private readonly materials = new Map<OverlayKind, StandardMaterial>()
   private readonly parts = new Map<OverlayKind, AbstractMesh[]>()
 
-  constructor(scene: Scene) {
-    this.scene = scene
+  constructor(mapScene: MapScene) {
+    this.mapScene = mapScene
+    this.scene = mapScene.scene
   }
 
-  /** Draws the region outlines. */
-  setRegions(outlines: RegionOutline[]): void {
-    this.replace('regions', regionPaths(outlines), [])
+  /** Draws the region outlines, draped on the ground. */
+  setRegions(outlines: RegionOutline[], surface: SurfaceHeight = NO_SURFACE): void {
+    this.replace('regions', regionPaths(outlines, surface), [])
   }
 
-  /** Draws the connectors as segments with a block at each endpoint. */
+  /** Draws the connectors as segments with a disc at each endpoint. */
   setConnectors(connectors: Connector[]): void {
-    const markers: WorldPoint[] = []
-    for (const connector of connectors) {
-      markers.push(connector.a, connector.b)
-    }
-    this.replace('connectors', connectorSegments(connectors), markers)
+    this.replace('connectors', connectorSegments(connectors), connectorEndpoints(connectors))
   }
 
   /** Draws the quadtree blocks that were aggregated, up to `maxDepth`. */
-  setSkeleton(nodes: SkeletonNode[], maxDepth = 6): void {
-    this.replace('skeleton', skeletonEdges(nodes, maxDepth), [])
+  setSkeleton(nodes: SkeletonNode[], maxDepth = 6, surface: SurfaceHeight = NO_SURFACE): void {
+    this.replace('skeleton', skeletonEdges(nodes, maxDepth, surface), [])
   }
 
   /** Draws the roadmap edges and marks its interface and connector nodes. */
   setPrm(nodes: PrmNode[], edges: PrmEdge[]): void {
+    // Only the nodes that carry meaning get a symbol: a dot on every roadmap sample
+    // turns the graph into a field of dots, which hides the edges it exists to show.
     const markers = nodes
       .filter((node) => node.interface || node.connectorEndpoint)
       .map((node): WorldPoint => [
         node.position[0],
-        node.position[1] + OVERLAY_LIFT,
-        node.position[2],
+        node.position[2] + OVERLAY_LIFT,
+        node.position[1],
       ])
-    this.replace('prm', prmSegments(nodes, edges), markers)
+    this.replace('prm', prmSegments(nodes, edges), markers, PRM_NODE_M)
   }
 
   /** Shows or hides one family; the geometry stays loaded. */
@@ -188,8 +160,16 @@ export class OverlaySet {
   }
 
   /** Replaces one family's meshes, disposing what it held. */
-  private replace(kind: OverlayKind, lines: WorldPoint[][], markers: WorldPoint[]): void {
+  private replace(
+    kind: OverlayKind,
+    lines: WorldPoint[][],
+    markers: WorldPoint[],
+    markerRadius = CONNECTOR_DISC_M,
+  ): void {
     for (const mesh of this.parts.get(kind) ?? []) {
+      // The mesh carried its own colour, so its material goes with it; the shared disc
+      // material below is disposed with the set instead.
+      this.mapScene.untrackHeightMesh(mesh)
       mesh.dispose()
     }
     const parts: AbstractMesh[] = []
@@ -197,35 +177,76 @@ export class OverlaySet {
       parts.push(this.lineMesh(kind, lines))
     }
     for (const marker of markers) {
-      parts.push(this.marker(kind, marker))
+      parts.push(this.marker(kind, marker, markerRadius))
     }
     this.parts.set(kind, parts)
   }
 
-  /** Builds a line mesh in the family's colour. */
-  private lineMesh(kind: OverlayKind, lines: WorldPoint[][]): LinesMesh {
-    const mesh = CreateLineSystem(
+  /**
+   * Builds one mesh holding every line of a family.
+   *
+   * A family is many disconnected segments — thousands of roadmap edges, dozens of
+   * region outlines — and the builder takes them as one list of paths, so a family
+   * stays one draw call instead of one per segment.
+   */
+  private lineMesh(kind: OverlayKind, lines: WorldPoint[][]): AbstractMesh {
+    const mesh = CreateGreasedLine(
       `overlay:${kind}`,
-      { lines: lines.map(toVectors), updatable: false },
+      { points: lines.map((line) => line.flat()) },
+      {
+        width: OVERLAY_WIDTH_M[kind],
+        color: this.colourOf(kind),
+        // Scene units, not pixels: the annotation is a metre-wide band on the ground,
+        // which is the whole point of drawing it as a ribbon rather than as a line.
+        sizeAttenuation: false,
+        // The ribbon carries the colour itself, so the mesh needs no shared material;
+        // `Mesh.dispose()` releases it with the mesh.
+        colorMode: GreasedLineMeshColorMode.COLOR_MODE_SET,
+      },
       this.scene,
     )
-    mesh.material = this.materialFor(kind)
     mesh.isPickable = false
     mesh.renderingGroupId = 1
+    if (mesh.material !== null) {
+      // A depth offset rather than a large lift: the annotation hugs the ground it
+      // describes while still winning the depth test against it. Small, because an
+      // offset large enough to draw a *buried* line through the surface was what made
+      // every annotation look painted on the underside of the terrain.
+      mesh.material.zOffset = -1
+      mesh.material.alpha = OVERLAY_ALPHA[kind]
+    }
+    // Registered with the height exaggeration so the annotation scales with the ground
+    // it describes; a family drawn at the map's own metres would sink into a stretched
+    // terrain and float over a flattened one.
+    this.mapScene.trackHeightMesh(mesh)
     return mesh
   }
 
-  /** Builds a small block at a point, sized in metres. */
-  private marker(kind: OverlayKind, point: WorldPoint, size = 1.2): AbstractMesh {
-    const box = CreateBox(`overlay:${kind}:marker`, { size }, this.scene)
-    box.position = new Vector3(point[0], point[1], point[2])
-    box.material = this.materialFor(kind)
-    box.isPickable = false
-    box.renderingGroupId = 1
-    return box
+  /** Colour of one family, from the series palette. */
+  private colourOf(kind: OverlayKind): Color3 {
+    const [r, g, b] = OVERLAY_COLORS[kind]
+    return new Color3(r, g, b)
   }
 
-  /** The emissive material of one family, created on first use. */
+  /**
+   * Builds a flat disc at a point, sized in metres.
+   *
+   * A disc lies on the ground the way a map symbol does; the cube it replaces stood a
+   * metre and a half proud of the surface and, at a campus scale, read as a bigger
+   * object than the buildings it was marking.
+   */
+  private marker(kind: OverlayKind, point: WorldPoint, radius = CONNECTOR_DISC_M): AbstractMesh {
+    const disc = CreateDisc(`overlay:${kind}:marker`, { radius, tessellation: 16 }, this.scene)
+    disc.rotation.x = Math.PI / 2
+    disc.position = new Vector3(point[0], point[1], point[2])
+    disc.material = this.materialFor(kind)
+    disc.isPickable = false
+    disc.renderingGroupId = 1
+    this.mapScene.trackHeightMesh(disc)
+    return disc
+  }
+
+  /** The emissive material a family's discs use, created on first use. */
   private materialFor(kind: OverlayKind): StandardMaterial {
     const existing = this.materials.get(kind)
     if (existing !== undefined) {
@@ -238,12 +259,9 @@ export class OverlaySet {
     material.diffuseColor = color
     material.specularColor = new Color3(0, 0, 0)
     material.disableLighting = true
+    material.alpha = OVERLAY_ALPHA[kind]
+    material.zOffset = -1
     this.materials.set(kind, material)
     return material
   }
-}
-
-/** Converts a path of world triples into Babylon vectors. */
-function toVectors(path: WorldPoint[]): Vector3[] {
-  return path.map(([x, y, z]) => new Vector3(x, y, z))
 }

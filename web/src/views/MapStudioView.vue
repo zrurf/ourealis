@@ -41,8 +41,13 @@ import { regionOutlines } from '@/types/sections'
 import { LAYER_ELEVATION, chunkKey, selectLevel } from '@/types/map'
 import { INK_LIGHT, SERIES_PALETTE, rgbToHex } from '@/types/colormap'
 import { engineFromQuery, probeEngine } from '@/render/engine'
-import { MapScene, updateDebug } from '@/render/scene'
-import { TerrainLayer, buildChunkMesh } from '@/render/terrain'
+import { updateDebug } from '@/render/scene'
+import { renderHost, type SceneLease } from '@/render/host'
+import type { MapScene } from '@/render/scene'
+import { TerrainLayer } from '@/render/terrain'
+import { buildChunkMesh, chunkGrid } from '@/render/terrainMesh'
+import { createCellSampler } from '@/render/cellSampler'
+import { surfaceStyle } from '@/render/surfaceStyle'
 import { pickGround } from '@/render/picking'
 import { useMapsStore } from '@/stores/maps'
 import { useNotificationsStore } from '@/stores/notifications'
@@ -86,10 +91,14 @@ const baseName = ref<string | null>(null)
 const exporting = ref(false)
 
 let scene: MapScene | null = null
+let lease: SceneLease | null = null
 let terrain: TerrainLayer | null = null
 let draftMesh: LinesMesh | null = null
 let existingMesh: LinesMesh | null = null
 let markerMeshes: Mesh[] = []
+/** In-flight engine creation, so a second call joins it instead of starting another. */
+let sceneStart: Promise<void> | null = null
+let disposed = false
 
 /** Whether an image is available to edit. */
 const hasBase = computed(() => omf.sourceBytes !== null)
@@ -167,12 +176,29 @@ async function loadSurface(): Promise<void> {
         chunkId,
       }))
       await maps.loadChunks(refs, { concurrency: 4 })
+      const sample = createCellSampler({
+        chunks: maps.chunks,
+        grid,
+        chunkSize: info.summary.chunk_size,
+        level,
+        layerId: LAYER_ELEVATION,
+      })
       for (const chunkRef of refs) {
         const key = chunkKey(chunkRef.layerId, chunkRef.level, chunkRef.chunkId)
-        const chunk = maps.chunkOf(key)
-        if (chunk !== null) {
-          terrain.setChunk(key, buildChunkMesh(chunk, grid, info.summary.chunk_size))
+        if (maps.chunkOf(key) === null) {
+          continue
         }
+        terrain.setChunk(
+          key,
+          buildChunkMesh(
+            chunkGrid(grid, info.summary.chunk_size, level, chunkRef.chunkId, maps.originOf(id)),
+            sample,
+            // The studio draws on the map rather than reading it, so its surface stays
+            // smooth: terracing would move the ground under a region the reader is
+            // placing without telling them anything they are there to see.
+            surfaceStyle({ range: null, dark: false, terraceM: 0, sunAzimuthDeg: 315 }),
+          ),
+        )
       }
     }
     await loadExistingRegions()
@@ -193,6 +219,7 @@ async function loadExistingRegions(): Promise<void> {
     const section = await getRegions(id)
     const outlines = regionOutlines(section.json)
     existingMesh?.dispose()
+    existingMesh?.material?.dispose()
     existingMesh = null
     if (outlines.length === 0) {
       return
@@ -227,19 +254,41 @@ function FIRST_COLOUR(): string {
   return SERIES_PALETTE[0] ?? rgbToHex(INK_LIGHT)
 }
 
-/** Starts the engine and wires the surface picker. */
+/**
+ * Starts the engine and wires the surface picker.
+ *
+ * The creation is memoised as a promise rather than as `scene`, because the engine
+ * takes a WebGPU device request or a WebGL context to resolve: a second call during
+ * that window would see `scene` still null and start a second engine and render loop
+ * on the same canvas, orphaning the first.
+ */
 async function startScene(): Promise<void> {
   const canvasElement = canvas.value
   if (canvasElement === null || scene !== null) {
     return
   }
+  sceneStart ??= beginScene(canvasElement)
+  await sceneStart
+}
+
+/** Builds the scene and its terrain layer; called once per mount. */
+async function beginScene(canvasElement: HTMLCanvasElement): Promise<void> {
   const probe = await probeEngine({ forced: engineFromQuery() })
   if (probe.backend === null) {
+    sceneStart = null
     failure.value = t('map.viewer.engineFailed')
     status.value = 'failed'
     return
   }
-  scene = await MapScene.create({ canvas: canvasElement, backend: probe.backend })
+  const borrowing = await renderHost().acquire(canvasElement, probe.backend)
+  if (disposed) {
+    // The view went away while the engine was starting; giving the lease straight back
+    // parks the canvas rather than leaving a second render loop running.
+    borrowing.release()
+    return
+  }
+  lease = borrowing
+  scene = borrowing.scene
   terrain = new TerrainLayer(scene.scene, scene)
   updateDebug({ engine: probe.backend, mapId: mapId.value, frames: 0, loaded: false, error: null })
   scene.scene.onPointerUp = () => {
@@ -286,6 +335,33 @@ function readPick(): void {
   drawDraft()
 }
 
+/** The material the draft and the markers share, created once per scene. */
+let draftMaterial: StandardMaterial | null = null
+
+/**
+ * Material of the work in progress.
+ *
+ * Babylon's `Mesh.dispose()` does not dispose a mesh's material, and the draft is
+ * redrawn on every placed vertex, so creating one per redraw leaked a material per
+ * click for the life of the page.
+ */
+function draftMaterialFor(current: MapScene): StandardMaterial {
+  if (draftMaterial !== null) {
+    return draftMaterial
+  }
+  const material = new StandardMaterial('draftMaterial', current.scene)
+  material.disableLighting = true
+  material.emissiveColor = Color3.FromHexString(FIRST_COLOUR())
+  draftMaterial = material
+  return material
+}
+
+/** Releases the material of a scene that is going away. */
+function disposeDraftMaterial(): void {
+  draftMaterial?.dispose()
+  draftMaterial = null
+}
+
 /** Draws the work in progress: the draft outline or the connector's first endpoint. */
 function drawDraft(): void {
   const current = scene
@@ -298,9 +374,7 @@ function drawDraft(): void {
     mesh.dispose()
   }
   markerMeshes = []
-  const material = new StandardMaterial('draftMaterial', current.scene)
-  material.disableLighting = true
-  material.emissiveColor = Color3.FromHexString(FIRST_COLOUR())
+  const material = draftMaterialFor(current)
   const points =
     tool.value === 'regions'
       ? draftPoints.value
@@ -431,10 +505,13 @@ watch(mapId, async () => {
   cancelDraft()
   regionDrafts.value = []
   connectorDrafts.value = []
-  scene?.dispose()
+  lease?.release()
+  lease = null
   scene = null
+  sceneStart = null
   terrain = null
   existingMesh = null
+  disposeDraftMaterial()
   await loadSurface()
 })
 
@@ -452,15 +529,20 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  disposed = true
   draftMesh?.dispose()
   existingMesh?.dispose()
+  existingMesh?.material?.dispose()
   for (const mesh of markerMeshes) {
     mesh.dispose()
   }
   markerMeshes = []
+  disposeDraftMaterial()
   terrain?.dispose()
-  scene?.dispose()
+  lease?.release()
+  lease = null
   scene = null
+  sceneStart = null
   updateDebug({ mapId: null, loaded: false, error: null })
 })
 </script>
@@ -514,7 +596,7 @@ onBeforeUnmount(() => {
     <div class="mt-4 grid grid-cols-3 gap-6">
       <div class="col-span-2">
         <div class="relative h-[30rem] rounded-card border border-line bg-surface">
-          <canvas ref="canvas" class="block h-full w-full" data-testid="studio-canvas" />
+          <div ref="canvas" class="block h-full w-full" data-testid="studio-canvas" />
           <p class="absolute bottom-3 left-3 text-xs text-muted">
             {{
               tool === 'regions'

@@ -1,4 +1,4 @@
-//! Simulation jobs: submission, progress, results and exports.
+//! Simulation tasks: submission, progress, results and exports.
 //!
 //! A submission is validated here before it reaches the queue — the individual,
 //! the settings and the route shape — so a request that cannot run is refused
@@ -8,7 +8,7 @@
 //!
 //! The sample streams live in [`crate::api::streams`] and the event transports in
 //! [`crate::facade::sse`] and [`crate::facade::ws`]; their routes are merged here
-//! so the job API is assembled in one place.
+//! so the task API is assembled in one place.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -25,16 +25,15 @@ use ourealis_core::SimulationOutput;
 use serde::{Deserialize, Serialize};
 
 use crate::api::dto::result::{MetricSummary, SampleCountsDto, SummaryDto, TruthSampleDto};
-use crate::api::dto::simulation::{
-    JobStateDto, SimulationRequest, SimulationStateDto, SubmitReply,
-};
+use crate::api::dto::simulation::SimulationRequest;
 use crate::api::dto::{Page, PageQuery};
+use crate::api::dto::{SubmitReply, TaskState, TaskStateDto};
 use crate::api::error::{json_rejection, query_rejection};
 use crate::api::maps::path_rejection;
 use crate::api::streams::{attachment, truth_page};
 use crate::app::AppState;
 use crate::error::{Result, ServiceError};
-use crate::job::Job;
+use crate::task::Task;
 
 /// Export formats of the result endpoint.
 const EXPORT_FORMATS: [&str; 3] = ["json", "csv", "geojson"];
@@ -60,7 +59,7 @@ pub struct CompareRequest {
 /// The headline numbers of one run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComparedRun {
-    /// Job identifier.
+    /// Task identifier.
     pub id: String,
     /// Path ratio.
     pub path_ratio: f64,
@@ -130,20 +129,24 @@ pub struct KsResult {
     pub samples_b: usize,
 }
 
-/// Lists jobs, newest first.
+/// Lists tasks, newest first.
 pub async fn list(
     State(state): State<Arc<AppState>>,
     query: Result<Query<PageQuery>, QueryRejection>,
-) -> Result<Json<Page<SimulationStateDto>>> {
+) -> Result<Json<Page<TaskStateDto>>> {
     let query = query.map_err(query_rejection)?.0;
     let (offset, limit) = state.page(query);
-    let all = state.jobs.list();
+    // Runs only: the registry holds every kind of task, and a map build listed as a run
+    // would answer a comparison with "not a run".
+    let all = state
+        .tasks
+        .list_kind(crate::api::dto::TaskKindDto::Simulation);
     let total = all.len();
     let items = all
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|job| job.to_dto())
+        .map(|task| task.to_dto())
         .collect();
     Ok(Json(Page::new(items, total, offset)))
 }
@@ -156,12 +159,12 @@ pub async fn submit(
     let request = body.map_err(json_rejection)?.0;
     validate_request(&request)?;
     let id = crate::store::identifier(request.name.as_deref().unwrap_or("run"));
-    let job = state.runner.submit(id, request).await?;
+    let task = state.runner.submit_simulation(id, request).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(SubmitReply {
-            id: job.id().to_string(),
-            state: job.state(),
+            id: task.id().to_string(),
+            state: task.state(),
         }),
     ))
 }
@@ -189,26 +192,26 @@ pub(crate) fn validate_request(request: &SimulationRequest) -> Result<()> {
     Ok(())
 }
 
-/// State of one job.
+/// State of one task.
 pub async fn state_of(
     State(state): State<Arc<AppState>>,
     path: Result<Path<String>, PathRejection>,
-) -> Result<Json<SimulationStateDto>> {
+) -> Result<Json<TaskStateDto>> {
     let id = path.map_err(path_rejection)?.0;
-    Ok(Json(state.jobs.get(&id)?.to_dto()))
+    Ok(Json(state.tasks.get(&id)?.to_dto()))
 }
 
-/// Cancels a job.
+/// Cancels a task.
 pub async fn cancel(
     State(state): State<Arc<AppState>>,
     path: Result<Path<String>, PathRejection>,
 ) -> Result<StatusCode> {
     let id = path.map_err(path_rejection)?.0;
-    let job = state.jobs.get(&id)?;
-    if !job.cancel() {
+    let task = state.tasks.get(&id)?;
+    if !task.cancel() {
         return Err(ServiceError::Conflict(format!(
             "simulation {id} already finished with state {}",
-            job.state().to_string_name()
+            task.state().to_string_name()
         )));
     }
     tracing::info!("simulation {id} cancellation requested");
@@ -221,8 +224,8 @@ pub async fn summary(
     path: Result<Path<String>, PathRejection>,
 ) -> Result<Json<SummaryDto>> {
     let id = path.map_err(path_rejection)?.0;
-    let job = state.jobs.get(&id)?;
-    let output = finished(&job)?;
+    let task = state.tasks.get(&id)?;
+    let output = finished(&task)?;
     Ok(Json(build_summary(&id, &output)?))
 }
 
@@ -235,8 +238,8 @@ pub async fn truth(
     let id = path.map_err(path_rejection)?.0;
     let query = query.map_err(query_rejection)?.0;
     let (offset, limit) = state.page(query);
-    let job = state.jobs.get(&id)?;
-    let output = finished(&job)?;
+    let task = state.tasks.get(&id)?;
+    let output = finished(&task)?;
     Ok(Json(truth_page(&output, offset, limit)))
 }
 
@@ -263,13 +266,13 @@ pub async fn export(
             )));
         }
     };
-    let job = state.jobs.get(&id)?;
-    let output = finished(&job)?;
+    let task = state.tasks.get(&id)?;
+    let output = finished(&task)?;
     // A geo-referenced map turns the track into degrees; a purely local map keeps
     // metres and says so in the document's own properties.
     let frame = state
         .maps
-        .get(job.map_id())
+        .get(task.map_id())
         .ok()
         .and_then(|entry| entry.open().ok())
         .filter(|map| map.has_geo_reference())
@@ -288,8 +291,8 @@ pub async fn compare(
     body: Result<Json<CompareRequest>, JsonRejection>,
 ) -> Result<Json<CompareReply>> {
     let request = body.map_err(json_rejection)?.0;
-    let first = state.jobs.get(&request.a)?;
-    let second = state.jobs.get(&request.b)?;
+    let first = state.tasks.get(&request.a)?;
+    let second = state.tasks.get(&request.b)?;
     let first = finished(&first)?;
     let second = finished(&second)?;
     let samples_a = ourealis_core::eval::speed_samples(&first.trajectory);
@@ -323,7 +326,7 @@ pub async fn compare(
     }))
 }
 
-/// Every route of the job API, including the streaming routes and the two whose
+/// Every route of the task API, including the streaming routes and the two whose
 /// bodies the facades own (SSE and WebSocket).
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -334,35 +337,33 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/simulations/{id}/truth", get(truth))
         .route("/simulations/{id}/export", get(export))
         .merge(crate::api::streams::router())
-        .merge(crate::facade::sse::routes())
-        .merge(crate::facade::ws::routes())
 }
 
-/// The result of a finished job, or the reason it cannot be read.
+/// The result of a finished task, or the reason it cannot be read.
 ///
-/// A result evicted from memory is `unsupported` rather than `not_found`: the job
+/// A result evicted from memory is `unsupported` rather than `not_found`: the task
 /// exists and its seed reproduces the run exactly, so resubmitting is a real
 /// remedy and a 404 would be misleading.
-pub(crate) fn finished(job: &Job) -> Result<Arc<SimulationOutput>> {
-    match job.state() {
-        JobStateDto::Succeeded => job.result().ok_or_else(|| {
+pub(crate) fn finished(task: &Task) -> Result<Arc<SimulationOutput>> {
+    match task.state() {
+        TaskState::Succeeded => task.simulation_result().ok_or_else(|| {
             ServiceError::Unsupported(format!(
                 "the result of simulation {} was evicted from memory; resubmit it to reproduce the run from its seed",
-                job.id()
+                task.id()
             ))
         }),
-        JobStateDto::Failed => Err(ServiceError::Conflict(format!(
+        TaskState::Failed => Err(ServiceError::Conflict(format!(
             "simulation {} failed: {}",
-            job.id(),
-            job.to_dto().error.unwrap_or_else(|| "no message".to_string())
+            task.id(),
+            task.to_dto().error.unwrap_or_else(|| "no message".to_string())
         ))),
-        JobStateDto::Cancelled => Err(ServiceError::Conflict(format!(
+        TaskState::Cancelled => Err(ServiceError::Conflict(format!(
             "simulation {} was cancelled and has no result",
-            job.id()
+            task.id()
         ))),
         state => Err(ServiceError::Conflict(format!(
             "simulation {} is {} and has no result yet",
-            job.id(),
+            task.id(),
             state.to_string_name()
         ))),
     }

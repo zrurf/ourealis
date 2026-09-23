@@ -31,6 +31,7 @@ import {
   decodeChunk,
   defaultMapping,
   type DecodedChunk,
+  type PlaneOrigin,
 } from '@/types/map'
 import type { Aabb } from '@/api/types'
 
@@ -93,6 +94,19 @@ export const useMapsStore = defineStore('maps', () => {
     return grids.value.get(`${mapId}/${layerId}`) ?? null
   }
 
+  /**
+   * Origin of a map's local plane, from whichever summary is available.
+   *
+   * A map's cell indices start at `bounds` rather than at zero, so every metre
+   * position the renderer builds has to be offset by this. Read from the metadata
+   * first — it is what the chunk grids are read against — and fall back to the
+   * library entry, then to the origin, so a caller never has to pass it in.
+   */
+  function originOf(mapId: string): PlaneOrigin {
+    const bounds = metadataOf(mapId)?.summary.bounds ?? summaryOf(mapId)?.bounds
+    return { x: bounds?.min_x ?? 0, y: bounds?.min_y ?? 0 }
+  }
+
   /** Cached chunk by its key, if it has been fetched. */
   function chunkOf(key: string): DecodedChunk | null {
     return chunks.value.get(key) ?? null
@@ -121,7 +135,7 @@ export const useMapsStore = defineStore('maps', () => {
 
   /** Builds a synthetic map and returns the new entry, refreshing the list. */
   async function createSynthetic(spec: SyntheticSpec, name?: string): Promise<MapSummary> {
-    const summary = await createSyntheticMap(spec, name, api)
+    const summary = await createSyntheticMap(spec, name)
     summaries.value = [...summaries.value, summary]
     return summary
   }
@@ -176,13 +190,19 @@ export const useMapsStore = defineStore('maps', () => {
     const request = getChunk(target, 'base64', api)
       .then((payload) => {
         const decoded = decodeChunk(payload)
-        chunks.value = new Map(chunks.value).set(key, decoded)
-        if (failures.value.has(key)) {
-          // A plain `delete` would not be seen: `failures` is shallow, so the panel
-          // would keep reporting a failure that has since been resolved.
-          const remaining = new Map(failures.value)
-          remaining.delete(key)
-          failures.value = remaining
+        // The cache may have been dropped for another map while this read was in
+        // flight, and the key carries no map id, so storing it here would serve the
+        // previous map's cells under the new map's frame — the ground would look
+        // right in shape and wrong in content.
+        if (cacheMapId === target.mapId) {
+          chunks.value = new Map(chunks.value).set(key, decoded)
+          if (failures.value.has(key)) {
+            // A plain `delete` would not be seen: `failures` is shallow, so the panel
+            // would keep reporting a failure that has since been resolved.
+            const remaining = new Map(failures.value)
+            remaining.delete(key)
+            failures.value = remaining
+          }
         }
         return decoded
       })
@@ -250,7 +270,8 @@ export const useMapsStore = defineStore('maps', () => {
    * Chunk references that cover an area at a level.
    *
    * This is the "visible area only" rule: the caller passes the camera's footprint,
-   * and only chunks the layer actually stores come back.
+   * and only chunks the layer actually stores come back. The map's own origin is
+   * applied here because the caller's footprint is already in the map's coordinates.
    */
   function chunkRefsInArea(
     mapId: string,
@@ -263,7 +284,7 @@ export const useMapsStore = defineStore('maps', () => {
     if (grid === null) {
       return []
     }
-    return chunksInBounds(grid, chunkSize, level, area).map((chunkId) => ({
+    return chunksInBounds(grid, chunkSize, level, area, originOf(mapId)).map((chunkId) => ({
       mapId,
       layerId,
       level,
@@ -313,6 +334,7 @@ export const useMapsStore = defineStore('maps', () => {
     summaryOf,
     metadataOf,
     gridOf,
+    originOf,
     chunkOf,
     loadMaps,
     importOmf,

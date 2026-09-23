@@ -819,6 +819,9 @@ impl MapBuilder {
 
     fn global_stats(&self) -> GlobalStats {
         let mut channels: Vec<ChannelStats> = Vec::new();
+        let res = (self.spec.base_res_cm as f64 / 100.0).max(1e-6);
+        let map_cells = (((self.spec.bounds.max_x - self.spec.bounds.min_x) / res).ceil() as u64)
+            * (((self.spec.bounds.max_y - self.spec.bounds.min_y) / res).ceil() as u64);
         for desc in &self.layers {
             if !desc.kind.is_chunked() {
                 continue;
@@ -828,7 +831,17 @@ impl MapBuilder {
             let mut max = vec![f32::NEG_INFINITY; channels_count];
             let mut sum = vec![0.0f64; channels_count];
             let mut present = vec![0u64; channels_count];
-            for chunk in self.chunks.iter().filter(|c| c.layer_id == desc.layer_id) {
+            // Level 0 only. The levels above it are decimations of the same data,
+            // so folding them in would weight the map by how many levels it
+            // carries and would report a mean no cell of the map holds. The margin
+            // a chunk carries past the map edge is excluded for the same reason the
+            // `forbidden_ratio` below excludes it: the padding is always zero, so
+            // counting it drags every minimum down to zero and dilutes the mean.
+            for chunk in self
+                .chunks
+                .iter()
+                .filter(|c| c.layer_id == desc.layer_id && c.level == 0)
+            {
                 let Ok(payload) = codec::decode(
                     chunk.codec,
                     &chunk.shape,
@@ -840,12 +853,29 @@ impl MapBuilder {
                 let Ok(decoded) = crate::raster::unpack(desc, &chunk.shape, &payload) else {
                     continue;
                 };
-                for (index, value) in decoded.data.iter().enumerate() {
-                    let channel = index % channels_count;
-                    min[channel] = min[channel].min(*value);
-                    max[channel] = max[channel].max(*value);
-                    sum[channel] += *value as f64;
-                    present[channel] += 1;
+                let (in_map_w, in_map_h) = self.in_map_cells(chunk.chunk_id);
+                // Cells, not data words: a multi-channel layer interleaves its
+                // channels, so the stride from one cell to the next is the channel
+                // count, while the row stride the padding is measured against is
+                // the chunk width.
+                let row = chunk.shape.width as usize;
+                let rows = (chunk.shape.height as usize).min(in_map_h);
+                let columns = in_map_w.min(row);
+                for y in 0..rows {
+                    for x in 0..columns {
+                        let cell = (y * row + x) * channels_count;
+                        if cell + channels_count > decoded.data.len() {
+                            break;
+                        }
+                        for (channel, value) in
+                            decoded.data[cell..cell + channels_count].iter().enumerate()
+                        {
+                            min[channel] = min[channel].min(*value);
+                            max[channel] = max[channel].max(*value);
+                            sum[channel] += *value as f64;
+                            present[channel] += 1;
+                        }
+                    }
                 }
             }
             for channel in 0..channels_count {
@@ -858,7 +888,14 @@ impl MapBuilder {
                     min: min[channel],
                     max: max[channel],
                     mean: (sum[channel] / present[channel] as f64) as f32,
-                    coverage: 1.0,
+                    // Fraction of the map the channel covers: a layer that ships
+                    // every cell reports 1, one whose chunks are missing or whose
+                    // extent stops short reports what it actually carries.
+                    coverage: if map_cells == 0 {
+                        0.0
+                    } else {
+                        (present[channel] as f64 / map_cells as f64).min(1.0) as f32
+                    },
                 });
             }
         }

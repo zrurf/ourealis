@@ -992,3 +992,53 @@ fn pace_drift_runs_on_the_configured_time_constant() {
         "a twelve-fold longer time constant must vary more slowly: {slow:.4} against {fast:.4}"
     );
 }
+
+#[test]
+fn a_zero_speed_limit_is_reported_instead_of_walked_through() {
+    // `LimitModifier::new` accepts a factor of zero, which is a legitimate way to say
+    // "the runner may not pass here". The walk advances by `v * dt`, so it could not
+    // move at all: it used to spin until its sample budget ran out and then emit an
+    // arrival sample claiming the whole path, 20 m short of the goal, with thousands of
+    // samples of standing still in between.
+    let environment = flat_environment(&[]);
+    let path = straight_path(30.0);
+    let person = PersonParams::preset(Preset::Moderate);
+    let config = MotionConfig {
+        sample_rate_hz: 10.0,
+        profile: ProfileConfig {
+            modifiers: vec![LimitModifier::new(10.0, 20.0, 0.0)],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let profile = SpeedProfile::build_steady(
+        &path,
+        &environment.terrain,
+        &SpeedLimitParams::default(),
+        &person,
+        &config.profile,
+    )
+    .expect("profile");
+    assert!(
+        profile.speed_at(15.0) < 1e-9,
+        "the window this test is about must hold the runner still: {} m/s",
+        profile.speed_at(15.0)
+    );
+
+    let error = Trajectory::build(
+        path,
+        &environment.terrain,
+        &environment.hard,
+        &environment.distance,
+        &person,
+        &config,
+        11,
+        0,
+    )
+    .expect_err("a profile that forbids passing the window cannot produce a trajectory");
+    let message = error.to_string();
+    assert!(
+        message.contains("zero speed"),
+        "the report must name the cause: {message}"
+    );
+}

@@ -124,7 +124,7 @@ pub struct MetricSummary {
 /// Summary of a finished run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SummaryDto {
-    /// Job identifier.
+    /// Task identifier.
     pub id: String,
     /// Route length, metres.
     pub route_length_m: f64,
@@ -182,50 +182,50 @@ pub struct RoutePreview {
     pub speed_limit_s: Vec<f64>,
 }
 
-/// A progress or log event of a job.
+/// A progress or log event of a task.
 ///
 /// The same shape travels over SSE, WebSocket and the gRPC `Watch` stream, so a
 /// client can switch transports without changing its parser.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventDto {
-    /// The job changed state.
+    /// The task changed state.
     State {
         /// State after the change.
         state: String,
-        /// Stage the job is in.
+        /// Stage the task is in.
         stage: String,
         /// Progress, 0 to 1, or `None` while the service cannot say.
         progress: Option<f64>,
-        /// Wall-clock time the job has been running, seconds.
+        /// Wall-clock time the task has been running, seconds.
         elapsed_s: f64,
     },
-    /// The job entered a new pipeline stage.
+    /// The task entered a new pipeline stage.
     Stage {
         /// Stage name.
         stage: String,
         /// Progress, 0 to 1, or `None` while the service cannot say.
         progress: Option<f64>,
-        /// Wall-clock time the job has been running, seconds.
+        /// Wall-clock time the task has been running, seconds.
         elapsed_s: f64,
     },
-    /// A log line produced by the job.
+    /// A log line produced by the task.
     Log {
         /// Level: `trace`, `debug`, `info`, `warn` or `error`.
         level: String,
         /// Message, English.
         message: String,
-        /// Wall-clock time the job has been running, seconds.
+        /// Wall-clock time the task has been running, seconds.
         elapsed_s: f64,
     },
-    /// The job finished successfully.
+    /// The task finished successfully.
     Done {
         /// Final state.
         state: String,
         /// URL of the summary resource.
         summary_url: String,
     },
-    /// The job failed.
+    /// The task failed.
     Error {
         /// Failure classification.
         kind: String,

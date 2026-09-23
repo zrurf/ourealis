@@ -13,6 +13,7 @@
  */
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test'
 import { serviceGate } from '../support/service'
+import { buildSyntheticMap } from '../support/tasks'
 
 /** Whether this lane has a service, and what to say about it. */
 const service = serviceGate()
@@ -40,12 +41,7 @@ test.describe('simulation flow', () => {
     // run names it explicitly, because a request without a map is only accepted
     // while the library holds exactly one.
     mapName = `e2e simulation ${Date.now()}`
-    await request
-      .post(`/api/v1/maps/synthetic?name=${encodeURIComponent(mapName)}`, {
-        data: { preset: 'compact', seed: 0x0ddb1a5e },
-        failOnStatusCode: false,
-      })
-      .catch(() => null)
+    await buildSyntheticMap(request, { preset: 'compact', seed: 0x0ddb1a5e }, mapName)
   })
 
   test('a run submitted through the form reaches its result page', async ({ page }) => {
@@ -202,28 +198,6 @@ test.describe('simulation flow', () => {
     }
   })
 
-  test('the route studio plans candidates and samples the speed limits', async ({ page }) => {
-    service.skipUnlessAvailable()
-    test.setTimeout(120_000)
-
-    await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
-    await page.goto('/routes')
-    await expect(page.locator('h1')).toHaveText('Route studio')
-
-    await fillNumber(page, 'start-x', START.x)
-    await fillNumber(page, 'start-y', START.y)
-    await fillNumber(page, 'goal-x', GOAL.x)
-    await fillNumber(page, 'goal-y', GOAL.y)
-    await page.getByTestId('route-plan').click()
-
-    // The planning endpoints answer with drawable geometry, so the candidate table
-    // and the speed-limit curve are the service's own reply rendered.
-    await expect(page.getByTestId('candidate-table').locator('tbody tr').first()).toBeVisible({
-      timeout: 90_000,
-    })
-    await expect(page.getByTestId('speed-limit-chart').locator('canvas')).toBeVisible()
-  })
-
   test('the OMF inspector reads an image and writes an edit back', async ({ page }) => {
     service.skipUnlessAvailable()
     test.setTimeout(120_000)
@@ -272,7 +246,7 @@ test.describe('simulation flow', () => {
     const mapId = await firstMapId(page)
     const pages: Array<{ path: string; heading: string }> = [
       { path: '/', heading: 'Overview' },
-      { path: '/routes', heading: 'Route studio' },
+      { path: '/run', heading: 'Run workspace' },
       { path: '/batch', heading: 'Batch runs' },
       { path: '/omf', heading: 'OMF inspector' },
       { path: '/settings', heading: 'Settings' },

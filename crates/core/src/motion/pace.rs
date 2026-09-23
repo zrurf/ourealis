@@ -111,6 +111,10 @@ pub struct IterationOutcome {
     /// Iterations performed.
     pub iterations: usize,
     /// True when the convergence threshold was met.
+    ///
+    /// An iteration that ran out of its budget without meeting the threshold
+    /// reports `false` here even though its profile is still returned; the
+    /// remaining disagreement is `last_change_s`.
     pub converged: bool,
     /// True when the iteration diverged and the even-pace fallback was used.
     pub fell_back: bool,
@@ -164,7 +168,6 @@ impl ConvergenceTracker {
                 && abs_change > self.previous_change
                 && abs_change > self.control.convergence_s);
         let converged = abs_change <= self.control.convergence_s;
-        let last_iteration = iteration >= self.control.max_iterations;
 
         self.previous_change = abs_change;
         self.previous_total = damped;
@@ -172,7 +175,7 @@ impl ConvergenceTracker {
         IterationOutcome {
             total_time_s: damped,
             iterations: iteration,
-            converged: converged || last_iteration,
+            converged,
             fell_back: diverging,
             last_change_s: abs_change,
         }

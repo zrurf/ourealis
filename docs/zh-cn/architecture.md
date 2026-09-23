@@ -1,14 +1,19 @@
 # 架构文档
 
-## 两个 crate，一个依赖方向
+## 三个 crate，一个依赖方向
 
 ```mermaid
 flowchart BT
     CORE["ourealis-core<br/>模拟器"] -->|path dependency| FMT["ourealis-map-format<br/>OMF 容器"]
+    SVC["crates/service<br/>二进制 ourealis"] -->|path dependency| CORE
+    SVC -->|path dependency| FMT
 ```
 
 `ourealis-core` 通过 `ourealis-map-format` 读地图，反向依赖不存在。因此地图工具可以只依赖格式
 crate 构建而不拉入模拟器，也不会有任何格式决策被"模拟器想这么用"倒逼。
+
+`crates/service` 是唯一知道网络存在的 crate：三个门面、作业表与内嵌页面都在这里。`core` 不因它引入
+任何网络依赖，也不引入 `async`——一次运行是同步调用，在阻塞工作线程上执行。
 
 `ourealis-core` 内部是一条模块组的链，每一段只消费上一段的输出：
 
@@ -125,6 +130,75 @@ pub trait ComputeBackend: Send + Sync {
 
 键的各字段逐项混合而不是按位段打包，因此不存在两个逻辑上独立的流共用同一个键。区域事件另有一种
 空间确定性触发模式：触发与否与偏差方向来自哈希而非抽样（见[设计文档](design.md) §6.3）。
+
+## 服务
+
+`crates/service`（crate 名与二进制名均为 `ourealis`）是一个进程，三个门面架在同一层 API 之上。
+处理函数返回 DTO，门面把它变成 JSON 或 protobuf，因此两种线格式不可能对同一个资源有不同说法：
+
+```mermaid
+flowchart TB
+    subgraph FACADES["facade/ — 传输"]
+        HTTP["http.rs<br/>axum：REST、WS、SSE"]
+        RPC["rpc.rs<br/>tonic：gRPC"]
+        WEB["web.rs<br/>内嵌页面"]
+    end
+    API["api/ — 处理函数、DTO、错误映射"]
+    TASK["task/ — 任务表、闸门、事件"]
+    STORE["store/ — 地图库"]
+    CORE["ourealis-core"]
+    FACADES --> API
+    API --> TASK
+    API --> STORE
+    TASK --> CORE
+    TASK --> STORE
+```
+
+* **`api/`**：处理函数、DTO（`dto/`）以及唯一一处错误映射（`error.rs`）——它把 `ServiceError`
+  变成 HTTP 状态码与 gRPC code，处理函数自己不构造任何一种。
+* **`task/`**：执行层。一张任务表装下所有耗时操作——一次运行、一次路线预览、一次路线规划、一次地图生成——
+  共用状态机、事件总线与一个信号量闸门。运行只是四种任务之一；它的结果是一整份 `SimulationOutput`，
+  因此按页从模拟端点上读，而不是从 `/tasks/{id}/result` 取。
+* **`store/`**：地图库（内存或磁盘），也是 id 校验发生的地方——一个 id 只有在 `validate_id` 接受之后才会落到文件路径上。
+* **前端不在这个 crate 里**：页面是独立的 Vite 工程，由 `build.rs` 内嵌进二进制，两者同版本发布，
+  因此页面不可能与它所调用的 API 脱节。
+
+耗时操作之所以是任务，是因为一个请求不该被挂住几分钟：提交返回 ticket，工作在阻塞工作线程上跑，
+结果、事件与取消都通过这个 ticket 寻址。不依赖地图的校验在提交时完成，所以"个体参数非法""采样率荒谬"
+是调用当场返回的 `400`；需要地图的那些失败（镜像损坏、无可行路径）才表现为任务失败并带消息。
+
+`api/feasibility.rs` 是唯一一个不规划就能回答"地图上能不能站人"的查询：给定若干点，读硬禁行位图与最近禁行格的距离，
+回答 `ok` / `outside` / `forbidden` / `too_close`。它存在的原因是页面画得出地表却看不见其中的约束，
+而把点落在墙上的人应该当场知道。
+
+## Web 应用
+
+`web/` 是 Vite + Vue 3 的单页应用。它的结构只有一条规则：渲染层不知道 Vue，状态层不知道 Babylon。
+
+```
+web/src/
+├── api/          每个资源一个模块：传输与 DTO 镜像，不含状态
+├── stores/       pinia：system、theme、locale、maps、viewer、workspace、tasks、
+│                 simulations、omf、notifications
+├── render/       Babylon：scene、terrain、shading、layers、overlays、handles、
+│                 picking、inspect、host、engine——尽可能写成纯函数
+├── components/   map/（画布浮层）、run/（工作区面板）、forms/、charts/、
+│                 layout/、common/、trajectory/
+├── views/        每个路由一个
+└── locales/      en（权威）与 zh-CN，键集一致性由单元测试强制
+```
+
+有两处值得点名：
+
+* **`render/host.ts`** 为整个会话持有引擎与画布，并把它借给某一个视图。引擎的代价是一个图形设备
+  （WebGPU adapter 请求或 WebGL 上下文），而把画布在父节点之间移动不会丢上下文——因此预览、工作区、
+  地图制作与轨迹页共用一台设备，而不是各建一台。渲染循环只在有视图持有租约时运行。
+* **`stores/workspace.ts`** 持有描述一次运行的草稿以及这份草稿的规划结果。它正是"地图上画的路线就是提交的路线"
+  这条保证的来源：在它之前，工作室与提交表单各存一份，来回切换就把规划结果丢了。
+
+页面发起的耗时操作都经过 **`stores/tasks.ts`**：提交、跟踪 ticket、按服务端上报的 kind 解包结果、报告结果。
+需要等待的操作显示为模态环形加载器（带实测耗时与取消按钮），其余在顶栏的任务托盘里报告。
+两者都不显示百分比——模拟器的一次运行是一次调用，没有可报的分数。
 
 ## 约定
 

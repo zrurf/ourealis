@@ -9,6 +9,7 @@
 pub mod map;
 pub mod result;
 pub mod simulation;
+pub mod task;
 
 pub use map::{
     ChunkData, LayerGridDto, LayerInfo, MapMetadata, MapSummary, Page, SectionJson, SkeletonDto,
@@ -17,9 +18,10 @@ pub use result::{
     EventDto, MetricSummary, RoutePreview, RoutePreviewCandidate, SampleCountsDto, SensorSampleDto,
     SummaryDto, TruthSampleDto,
 };
-pub use simulation::{
-    JobStateDto, PersonOverrides, PersonSpec, SimulationRequest, SimulationSettings,
-    SimulationStateDto, SubmitReply,
+pub use simulation::{PersonOverrides, PersonSpec, SimulationRequest, SimulationSettings};
+pub use task::{
+    SubmitReply, TaskKindDto, TaskReply, TaskResultDto, TaskResultRef, TaskState, TaskStateDto,
+    TaskSubmit,
 };
 
 use serde::{Deserialize, Serialize};

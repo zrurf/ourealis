@@ -5,5 +5,6 @@ pub mod resample;
 
 pub use polyline::Path;
 pub use resample::{
-    cumulative_lengths, curvatures, deduplicate, max_turn_angle, resample, turn_angle,
+    MIN_SEGMENT_M, cumulative_lengths, curvatures, deduplicate, max_turn_angle, resample,
+    turn_angle,
 };

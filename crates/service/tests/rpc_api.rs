@@ -7,7 +7,9 @@
 
 mod fixtures;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
 
 use ourealis::app::Service;
 use ourealis::proto::v1;
@@ -21,6 +23,32 @@ async fn start() -> (Service, String) {
     let service = Service::start(config).await.expect("service starts");
     let port = service.rpc_addr().expect("rpc bound").port();
     (service, format!("http://127.0.0.1:{port}"))
+}
+
+/// Polls a task ticket until it reaches a terminal state.
+async fn wait_for_task(
+    tasks: &mut v1::task_service_client::TaskServiceClient<tonic::transport::Channel>,
+    id: &str,
+) -> v1::TaskRecord {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let record = tasks
+            .get(v1::GetTaskRequest { id: id.to_string() })
+            .await
+            .expect("state")
+            .into_inner();
+        if record.state == v1::TaskState::Succeeded as i32
+            || record.state == v1::TaskState::Failed as i32
+            || record.state == v1::TaskState::Cancelled as i32
+        {
+            return record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {id} did not finish: {record:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -53,7 +81,7 @@ async fn the_system_service_reports_build_and_capabilities() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_map_imported_over_a_client_stream_is_readable_over_the_same_channel() {
     let (service, endpoint) = start().await;
-    let mut maps = v1::map_service_client::MapServiceClient::connect(endpoint)
+    let mut maps = v1::map_service_client::MapServiceClient::connect(endpoint.clone())
         .await
         .expect("connect");
 
@@ -142,8 +170,13 @@ async fn a_map_imported_over_a_client_stream_is_readable_over_the_same_channel()
         "Get and List must agree on when a map was created"
     );
     assert!(
-        metadata.has_prm || !metadata.has_prm,
-        "the flag is set either way"
+        !metadata.has_prm && !metadata.has_kpath_library,
+        "the synthetic fixture carries neither a roadmap nor a candidate library, so both \
+         capability flags must be false: they are read from the layer table, not assumed"
+    );
+    assert_eq!(
+        fetched.layer_count, list.items[0].layer_count,
+        "Get and List must agree on the layer count"
     );
 
     // The inspector reads an image that was never imported.
@@ -236,9 +269,10 @@ async fn a_run_submitted_over_grpc_streams_its_events_and_samples() {
     })
     .to_string();
 
-    let mut simulations = v1::simulation_service_client::SimulationServiceClient::connect(endpoint)
-        .await
-        .expect("connect");
+    let mut simulations =
+        v1::simulation_service_client::SimulationServiceClient::connect(endpoint.clone())
+            .await
+            .expect("connect");
     let reply = simulations
         .submit(v1::SubmitRequest {
             request_json: request.clone(),
@@ -246,7 +280,7 @@ async fn a_run_submitted_over_grpc_streams_its_events_and_samples() {
         .await
         .expect("submit")
         .into_inner();
-    assert_eq!(reply.state, v1::JobState::Queued as i32);
+    assert_eq!(reply.state, v1::TaskState::Queued as i32);
     assert!(!reply.id.is_empty());
 
     // The watch stream must deliver progress and end with the terminal event.
@@ -282,7 +316,7 @@ async fn a_run_submitted_over_grpc_streams_its_events_and_samples() {
         .await
         .expect("state")
         .into_inner();
-    assert_eq!(state.state, v1::JobState::Succeeded as i32);
+    assert_eq!(state.state, v1::TaskState::Succeeded as i32);
     assert_eq!(state.name, "grpc run");
     assert!(
         state.created_at_unix_ms > 1_600_000_000_000,
@@ -453,15 +487,36 @@ async fn a_run_submitted_over_grpc_streams_its_events_and_samples() {
         .expect_err("an unknown channel must fail");
     assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error}");
 
-    // A route preview over gRPC matches the HTTP shape.
-    let preview = simulations
-        .preview(v1::RoutePreviewRequest {
-            request_json: request,
+    // A route preview is a task, and the task service submits and reports it.
+    let mut tasks = v1::task_service_client::TaskServiceClient::connect(endpoint.clone())
+        .await
+        .expect("connect");
+    let submitted = tasks
+        .submit(v1::SubmitTaskRequest {
+            body_json: serde_json::to_string(&json!({
+                "kind": "route_preview",
+                "request": serde_json::from_str::<Value>(&request).expect("the request parses"),
+            }))
+            .expect("body"),
         })
         .await
-        .expect("preview")
+        .expect("submit")
         .into_inner();
-    assert!(preview.preview_json.contains("candidates"));
+    assert_eq!(submitted.kind, v1::TaskKind::RoutePreview as i32);
+    let ticket = wait_for_task(&mut tasks, &submitted.id).await;
+    assert_eq!(ticket.state, v1::TaskState::Succeeded as i32, "{ticket:?}");
+    let result = tasks
+        .result(v1::TaskResultRequest {
+            id: submitted.id.clone(),
+        })
+        .await
+        .expect("result")
+        .into_inner();
+    assert!(
+        result.result_json.contains("candidates"),
+        "the preview must carry the candidate set: {}",
+        result.result_json
+    );
 
     // Cancelling a finished job is a conflict.
     let error = simulations

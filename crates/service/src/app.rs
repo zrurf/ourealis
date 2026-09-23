@@ -13,8 +13,8 @@ use crate::api::dto::PageQuery;
 use crate::api::{API_PREFIX, API_VERSION};
 use crate::config::Config;
 use crate::error::{Result, ServiceError};
-use crate::job::{JobContext, JobRegistry, JobRunner};
 use crate::store::{self, MapStore};
+use crate::task::{TaskContext, TaskRegistry, TaskRunner};
 
 /// Build facts reported by the system endpoints.
 #[derive(Debug, Clone)]
@@ -61,10 +61,10 @@ pub struct AppState {
     pub config: Config,
     /// Map library.
     pub maps: Arc<dyn MapStore>,
-    /// Job registry.
-    pub jobs: Arc<JobRegistry>,
-    /// Job admission and execution.
-    pub runner: Arc<JobRunner>,
+    /// Task registry: runs, plans and map builds share it.
+    pub tasks: Arc<TaskRegistry>,
+    /// Task admission and execution.
+    pub runner: Arc<TaskRunner>,
     /// Build facts.
     pub build: BuildInfo,
     /// Start time of the process, Unix milliseconds.
@@ -75,18 +75,18 @@ impl AppState {
     /// Builds the state, opening the configured store.
     pub fn new(config: Config) -> Result<Arc<Self>> {
         let maps = store::open(&config.storage)?;
-        let jobs = Arc::new(JobRegistry::new(config.simulation.keep_results));
-        let context = Arc::new(JobContext {
+        let tasks = Arc::new(TaskRegistry::new(config.simulation.keep_results));
+        let context = Arc::new(TaskContext {
             maps: Arc::clone(&maps),
             max_concurrent: config.simulation.max_concurrent,
             queue_capacity: config.simulation.queue_capacity,
             with_metrics: config.simulation.with_metrics,
         });
-        let runner = Arc::new(JobRunner::new(context, Arc::clone(&jobs)));
+        let runner = Arc::new(TaskRunner::new(context, Arc::clone(&tasks)));
         Ok(Arc::new(Self {
             config,
             maps,
-            jobs,
+            tasks,
             runner,
             build: BuildInfo::current(),
             started_at_ms: crate::api::time::now_unix_ms(),

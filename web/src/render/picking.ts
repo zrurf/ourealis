@@ -72,15 +72,19 @@ export function pickGround(
   y: number,
   options: { targets?: AbstractMesh[]; planeY?: number } = {},
 ): PickResult {
-  const ray = scene.createPickingRay(x, y, null, null)
   const targets = options.targets
   if (targets !== undefined && targets.length > 0) {
-    const hit = scene.pickWithRay(ray, (mesh) => targets.includes(mesh))
+    // `scene.pick` rather than a ray built by hand: the scene's pick uses the same
+    // coordinate convention its own pointer events established, which is what keeps a
+    // hit on a canvas of any size landing where the reader clicked.
+    const allowed = new Set(targets)
+    const hit = scene.pick(x, y, (mesh) => allowed.has(mesh))
     if (hit?.hit === true && hit.pickedPoint !== null) {
       const point = hit.pickedPoint
       return { point: { x: point.x, y: point.z, z: point.y, onTerrain: true }, source: 'terrain' }
     }
   }
+  const ray = scene.createPickingRay(x, y, null, null)
   const fallback = planeIntersection(
     [ray.origin.x, ray.origin.y, ray.origin.z],
     [ray.direction.x, ray.direction.y, ray.direction.z],

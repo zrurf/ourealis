@@ -81,6 +81,20 @@ test.describe('map viewer', () => {
     await expect.poll(async () => ((await debugState(page))?.frames ?? 0) > afterToggle).toBe(true)
     await page.getByTestId('layer-1').click()
 
+    // An overlay switched off and on again is drawn again. It was not: the geometry was
+    // loaded once and the early return left it hidden for the rest of the session, so
+    // the second switch did nothing at all.
+    const regions = page.getByTestId('overlay-regions')
+    if (!(await regions.isDisabled())) {
+      await regions.click()
+      await expect(regions).toHaveClass(/t-is-checked/)
+      await regions.click()
+      await expect(regions).not.toHaveClass(/t-is-checked/)
+      await regions.click()
+      await expect(regions).toHaveClass(/t-is-checked/)
+      await expect.poll(async () => (await debugState(page))?.frames ?? 0).toBeGreaterThan(0)
+    }
+
     expect(problems).toEqual([])
   })
 

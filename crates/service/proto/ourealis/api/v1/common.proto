@@ -27,6 +27,16 @@ message Aabb {
   double max_y = 4;
 }
 
+// Progress and log event of a task, identical to the SSE stream.
+message Event {
+  // "state", "stage", "log", "done" or "error".
+  string type = 1;
+  // Event payload as JSON, shaped like the corresponding HTTP event.
+  string data_json = 2;
+  // Server time of the event, Unix milliseconds.
+  int64 at_unix_ms = 3;
+}
+
 // Health of the service process.
 message HealthReply {
   // "ok" while the process serves requests.

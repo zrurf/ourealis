@@ -21,13 +21,14 @@
 pub mod base64;
 pub mod dto;
 pub mod error;
+pub mod feasibility;
 pub mod maps;
 pub mod omf;
 pub mod presets;
-pub mod routes;
 pub mod simulations;
 pub mod streams;
 pub mod system;
+pub mod tasks;
 pub mod time;
 pub mod version;
 
@@ -44,8 +45,13 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .merge(system::router())
         .merge(maps::router())
+        .merge(feasibility::router())
         .merge(omf::router())
         .merge(presets::router())
-        .merge(routes::router())
+        .merge(tasks::router())
         .merge(simulations::router())
+        // The event and socket transports serve any task, so they are mounted once
+        // here rather than by each module that happens to expose a ticket.
+        .merge(crate::facade::sse::routes())
+        .merge(crate::facade::ws::routes())
 }

@@ -30,7 +30,7 @@ const STEPS_PER_ROUTE = 8
  * error states of unknown identifiers are asserted directly instead, in
  * `tests/e2e/simulation.spec.ts`.
  */
-const ROUTES = ['/', '/maps', '/routes', '/batch', '/omf', '/settings']
+const ROUTES = ['/', '/maps', '/run', '/batch', '/omf', '/settings']
 
 /** Deterministic 32-bit generator, so the walk replays from the seed alone. */
 function mulberry32(seed: number): () => number {

@@ -23,6 +23,7 @@
 
 import { expect, test, type APIRequestContext } from '@playwright/test'
 import { serviceGate } from '../support/service'
+import { buildSyntheticMap } from '../support/tasks'
 
 /** API prefix, matching the service's `API_PREFIX`. */
 const API = '/api/v1'
@@ -79,17 +80,22 @@ async function assertHealthy(request: APIRequestContext, context: string): Promi
 async function seedMap(
   request: APIRequestContext,
 ): Promise<{ id: string; image: Buffer; sizeBytes: number }> {
-  const built = await request.post(`${API}/maps/synthetic`, {
-    data: { preset: 'compact', seed: 11, with_kpath_library: false },
+  // Map generation is a task: submit, wait for the ticket, read the map from it.
+  const id = await buildSyntheticMap(request, {
+    preset: 'compact',
+    seed: 11,
+    with_kpath_library: false,
   })
-  expect(built.status(), 'the service must be able to build a synthetic map').toBe(201)
-  const summary = (await built.json()) as { id: string; size_bytes: number }
+  const summary = (await request.get(`${API}/maps/${id}`).then((reply) => reply.json())) as {
+    summary: { size_bytes: number }
+  }
+  const sizeBytes = summary.summary.size_bytes
 
-  const image = await request.get(`${API}/maps/${summary.id}/image`)
+  const image = await request.get(`${API}/maps/${id}/image`)
   expect(image.status(), 'the stored image must be downloadable').toBe(200)
   const bytes = Buffer.from(await image.body())
-  expect(bytes.length).toBe(summary.size_bytes)
-  return { id: summary.id, image: bytes, sizeBytes: summary.size_bytes }
+  expect(bytes.length, 'the stored image is what the summary says').toBe(sizeBytes)
+  return { id, image: bytes, sizeBytes }
 }
 
 test('random bytes are refused as a bad image', async ({ request }) => {

@@ -18,7 +18,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::builder::{MapBuilder, PartitionOptions};
 use crate::codec::id as codec_id;
-use crate::error::Result;
+use crate::error::{MapError, Result};
 use crate::geometry::Aabb;
 use crate::layer::{DType, LayerDesc, LayerId, LayerKind};
 use crate::motion::MotionMode;
@@ -53,6 +53,24 @@ pub mod feature {
     /// Street lighting.
     pub const LIGHTING: u8 = 3;
 }
+
+/// Cell size in metres.
+pub const MIN_RESOLUTION_M: f64 = 0.01;
+
+/// Largest desired cell size the generator accepts, metres.
+///
+/// The header stores the resolution in centimetres, so anything past 655 m
+/// cannot be recorded and the file would describe a different grid than the one
+/// it holds.
+pub const MAX_RESOLUTION_M: f64 = 100.0;
+
+/// Largest grid the generator will rasterise, in cells.
+///
+/// A rasterised layer is one `f32` per cell and the generator builds seven of
+/// them, so this bound is what turns an impossible request into an error instead
+/// of an aborting allocation. Eight million cells is about 2.8 km square at 1 m,
+/// well above the campus scale the generator is meant for.
+pub const MAX_CELLS: u64 = 8_000_000;
 
 /// Description of the map to generate.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -111,12 +129,72 @@ impl SyntheticMapSpec {
         }
     }
 
+    /// Resolution the generator actually rasterises at, metres.
+    ///
+    /// The header records the resolution in whole centimetres and every reader
+    /// derives cell geometry from that field, so the raster must use the rounded
+    /// value: rasterising at the raw one would place every cell a fraction of a
+    /// centimetre away from where the file says it is, and on a sub-centimetre
+    /// request the two would describe different grids entirely.
+    pub fn effective_resolution_m(&self) -> f64 {
+        ((self.resolution_m * 100.0).round() / 100.0).max(MIN_RESOLUTION_M)
+    }
+
     /// Cell dimensions of the generated grids.
     pub fn cell_dims(&self) -> (u32, u32) {
+        let resolution = self.effective_resolution_m();
         (
-            (self.width_m / self.resolution_m).ceil() as u32,
-            (self.height_m / self.resolution_m).ceil() as u32,
+            (self.width_m / resolution).ceil() as u32,
+            (self.height_m / resolution).ceil() as u32,
         )
+    }
+
+    /// Number of cells the generated grids hold.
+    pub fn cells(&self) -> u64 {
+        let (width, height) = self.cell_dims();
+        u64::from(width).saturating_mul(u64::from(height))
+    }
+
+    /// Checks the spec before anything is allocated for it.
+    ///
+    /// The generator holds one `f32` per cell per layer and the encoder another
+    /// copy, so an unbounded request is not a slow run but an aborting
+    /// allocation. Rejecting it here keeps that decision in the library instead
+    /// of relying on every caller to bound its inputs.
+    pub fn validate(&self) -> Result<()> {
+        if !self.width_m.is_finite() || !self.height_m.is_finite() {
+            return Err(MapError::Invalid("map extent must be finite".into()));
+        }
+        if !self.resolution_m.is_finite() {
+            return Err(MapError::Invalid("map resolution must be finite".into()));
+        }
+        if self.resolution_m < MIN_RESOLUTION_M {
+            return Err(MapError::Invalid(format!(
+                "map resolution {} m is below the {MIN_RESOLUTION_M} m the header can record",
+                self.resolution_m
+            )));
+        }
+        if self.resolution_m > MAX_RESOLUTION_M {
+            return Err(MapError::Invalid(format!(
+                "map resolution {} m exceeds the {MAX_RESOLUTION_M} m maximum",
+                self.resolution_m
+            )));
+        }
+        if self.chunk_size == 0 {
+            return Err(MapError::Invalid("chunk size must not be zero".into()));
+        }
+        let cells = self.cells();
+        if cells == 0 {
+            return Err(MapError::Invalid(
+                "map extent is smaller than one cell".into(),
+            ));
+        }
+        if cells > MAX_CELLS {
+            return Err(MapError::Invalid(format!(
+                "map needs {cells} cells, above the {MAX_CELLS} the generator will rasterise"
+            )));
+        }
+        Ok(())
     }
 
     /// Map extent in the local metre plane.
@@ -175,6 +253,9 @@ impl SyntheticLayers {
 }
 
 /// Rasterises the synthetic map without encoding it.
+///
+/// The spec must pass [`SyntheticMapSpec::validate`]; every entry point in this
+/// module validates before calling here.
 pub fn rasterise(spec: &SyntheticMapSpec) -> SyntheticLayers {
     let dims = spec.cell_dims();
     let cells = dims.0 as usize * dims.1 as usize;
@@ -191,8 +272,6 @@ pub fn rasterise(spec: &SyntheticMapSpec) -> SyntheticLayers {
     };
 
     let mut rng = ChaCha8Rng::seed_from_u64(spec.seed);
-    let res_x = spec.width_m / dims.0 as f64;
-    let res_y = spec.height_m / dims.1 as f64;
 
     // Roads: a ring road plus two crossing streets.
     let road_width = 8.0;
@@ -350,8 +429,6 @@ pub fn rasterise(spec: &SyntheticMapSpec) -> SyntheticLayers {
         }
     }
 
-    let _ = res_x;
-    let _ = res_y;
     layers
 }
 
@@ -592,6 +669,7 @@ pub fn connectors(layers: &SyntheticLayers, spec: &SyntheticMapSpec) -> Connecto
 
 /// Builds a complete synthetic map image.
 pub fn build(spec: &SyntheticMapSpec) -> Result<Vec<u8>> {
+    spec.validate()?;
     let layers = rasterise(spec);
     let dims = layers.dims;
 
@@ -600,7 +678,7 @@ pub fn build(spec: &SyntheticMapSpec) -> Result<Vec<u8>> {
         ref_lat: 39.909_f64.to_radians(),
         epsg: 0,
         bounds: layers.bounds,
-        base_res_cm: (spec.resolution_m * 100.0).round() as u16,
+        base_res_cm: (spec.effective_resolution_m() * 100.0).round() as u16,
         chunk_size: spec.chunk_size,
         lod_count: 3,
     };
@@ -812,6 +890,7 @@ fn crate_candidate_param_set_id() -> u32 {
 /// The layers are what the examples use to draw or cross-check the map without
 /// decoding it again.
 pub fn build_with_layers(spec: &SyntheticMapSpec) -> Result<(Vec<u8>, SyntheticLayers)> {
+    spec.validate()?;
     let layers = rasterise(spec);
     let bytes = build(spec)?;
     Ok((bytes, layers))

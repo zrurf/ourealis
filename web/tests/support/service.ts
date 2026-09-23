@@ -21,8 +21,8 @@ const HEALTH_URL = `${SERVICE_URL}/api/v1/health`
 
 /** Message a lane shows when nothing answered, including how to start the service. */
 export const SERVICE_REASON = `no service answered at ${HEALTH_URL}: start one from the repository root with
-  cargo run -p ourealis -- --config web/tests/fixtures/service.toml
-or run the built binary with ./target/debug/ourealis --config web/tests/fixtures/service.toml, then point the lane at it with OUREALIS_SERVICE_URL=${SERVICE_URL}. Set OUREALIS_ALLOW_SKIP=1 to skip the lane instead of failing it.`
+  pnpm run build:service && ./../target/release/ourealis --config web/tests/fixtures/service.toml
+The lane builds the service in **release** (a debug build plans a route in tens of seconds, which turns its timeouts into a measurement of the planner rather than of the page), and talks to the running binary at OUREALIS_SERVICE_URL=${SERVICE_URL}. Set OUREALIS_ALLOW_SKIP=1 to skip the lane instead of failing it.`
 
 /** One spec file's view of the service. */
 export interface ServiceGate {

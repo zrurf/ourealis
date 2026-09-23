@@ -1,16 +1,22 @@
 # Architecture
 
-## Two crates, one dependency direction
+## Three crates, one dependency direction
 
 ```mermaid
 flowchart BT
     CORE["ourealis-core<br/>simulator"] -->|path dependency| FMT["ourealis-map-format<br/>OMF container"]
+    SVC["crates/service<br/>binary `ourealis`"] -->|path dependency| CORE
+    SVC -->|path dependency| FMT
 ```
 
-`ourealis-core` reads maps through `ourealis-map-format`; the reverse dependency
-does not exist. A map tool can therefore be built against the format crate without
-pulling in the simulator, and no format decision can be forced by a simulation need
-the format does not already express.
+`ourealis-core` reads maps through `ourealis-map-format`; the reverse dependency does
+not exist. A map tool can therefore be built against the format crate without pulling in
+the simulator, and no format decision can be forced by a simulation need the format does
+not already express.
+
+`crates/service` is the only crate that knows about the network: it holds the HTTP, gRPC
+and Web-socket facades, the job registry and the embedded page. `core` gains no network
+dependency and no `async` from it — a run is a synchronous call made on a blocking worker.
 
 Inside `ourealis-core`, the pipeline is a chain of module groups, each consuming the
 previous group's output and nothing else:
@@ -146,6 +152,93 @@ The key fields are mixed term by term rather than packed into bit fields, so no 
 logically independent processes can share a stream. Region events additionally have
 a spatially deterministic trigger mode, in which the decision and the bias direction
 come from a hash rather than a draw (§6.3 of the [design](design.md)).
+
+## The service
+
+`crates/service` (crate and binary name `ourealis`) is one process with three facades
+over one API layer. A handler returns a DTO; the facades turn it into JSON or protobuf,
+so the two wire formats cannot disagree about a resource:
+
+```mermaid
+flowchart TB
+    subgraph FACADES["facade/ — transport"]
+        HTTP["http.rs<br/>axum: REST, WS, SSE"]
+        RPC["rpc.rs<br/>tonic: gRPC"]
+        WEB["web.rs<br/>embedded page"]
+    end
+    API["api/ — handlers, DTOs, error mapping"]
+    TASK["task/ — registry, gate, events"]
+    STORE["store/ — map library"]
+    CORE["ourealis-core"]
+    FACADES --> API
+    API --> TASK
+    API --> STORE
+    TASK --> CORE
+    TASK --> STORE
+```
+
+* **`api/`** holds the handlers, the DTOs (`dto/`) and the one error mapping
+  (`error.rs`) that turns a `ServiceError` into an HTTP status and a gRPC code. A
+  handler never builds either.
+* **`task/`** is the execution layer: one registry holding every long operation — a run,
+  a route preview, a route plan, a synthetic map build — with a shared state machine, a
+  shared event bus and one semaphore gate. A run is one task kind among four; its result
+  is a whole `SimulationOutput`, so it is read from the simulation endpoints in pages
+  rather than from `/tasks/{id}/result`.
+* **`store/`** is the map library, in memory or on disk, and the place ids are validated:
+  an id reaches a file path only after `validate_id` accepts it.
+* **`render/`** does not exist here — the page is a separate Vite project embedded into
+  the binary by `build.rs`, and the two ship together so the page cannot drift from the
+  API it calls.
+
+Long operations are tasks because a request should not be held open for minutes: the
+submission returns a ticket and the work runs on a blocking worker, with the result, the
+events and the cancellation all addressed by that ticket. Validation that does not need
+the map happens at submission, so an impossible individual or an unusable sample rate is
+a `400` on the call; anything that needs the map (a corrupt image, no feasible path) is a
+failed task with a message.
+
+`api/feasibility.rs` is the one query that answers about the *map* without planning:
+given points, it reads the hard-forbidden bitmap and the distance to the nearest blocked
+cell and answers `ok` / `outside` / `forbidden` / `too_close`. It exists because the page
+draws the surface but cannot see the constraints in it, and a reader who drops a point in
+a wall should learn that where they dropped it.
+
+## The web application
+
+`web/` is a Vite + Vue 3 single-page application. Its structure follows one rule: the
+render layer knows nothing about Vue, and the stores know nothing about Babylon.
+
+```
+web/src/
+├── api/          one module per resource; transport, DTO mirrors, no state
+├── stores/       pinia: system, theme, locale, maps, viewer, workspace, tasks,
+│                 simulations, omf, notifications
+├── render/       Babylon: scene, terrain, shading, layers, overlays, handles,
+│                 picking, inspect, host, engine — pure functions where possible
+├── components/   map/ (canvas furniture), run/ (workspace panels), forms/,
+│                 charts/, layout/, common/, trajectory/
+├── views/        one per route
+└── locales/      en (authoritative) and zh-CN, key sets enforced by a unit test
+```
+
+Two pieces are worth naming:
+
+* **`render/host.ts`** owns the engine and its canvas for the session and lends them to
+  one view at a time. An engine costs a graphics device — a WebGPU adapter request or a
+  WebGL context — and moving the canvas between parents preserves that context, so the
+  preview, the workspace, the map studio and the trajectory viewer share one device
+  instead of building four. The render loop runs only while a view holds a lease.
+* **`stores/workspace.ts`** holds the draft a run is described by and the plan of that
+  draft. It is the reason the route drawn on the map is the route that is submitted:
+  before it, the studio and the submission form each kept their own copy, and moving
+  between them threw the plan away.
+
+Long operations from the page go through **`stores/tasks.ts`**: it submits, tracks the
+ticket, unpacks the result by the kind the service reported, and reports the outcome.
+Work the interface waits on is shown behind a modal loader with its elapsed time and a
+cancel button; the rest is reported in the header's task tray. Neither shows a percentage
+— the simulator's run is a single call, so there is no fraction to report.
 
 ## Conventions
 

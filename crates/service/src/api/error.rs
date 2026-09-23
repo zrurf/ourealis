@@ -69,7 +69,7 @@ pub fn grpc_code(kind: ErrorKind) -> tonic::Code {
         ErrorKind::Unprocessable => tonic::Code::FailedPrecondition,
         ErrorKind::NotFound => tonic::Code::NotFound,
         // A conflict is a state precondition that the call contradicts (cancelling
-        // a finished job, patching against a foreign base file), not an attempt to
+        // a finished task, patching against a foreign base file), not an attempt to
         // create something that exists: `AlreadyExists` would misdescribe it.
         ErrorKind::Conflict => tonic::Code::FailedPrecondition,
         ErrorKind::TooLarge => tonic::Code::ResourceExhausted,

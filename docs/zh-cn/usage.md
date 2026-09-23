@@ -22,6 +22,114 @@ cargo doc   --workspace --no-deps
 GPU 后端由默认开启的 `gpu` feature 控制。使用 `--no-default-features` 可构建纯 CPU 版本：CPU
 后端是每个内核的完整实现，也是 GPU 所对照的语义参考。
 
+## 服务与 Web 界面
+
+服务是 `crates/service` 里的一个二进制（crate 名与二进制名均为 `ourealis`）：读一份 TOML、
+提供三个门面、并把页面内嵌在二进制中。
+
+```bash
+pnpm --dir web install --frozen-lockfile         # 首次
+cargo build --release -p ourealis                 # build.rs 调 Vite 构建并把 web/dist 内嵌
+./target/release/ourealis --config dev.toml       # 不带参数则用默认值，且只监听回环
+./target/release/ourealis --print-config          # 合并默认值后的有效配置
+```
+
+| 门面 | 开关 | 承载 |
+|---|---|---|
+| RPC | `server.rpc_enabled` | gRPC，包名 `ourealis.api.v1` |
+| HTTP | `server.http_enabled` | `/api/v1` 下的 REST，外加 WebSocket 与 SSE |
+| Web | `server.web_enabled` | 内嵌页面，挂在 `/`（要求 HTTP 门面开启） |
+
+### 运行工作区
+
+打开 `/` 即是界面。一次运行在 `/run` 一个页面里分五个阶段完成：
+
+| 阶段 | 决定什么 |
+|---|---|
+| 地图 | 针对哪张地图规划 |
+| 路线 | 模式与点位；在地图上单击与拖动即可绘制 |
+| 跑者 | 预设、随机种子；专家模式下还有全部个体参数 |
+| 传感器 | 采样率；专家模式下还有噪声与事件开关 |
+| 运行 | 名称、指标开关，以及提交按钮 |
+
+路线是**画出来的而不是填出来的**：在地图上单击放置起点与终点，拖动标记即可移动，双击可删除。
+规划是自动的——路线一旦完整就请求预览——因此摘要（长度、路径比、预计用时）与候选表随路线变化即时更新，
+不必先跑一遍才知道改动带来了什么。规划器自己的选择会在候选表里标出：运行走的就是那一条，
+因为路径选择由路线与随机种子决定，而不是由表里选中哪一行决定。
+
+**简单**只显示会改变结果的决策；**专家**全部显示并按语义分组，每组旁边的徽标显示与配方（或默认值）相差几项。
+四张配方卡——校园慢跑、场地间歇、手机 + 手表、纯净真值——一次点击填满整份配置，之后仍可继续修改。
+
+其余页面：`/maps`（导入、生成、下载）、`/maps/{id}`（预览，含区块检视与图层铺贴）、
+`/maps/{id}/studio`（绘制区域与连接器并导出）、`/batch`（多样本批量）、`/omf`（结构树、元数据编辑、补丁）、
+`/simulations/{id}` 及其 `/trajectory`、`/sensors`、`/audit` 三个分页、`/settings`。
+
+### 任务：所有耗时操作都是 ticket
+
+规划一条路线、取一次剖面、生成一张地图，耗时从几秒到几分钟，因此没有任何端点会为它挂住一个请求。
+`POST /api/v1/tasks` 返回 `202` 与一个 ticket，工作在阻塞工作线程上跑：
+
+```jsonc
+// POST /api/v1/tasks
+{"kind": "route_preview", "request": { /* 与 POST /simulations 相同的请求体 */ }}
+{"kind": "route_plan",    "request": { /* … */ }}
+{"kind": "synthetic_map", "spec": { "preset": "compact", "seed": 7 }, "name": "fixture"}
+```
+
+| 调用 | 回答 |
+|---|---|
+| `GET /api/v1/tasks/{id}` | `kind`、`state`（`queued`/`running`/`succeeded`/`failed`/`cancelled`）、`stage`、`elapsed_s`、`error` |
+| `GET /api/v1/tasks/{id}/result` | 结果，按 kind 标记：`{"route": {…}}` 或 `{"map": {…}}`；运行中为 `409` |
+| `GET /api/v1/tasks/{id}/result/ref` | 结果所在路径，不取回内容 |
+| `DELETE /api/v1/tasks/{id}` | 取消：排队中立即停止，运行中在下一个阶段边界生效 |
+| `GET /api/v1/tasks/{id}/events` | SSE：状态、阶段、日志，以及一个终态事件 |
+| `GET /api/v1/tasks/{id}/ws` | 同一会话的 WebSocket 版本 |
+| `GET /api/v1/tasks?kind=route_plan` | ticket 列表（最新在前，可按 kind 过滤） |
+
+**运行本身也是任务**，`GET /tasks/{id}` 对运行 id 同样有效，所以一个轮询器可以管全部。
+运行的数据仍在它自己的端点上（`/simulations/{id}/summary`、`/truth`、`/sensors`、`/export`），
+因为一次完整运行装不进一个响应——`/tasks/{id}/result` 对运行返回 `415` 并说明原因。
+
+不依赖地图的校验在提交时完成，所以"个体参数非法""采样率荒谬"是调用当场返回的 `400`，而不是要轮询才知道的失败。
+需要地图的那些失败（镜像损坏、无可行路径）才表现为任务失败，并带服务端消息。
+
+页面用的是同一套接口：需要等待的任务显示为模态环形加载器（带实测耗时与取消按钮），
+其余在顶栏的任务托盘里报告。两者都不显示百分比——模拟器的一次运行是一次调用，没有可报的分数。
+
+### 哪些位置可以放点
+
+"跑步者能不能站在这里"由地图决定，而页面读不到：硬禁行是一层位图数据，页面只画地表。
+`POST /api/v1/maps/{id}/feasibility` 回答一组点的可用性：
+
+```jsonc
+{"points": [{"x": 234, "y": 156}, {"x": 36, "y": 100}], "safe_radius_m": 0.75}
+// { "items": [
+//   {"point": …, "legal": false, "reason": "forbidden", "distance_m": 0,    "cell": [117, 78], "elevation_m": 13.8},
+//   {"point": …, "legal": true,  "reason": "ok",        "distance_m": 0.75, "cell": [18, 50],  "elevation_m": 12.6}
+// ]}
+```
+
+`reason` 取值 `ok`、`outside`（超出地图）、`forbidden`（禁行格）、`too_close`（可通行但与最近障碍的距离小于
+`safe_radius_m`——正是模拟器偏移阶段自己的判定规则，因此这里通过的点规划器也会接受）。该端点只读位图与邻近格子，
+不合成成本场、不建图，因此毫秒级返回；工作区在落点的那一刻就调用它，被拒的点用手柄的错误色标出，并用一句话说明原因。
+
+### 前端验收
+
+```bash
+pnpm --dir web run typecheck      # vue-tsc 覆盖 src *与* tests，另有 node 侧配置
+pnpm --dir web run lint           # oxlint
+pnpm --dir web run format:check   # oxfmt
+pnpm --dir web run build          # build.rs 内嵌的页面产物
+pnpm --dir web run test:unit      # 纯逻辑，不启浏览器
+pnpm --dir web run test:e2e       # 真实浏览器对着真实服务（会以 release 构建服务）
+pnpm --dir web run test:fuzz      # 固定种子的随机输入
+pnpm --dir web run test:monkey    # 固定种子的随机操作序列
+```
+
+e2e 泳道需要一个服务：`test:e2e` 会以 **release** 构建它，并按 `OUREALIS_SERVICE_URL`（默认
+`http://127.0.0.1:8080`）去找。找不到服务时它**失败**而不是跳过，除非设置 `OUREALIS_ALLOW_SKIP=1`——
+一个在缺少被验证栈时静默通过的泳道，比一个报出问题的泳道更糟。
+
 ## 示例
 
 ```bash

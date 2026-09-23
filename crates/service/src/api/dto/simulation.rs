@@ -1,4 +1,8 @@
-//! Simulation resources: requests, settings, individuals and job state.
+//! Simulation resources: requests, settings and individuals.
+//!
+//! A run is a task, so its lifecycle and its ticket live in [`super::task`]; this
+//! module describes what a client asks for and the sparse settings that override the
+//! defaults behind it.
 
 use ourealis_core::motion::MotionConfig;
 use ourealis_core::motion::limits::LookAheadMode;
@@ -7,81 +11,13 @@ use ourealis_core::plan::{LoopRequest, StandardRequest, Waypoint};
 use ourealis_core::sensor::DeviceMount;
 use ourealis_core::sim::{Backend, SimulationConfig};
 use ourealis_map_format::MotionMode;
+use ourealis_map_format::synthetic::SyntheticMapSpec;
 use serde::{Deserialize, Serialize};
 
 use crate::api::dto::Vec2;
 use crate::error::{Result, ServiceError};
 
 use ourealis_core::plan::ViaSemantics;
-
-/// Lifecycle state of a job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobStateDto {
-    /// Waiting for a worker slot.
-    Queued,
-    /// Running; `stage` says how far it has come.
-    Running,
-    /// Finished successfully.
-    Succeeded,
-    /// Finished with an error.
-    Failed,
-    /// Cancelled before finishing.
-    Cancelled,
-}
-
-impl JobStateDto {
-    /// True once the job cannot change state again.
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            JobStateDto::Succeeded | JobStateDto::Failed | JobStateDto::Cancelled
-        )
-    }
-}
-
-/// State of one job.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SimulationStateDto {
-    /// Job identifier.
-    pub id: String,
-    /// Lifecycle state.
-    pub state: JobStateDto,
-    /// Pipeline stage: `queued`, `environment`, `planning`, `motion`, `sensors`,
-    /// `metrics` or `done`.
-    pub stage: String,
-    /// Fraction of the run completed, 0 to 1, or `None` while the service cannot
-    /// say. The simulator's run is one call, so a running job reports `None` and
-    /// the client shows elapsed time instead of a made-up fraction.
-    pub progress: Option<f64>,
-    /// Wall-clock time the job has been running, seconds, absent while queued.
-    pub elapsed_s: Option<f64>,
-    /// Name given at submission, when one was given.
-    pub name: Option<String>,
-    /// Map the run used.
-    pub map_id: String,
-    /// Planning mode: `standard`, `loop` or `dynamic`.
-    pub mode: String,
-    /// Failure message, absent unless the state is `failed`.
-    pub error: Option<String>,
-    /// Failure classification, absent unless the state is `failed`.
-    pub error_kind: Option<String>,
-    /// Submission time, RFC 3339.
-    pub created_at: String,
-    /// Time the worker started, RFC 3339, absent while queued.
-    pub started_at: Option<String>,
-    /// Time the job finished, RFC 3339, absent while it runs.
-    pub finished_at: Option<String>,
-}
-
-/// Reply to a submission.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SubmitReply {
-    /// Identifier of the queued job.
-    pub id: String,
-    /// State right after submission, normally `queued`.
-    pub state: JobStateDto,
-}
 
 /// Where the map of a run comes from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,11 +46,13 @@ pub enum MapRef {
 /// Settings of the synthetic map generator.
 ///
 /// The defaults match `SyntheticMapSpec::default()`; `preset` selects one of the
-/// shapes the simulator's own tests use.
+/// shapes the simulator ships with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyntheticSpec {
-    /// Shape preset: `default`, `compact` or `wide`.
+    /// Shape preset: `default` (campus), `compact` (test fixture), `wide`
+    /// (long campus) or any other value, which builds a custom map from
+    /// `width_m` and `height_m`.
     pub preset: String,
     /// Map width, metres. Ignored when a preset is named.
     pub width_m: f64,
@@ -149,16 +87,25 @@ impl SyntheticSpec {
     ///
     /// `preset` picks the base shape and fixes its footprint: `compact` is the
     /// 300 x 200 m fixture the simulator's own tests use, `default` (or an empty
-    /// string) is the 600 x 400 m campus, and **any other value** builds a custom
-    /// map from `width_m` and `height_m`. Resolution, chunk size, whether the
-    /// candidate library is attached, and the seed are taken from this object in
-    /// every case, so two requests that differ only in `seed` produce two
-    /// different maps and the same request reproduces the same one.
-    pub fn to_spec(&self) -> ourealis_map_format::synthetic::SyntheticMapSpec {
-        use ourealis_map_format::synthetic::SyntheticMapSpec;
+    /// string) is the 600 x 400 m campus, `wide` is a 900 x 400 m campus, and any
+    /// other value builds a custom map from `width_m` and `height_m`. Resolution,
+    /// chunk size, whether the candidate library is attached, and the seed are
+    /// taken from this object in every case, so two requests that differ only in
+    /// `seed` produce two different maps and the same request reproduces the same
+    /// one.
+    ///
+    /// The generator's own limits are checked here rather than left to the task
+    /// thread: a spec whose grid is larger than the generator will rasterise is a
+    /// bad request, not a failed run.
+    pub fn to_spec(&self) -> Result<SyntheticMapSpec> {
         let mut spec = match self.preset.as_str() {
             "compact" => SyntheticMapSpec::compact(),
             "default" | "" => SyntheticMapSpec::default(),
+            "wide" => SyntheticMapSpec {
+                width_m: 900.0,
+                height_m: 400.0,
+                ..SyntheticMapSpec::default()
+            },
             _ => SyntheticMapSpec {
                 width_m: self.width_m.max(50.0),
                 height_m: self.height_m.max(50.0),
@@ -169,7 +116,10 @@ impl SyntheticSpec {
         spec.chunk_size = self.chunk_size.max(8);
         spec.with_kpath_library = self.with_kpath_library;
         spec.seed = self.seed;
-        spec
+        spec.validate().map_err(|error| {
+            ServiceError::Invalid(format!("synthetic map spec is unusable: {error}"))
+        })?;
+        Ok(spec)
     }
 }
 
@@ -410,7 +360,7 @@ impl From<PaceStrategyDto> for PaceStrategy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimulationRequest {
-    /// Optional name for the job.
+    /// Optional name for the task.
     #[serde(default)]
     pub name: Option<String>,
     /// Map to run on. Absent means the library must hold exactly one map: with
@@ -441,7 +391,7 @@ fn default_seed() -> u64 {
 impl SimulationRequest {
     /// Drops the bytes of an inline map image.
     ///
-    /// Called when a job reaches a terminal state: the parameters stay for reporting,
+    /// Called when a task reaches a terminal state: the parameters stay for reporting,
     /// the payload — which may be as large as the upload limit — does not.
     pub fn release_payload(&mut self) {
         if let Some(MapRef::Inline { omf_base64, .. }) = &mut self.map {
@@ -671,6 +621,20 @@ pub enum RoadmapSettings {
     },
 }
 
+/// Smallest arc-length spacing the request may ask a smoothed path to keep, metres.
+///
+/// One point is stored per spacing, so the spacing is what converts a path length
+/// into a point count; a spacing small enough to ask for billions of points is a
+/// rejected request rather than an allocation.
+const MIN_SAMPLE_SPACING_M: f64 = 1.0e-2;
+
+/// Largest sensor or timeline sample rate a request may ask for, Hz.
+///
+/// Consumer inertial units top out around 1 kHz, and the rate multiplies the run's
+/// duration into the number of samples held in memory, so anything above it is a
+/// rejected request rather than a run that cannot finish.
+const MAX_SAMPLE_RATE_HZ: f64 = 1.0e3;
+
 /// Route planning settings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -867,9 +831,18 @@ impl SimulationSettings {
         self.route.apply(&mut config.route)?;
         self.motion.apply(&mut config.motion)?;
         self.offset.apply(&mut config.motion.offset)?;
-        self.limits.apply(&mut config.motion.limits);
+        self.limits.apply(&mut config.motion.limits)?;
         if let Some(sensors) = &self.sensors {
             sensors.apply(&mut config.sensors)?;
+        }
+        // The truth timeline *is* the inertial sequence: `align_rates` copies the IMU
+        // rate over the motion rate when the simulator is built. A request that sets
+        // only the timeline rate therefore has to reach the sensor config too, or the
+        // field would be accepted and then silently discarded.
+        if let Some(rate) = self.motion.sample_rate_hz
+            && self.sensors.as_ref().and_then(|s| s.imu_rate_hz).is_none()
+        {
+            config.sensors.imu_rate_hz = rate;
         }
         if let Some(with_metrics) = self.with_metrics {
             config.with_metrics = with_metrics;
@@ -962,6 +935,7 @@ impl RouteSettings {
         positive("route.penalty_mu", self.penalty_mu)?;
         positive("route.d_attach_m", self.d_attach_m)?;
         positive("route.corner_radius_m", self.corner_radius_m)?;
+        positive("route.sample_spacing_m", self.sample_spacing_m)?;
 
         if let Some(value) = self.epsilon {
             route.search.epsilon = value;
@@ -1004,7 +978,10 @@ impl RouteSettings {
             route.smooth = value;
         }
         if let Some(value) = self.sample_spacing_m {
-            route.sample_spacing_m = value;
+            // Floored like the profile spacing: the smoothed path holds one point per
+            // spacing, so a sub-millimetre request asks for a point count that grows
+            // with the path length and carries no shape the path does not already have.
+            route.sample_spacing_m = value.max(MIN_SAMPLE_SPACING_M);
         }
         if let Some(value) = self.smoothing_iterations {
             route.smoothing.iterations = value.max(1);
@@ -1016,14 +993,16 @@ impl RouteSettings {
 impl MotionSettings {
     /// Applies the motion settings.
     fn apply(&self, motion: &mut MotionConfig) -> Result<()> {
-        if let Some(rate) = self.sample_rate_hz
-            && rate <= 0.0
-        {
-            return Err(ServiceError::Invalid(
-                "motion.sample_rate_hz must be positive".to_string(),
-            ));
-        }
         if let Some(rate) = self.sample_rate_hz {
+            if !(0.0..=MAX_SAMPLE_RATE_HZ).contains(&rate) || rate <= 0.0 {
+                return Err(ServiceError::Invalid(format!(
+                    "motion.sample_rate_hz must lie in (0, {MAX_SAMPLE_RATE_HZ}]"
+                )));
+            }
+            // The timeline is the inertial sensor's own sample sequence, and
+            // `SimulationConfig::align_rates` pins one to the other, so a client that
+            // sets only this one would otherwise see the run come back at the IMU rate
+            // with no sign that the field was ignored.
             motion.sample_rate_hz = rate;
         }
         if let Some(value) = self.start_stand_s {
@@ -1099,7 +1078,23 @@ impl OffsetSettings {
 
 impl LimitSettings {
     /// Applies the limit settings.
-    fn apply(&self, limits: &mut ourealis_core::motion::SpeedLimitParams) {
+    fn apply(&self, limits: &mut ourealis_core::motion::SpeedLimitParams) -> Result<()> {
+        // A zero or negative value here collapses the speed limit to nothing, which
+        // no trajectory can walk; rejecting it says why instead of failing later
+        // with "the profile gives zero speed".
+        for (name, value) in [
+            ("a_lat_max", self.a_lat_max),
+            ("k_down", self.k_down),
+            ("grade_clamp", self.grade_clamp),
+        ] {
+            if let Some(value) = value
+                && !(value > 0.0 && value.is_finite())
+            {
+                return Err(ServiceError::Invalid(format!(
+                    "limits.{name} must be finite and positive"
+                )));
+            }
+        }
         if let Some(value) = self.look_ahead_m {
             limits.look_ahead_m = value.max(0.0);
         }
@@ -1115,6 +1110,7 @@ impl LimitSettings {
         if let Some(value) = self.grade_clamp {
             limits.grade_clamp = value;
         }
+        Ok(())
     }
 }
 
@@ -1128,10 +1124,10 @@ impl SensorSettings {
             ("baro_rate_hz", self.baro_rate_hz),
         ] {
             if let Some(rate) = rate
-                && rate <= 0.0
+                && !(rate > 0.0 && rate <= MAX_SAMPLE_RATE_HZ)
             {
                 return Err(ServiceError::Invalid(format!(
-                    "sensors.{name} must be positive"
+                    "sensors.{name} must lie in (0, {MAX_SAMPLE_RATE_HZ}]"
                 )));
             }
         }

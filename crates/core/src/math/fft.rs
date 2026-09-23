@@ -116,6 +116,16 @@ impl Spectrum {
     /// amplitude with the padded window and 1.0 with this one.
     #[allow(clippy::needless_range_loop)]
     pub fn of(signal: &[f64], sample_rate_hz: f64) -> Self {
+        if signal.is_empty() {
+            // No samples, no spectrum. Everything downstream reads a magnitude at a
+            // frequency, and an empty bin list answers every such query with "not
+            // measured" instead of inventing a zero line.
+            return Self {
+                frequencies_hz: Vec::new(),
+                magnitudes: Vec::new(),
+                resolution_hz: sample_rate_hz,
+            };
+        }
         let fft = Fft::new(signal.len());
         let size = fft.size();
         let count = signal.len().clamp(1, size);

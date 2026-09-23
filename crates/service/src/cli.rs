@@ -33,7 +33,7 @@ pub struct Cli {
     /// Log level, overriding `log.level` in the configuration file.
     ///
     /// Accepts a single level (`debug`) or an `env_logger`-style directive list
-    /// (`info,ourealis::job=trace`).
+    /// (`info,ourealis::task=trace`).
     #[arg(long, value_name = "LEVEL")]
     pub log: Option<String>,
 }

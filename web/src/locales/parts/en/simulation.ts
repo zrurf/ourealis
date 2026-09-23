@@ -86,6 +86,7 @@ export default {
       off: 'Off',
       smooth: 'Smooth the path',
       submitFailed: 'The run could not be submitted.',
+      submitted: 'Run queued.',
       noPresets: 'The service reported no presets; the form cannot be filled.',
     },
     person: {
@@ -355,6 +356,7 @@ export default {
       plausibilityFail: 'Outside the design’s plausibility window.',
       compare: 'Comparison',
       compareHint: 'Compares this run against another finished run through /simulations/compare.',
+      compareChart: 'Cadence against pace',
       compareWith: 'Compare against',
       compareAction: 'Compare',
       comparing: 'Comparing…',

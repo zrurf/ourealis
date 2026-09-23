@@ -1,0 +1,138 @@
+// Background tasks: submission, progress and results.
+//
+// Every long operation is a task, and a task is identified by a ticket. Submitting
+// one returns immediately; the client polls `GetTask`, watches `WatchTask` for the
+// progress and log events, and reads `TaskResult` once the task succeeded. A run is
+// one kind of task, and its own resources (summary, samples, exports) live in
+// `simulation.proto`.
+
+syntax = "proto3";
+
+package ourealis.api.v1;
+
+import "ourealis/api/v1/common.proto";
+
+// Kind of work a task does.
+enum TaskKind {
+  TASK_KIND_UNSPECIFIED = 0;
+  // A full run: planning, motion, sensors and metrics.
+  TASK_KIND_SIMULATION = 1;
+  // Planning only: the candidate set, the chosen length and the cost.
+  TASK_KIND_ROUTE_PREVIEW = 2;
+  // Planning plus the smoothed path and its speed limits.
+  TASK_KIND_ROUTE_PLAN = 3;
+  // Generate a synthetic map and add it to the library.
+  TASK_KIND_SYNTHETIC_MAP = 4;
+}
+
+// Lifecycle state of a task.
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  // Waiting for a worker slot.
+  TASK_STATE_QUEUED = 1;
+  // Running; see `stage` for how far it has come.
+  TASK_STATE_RUNNING = 2;
+  TASK_STATE_SUCCEEDED = 3;
+  TASK_STATE_FAILED = 4;
+  TASK_STATE_CANCELLED = 5;
+}
+
+// One task's state.
+message TaskRecord {
+  string id = 1;
+  TaskKind kind = 2;
+  TaskState state = 3;
+  // Coarse stage: "queued", "running", "done", "failed" or "cancelled".
+  string stage = 4;
+  // Fraction complete. Unset while the service cannot say: a task body is a single
+  // call, so a running task reports no fraction and a client shows elapsed time.
+  optional double progress = 5;
+  // Wall-clock time the task has been running, seconds; unset while queued.
+  optional double elapsed_s = 6;
+  // Name the client gave, for a run.
+  string name = 7;
+  // Failure message, empty unless the state is failed.
+  string error = 8;
+  // Error kind, empty unless the state is failed.
+  string error_kind = 9;
+  int64 created_at_unix_ms = 10;
+  int64 started_at_unix_ms = 11;
+  int64 finished_at_unix_ms = 12;
+  // Map the task works on, as a reporting label.
+  string map_id = 13;
+  // Planning mode for a run, or the task's own label for a build.
+  string mode = 14;
+}
+
+// Body of a task submission.
+//
+// One JSON payload, laid out exactly like the HTTP `POST /api/v1/tasks` body — the
+// same reason `SubmitRequest` carries JSON: the nested settings have dozens of
+// optional fields and mirroring them by hand would add a second place to keep in
+// sync.
+message SubmitTaskRequest {
+  string body_json = 1;
+}
+
+message SubmitTaskReply {
+  string id = 1;
+  TaskKind kind = 2;
+  TaskState state = 3;
+}
+
+message GetTaskRequest {
+  string id = 1;
+}
+
+message ListTasksRequest {
+  uint32 offset = 1;
+  uint32 limit = 2;
+  // Restrict the list to one kind; unspecified means every kind.
+  TaskKind kind = 3;
+}
+
+message ListTasksReply {
+  repeated TaskRecord items = 1;
+  uint32 total = 2;
+}
+
+message CancelTaskRequest {
+  string id = 1;
+}
+
+message WatchTaskRequest {
+  string id = 1;
+  // Topics to forward; empty means every topic the task publishes.
+  repeated string topics = 2;
+}
+
+message TaskResultRequest {
+  string id = 1;
+}
+
+// The result of a task, in the shape its kind defines.
+message TaskResultReply {
+  string id = 1;
+  TaskKind kind = 2;
+  // Result as JSON. A route task carries the same payload `RoutePreviewReply` used
+  // to carry; a map task carries the map summary.
+  string result_json = 3;
+}
+
+// Where a task's result lives, without fetching it.
+message TaskResultRef {
+  string id = 1;
+  TaskKind kind = 2;
+  string url = 3;
+}
+
+service TaskService {
+  rpc Submit(SubmitTaskRequest) returns (SubmitTaskReply);
+  rpc List(ListTasksRequest) returns (ListTasksReply);
+  rpc Get(GetTaskRequest) returns (TaskRecord);
+  rpc Cancel(CancelTaskRequest) returns (Empty);
+  // Server-side stream of the task's progress and log events.
+  rpc Watch(WatchTaskRequest) returns (stream Event);
+  rpc Result(TaskResultRequest) returns (TaskResultReply);
+  rpc ResultRef(TaskResultRequest) returns (TaskResultRef);
+}

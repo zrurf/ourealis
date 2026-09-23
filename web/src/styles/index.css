@@ -90,6 +90,39 @@
   margin: calc(var(--spacing) * 4);
 }
 
+/*
+ * Frosted panels that float over the canvas.
+ *
+ * Only overlays use this — card panels keep the flat surface and hairlines the rest
+ * of the interface is built from, so a blurred background stays a signal that
+ * something floats above the map rather than a look.
+ *
+ * Text inside keeps the solid ink token: translucency is a property of the panel, not
+ * of its content, and a washed-out label is unreadable over a bright terrain. Where
+ * `backdrop-filter` is unsupported, or the reader asked for less transparency, the
+ * panel falls back to the opaque surface colour.
+ */
+.glass {
+  background: color-mix(in srgb, var(--ourealis-surface) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ourealis-line) 70%, transparent);
+  border-radius: var(--radius-card);
+  box-shadow: 0 8px 28px color-mix(in srgb, #000 18%, transparent);
+  backdrop-filter: blur(14px) saturate(1.2);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .glass {
+    background: var(--ourealis-surface);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass {
+    background: var(--ourealis-surface);
+    backdrop-filter: none;
+  }
+}
+
 .t-alert.mt-2,
 .t-progress.mt-2,
 .t-radio-group.mt-2 {
@@ -129,4 +162,20 @@
 .t-select__wrap.w-32,
 .t-input-number.w-32 {
   width: calc(var(--spacing) * 32);
+}
+
+/*
+ * The one value tdesign's tooltip cannot take from the appearance.
+ *
+ * Its default theme paints the inverse surface — a near-black bubble, from the grey scale — and
+ * takes the text colour from `--td-text-color-anti`, which means "ink that contrasts with the
+ * *surface this component sits on*". The dark appearance maps that token to a near-black ink, so
+ * the bubble came out black on black. It is set here, on the class the tooltip wrapper passes to
+ * tdesign, rather than on the token: a filled brand button reads the same token for its label,
+ * and that label has to keep following the appearance.
+ *
+ * Nothing else is styled: the bubble, its arrow and its shadow are tdesign's own.
+ */
+.ourealis-tooltip .t-popup__content {
+  --td-text-color-anti: #ffffff;
 }

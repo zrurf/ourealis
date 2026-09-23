@@ -558,8 +558,23 @@ export const useOmfStore = defineStore('omf', () => {
     editError.value = null
   }
 
-  /** Replaces the source bytes without a fresh inspection; the studio uses it for a library map. */
+  /**
+   * Replaces the source bytes without a fresh inspection; the studio uses it for a
+   * library map.
+   *
+   * Everything derived from the previous image is dropped first: this call exists to
+   * switch the inspector onto a different file, and a structure tree or edited image
+   * left over from the old one would describe — and be written back over — a file the
+   * user is no longer looking at.
+   */
   function setSource(bytes: Uint8Array, name?: string): void {
+    structure.value = null
+    editedBytes.value = null
+    editedName.value = null
+    status.value = 'idle'
+    error.value = null
+    editStatus.value = 'idle'
+    editError.value = null
     sourceBytes.value = bytes
     fileName.value = name ?? null
   }

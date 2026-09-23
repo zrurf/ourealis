@@ -166,6 +166,38 @@ from the network. Point a browser at the HTTP address and the interface is there
 no separate front-end deployment, and the page cannot drift from the API it calls
 because the two ship in one binary.
 
+### The workspace
+
+`/run` is the whole interface for producing a run. It is one page with a stage rail,
+the map, and the controls of whichever stage is open:
+
+| Stage | What it decides |
+|---|---|
+| Map | which map to plan against |
+| Route | the mode and the points, drawn by clicking and dragging on the map |
+| Runner | the preset, the seed and — in expert mode — every individual parameter |
+| Sensors | the sample rates and, in expert mode, the noise and event switches |
+| Run | the name, the metrics switch, and the button that submits |
+
+A route is drawn rather than typed: click the ground to place the start and the goal,
+drag a handle to move it, double-click it to remove it. Planning is automatic — as soon
+as the route is complete a preview runs, and the summary (length, path ratio, estimated
+time) and the candidate table update as the route changes. The planner's own choice is
+marked in the table; the run takes that one, because path choice is a property of the
+route and the seed rather than of a row in a list.
+
+Every long operation is a **task**: the submission returns a ticket and the result
+arrives under it, so no request is ever held open for the minutes a plan or a map build
+can take. Tasks the interface waits on are shown behind a modal loader with their
+elapsed time and a cancel button; the rest are reported in the header's task tray. The
+API surface is `/api/v1/tasks` (`POST` to submit, `GET /tasks/{id}` to poll,
+`/result` for the payload, `DELETE` to cancel, `/events` for SSE).
+
+Two levels of detail: **Simple** shows the decisions that change the result, and
+**Expert** shows everything, grouped. A badge beside each group reports how many fields
+differ from the recipe or the defaults. Four recipes — campus jog, track intervals,
+phone and watch, clean truth — fill the whole configuration in one click.
+
 Development runs the front-end with hot reload and proxies the API:
 
 ```bash

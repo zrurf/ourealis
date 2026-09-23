@@ -27,6 +27,13 @@ const props = defineProps<{
   presets: Preset[]
   /** How far the preset request has come, so an empty list has an explanation. */
   status: 'idle' | 'loading' | 'ready' | 'failed'
+  /**
+   * Whether to show only what changes the result.
+   *
+   * The preset is the decision; its twenty-odd overrides are the expert half, and the
+   * count beside them says how many differ from what the preset already sets.
+   */
+  simple?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -135,7 +142,7 @@ function optionsFor(name: string): Array<{ value: string; label: string }> {
       {{ t('simulation.form.noPresets') }}
     </p>
 
-    <div v-else class="mt-3 grid grid-cols-3 gap-3" data-testid="person-overrides">
+    <div v-else-if="!simple" class="mt-3 grid grid-cols-3 gap-3" data-testid="person-overrides">
       <label v-for="field in fields" :key="field.name" class="flex flex-col gap-1">
         <span class="font-mono text-xs text-muted">{{ field.name }}</span>
         <TInputNumber

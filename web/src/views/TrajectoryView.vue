@@ -19,8 +19,12 @@ import type { ChunkRef } from '@/api/maps'
 import { LAYER_ELEVATION, chunkKey, selectLevel } from '@/types/map'
 import type { TruthSample } from '@/types/result'
 import { backendLabel, engineFromQuery, probeEngine, type EngineBackend } from '@/render/engine'
-import { MapScene, updateDebug } from '@/render/scene'
-import { TerrainLayer, buildChunkMesh } from '@/render/terrain'
+import { updateDebug } from '@/render/scene'
+import { renderHost, type SceneLease } from '@/render/host'
+import type { MapScene } from '@/render/scene'
+import { TerrainLayer } from '@/render/terrain'
+import { buildChunkMesh, chunkGrid } from '@/render/terrainMesh'
+import { createCellSampler } from '@/render/cellSampler'
 import { TrajectoryLine, sampleTrajectory, type TrajectoryChannel } from '@/render/trajectory'
 import EChart from '@/components/charts/EChart.vue'
 import { lineOption } from '@/components/charts/options/line'
@@ -58,6 +62,7 @@ const failure = ref<string | null>(null)
 const backend = ref<EngineBackend | null>(null)
 
 let scene: MapScene | null = null
+let lease: SceneLease | null = null
 let terrain: TerrainLayer | null = null
 let line: TrajectoryLine | null = null
 let frame: number | null = null
@@ -389,14 +394,15 @@ async function startScene(): Promise<void> {
     return
   }
   backend.value = probe.backend
-  const created = await MapScene.create({ canvas: canvasElement, backend: probe.backend })
+  const borrowing = await renderHost().acquire(canvasElement, probe.backend)
   if (disposed) {
-    // The unmount disposed nothing, because the scene did not exist yet: an engine
-    // left alive here would render into a detached canvas for the rest of the page.
-    created.dispose()
+    // The view went away while the engine was starting; giving the lease straight back
+    // parks the canvas rather than leaving a render loop on a canvas nobody sees.
+    borrowing.release()
     return
   }
-  scene = created
+  lease = borrowing
+  scene = borrowing.scene
   terrain = new TerrainLayer(scene.scene, scene)
   line = new TrajectoryLine(scene.scene)
   updateDebug({
@@ -442,13 +448,25 @@ async function loadSurface(): Promise<void> {
     if (disposed) {
       return
     }
+    const sample = createCellSampler({
+      chunks: maps.chunks,
+      grid,
+      chunkSize: info.summary.chunk_size,
+      level,
+      layerId: LAYER_ELEVATION,
+    })
     for (const chunkRef of refs) {
       const key = chunkKey(chunkRef.layerId, chunkRef.level, chunkRef.chunkId)
-      const chunk = maps.chunkOf(key)
-      if (chunk === null) {
+      if (maps.chunkOf(key) === null) {
         continue
       }
-      terrain.setChunk(key, buildChunkMesh(chunk, grid, info.summary.chunk_size))
+      terrain.setChunk(
+        key,
+        buildChunkMesh(
+          chunkGrid(grid, info.summary.chunk_size, level, chunkRef.chunkId, maps.originOf(mapId)),
+          sample,
+        ),
+      )
     }
   } catch (error) {
     failure.value = isApiError(error) ? error.message : t('simulation.route.surfaceFailed')
@@ -500,7 +518,8 @@ onBeforeUnmount(() => {
   }
   line?.dispose()
   terrain?.dispose()
-  scene?.dispose()
+  lease?.release()
+  lease = null
   scene = null
   updateDebug({ mapId: null, loaded: false, error: null })
 })
@@ -542,7 +561,7 @@ onBeforeUnmount(() => {
     <div class="mt-4 grid grid-cols-4 gap-6">
       <div class="col-span-3">
         <div class="relative h-[28rem] rounded-card border border-line bg-surface">
-          <canvas ref="canvas" class="block h-full w-full" data-testid="trajectory-canvas" />
+          <div ref="canvas" class="block h-full w-full" data-testid="trajectory-canvas" />
           <p class="absolute bottom-3 left-3 font-mono text-xs text-muted">{{ positionText }}</p>
         </div>
         <Timeline

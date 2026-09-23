@@ -20,9 +20,9 @@ cargo test --workspace --all-features
 | `map-format::omf_graph` (12) | Do the roadmap, connector, path-library and vector layers round-trip, do region inclusion and the spatial hash work, and do derived-layer fingerprints verify and go stale correctly? |
 | `map-format::omf_patch` (6) | Does a patch apply, refuse a foreign base file, refuse to touch a derived layer, and survive a reload? |
 | `map-format::prop_roundtrip` (2) | Property tests: any raster content survives encode → decode, any metadata survives write → read. |
-| `core::math_terrain` (11) | Do projection, terrain, slope, the distance transform and the FFT match closed-form references? |
+| `core::math_terrain` (13) | Do projection, terrain, slope, the distance transform and the FFT match closed-form references? |
 | `core::field_search` (25) | Do cost synthesis, hard-constraint enforcement, the sampler, Lazy Theta\*, candidate generation, the Logit model, the elastic band and corner rounding behave? |
-| `core::motion` (28) | Do the speed limits, profile, stop handling, fatigue iteration, offset, attitude, bounce and turn profile behave? |
+| `core::motion` (29) | Do the speed limits, profile, stop handling, fatigue iteration, offset, attitude, bounce and turn profile behave? |
 | `core::sensors` (15) | Do sample rates, reproduction, GNSS errors and correlation, the resting accelerometer reading, the step spectrum, the gyroscope's turn rate, the magnetometer's magnitude and the barometer's ripple behave? |
 | `core::simulator` (13) | Does a whole run hold its invariants, replay bit-identically, honour waypoint semantics, close a loop, follow a redirect, batch reproducibly, export correctly and report metrics? |
 | `core::coarse` (7) | Are coarse blocks internally passable, do they replace the fine cells they cover, do they reduce the search, and are routes feasible with them on and off? |
@@ -84,7 +84,45 @@ device placement or pace. The recordings are not part of the repository — see
 [usage.md](usage.md#real-data) for how to convert them. Without any table, the layer
 reports the skip and passes.
 
+## The service and the page
+
+The service is tested through its own facades rather than through its internals: a
+router driven by `tower`'s `oneshot`, a gRPC client over an ephemeral port, and a real
+binary behind the browser lane. What each suite pins down:
+
+| Suite | Question it answers |
+|---|---|
+| `service::config` (12) | Do defaults, partial files, migrations, unknown keys and impossible values behave, and does the effective configuration render back as TOML? |
+| `service::facades` (5) | Do the three facades bind and stop, can each be disabled on its own, and is a page without the API refused before anything binds? |
+| `service::http_api` (24) | Status codes, prefixes, error bodies, paging, the embedded page, resource exhaustion (an oversized upload is `413`, a body within the limit reaches the handler), hostile ids and names, and the input bounds that used to abort the process | 
+| `service::simulations` (13) | Submit → watch → read: a summary, sample streams, exports, cancellation, and the retention bound |
+| `service::tasks` (10) | The task surface: a plan's result is the candidate set, a ticket that has not finished has no result, cancellation, kind filtering, a run's ticket readable through the task endpoints, event streams ending on a terminal event, and immediate `400`s |
+| `service::feasibility` (6) | Whether a point may be stood on: forbidden, passable, outside, too-close-to-an-obstacle (the same point flips with the radius), the order of a whole route, and absurd requests |
+| `service::rpc_api` (3) | The same resources over gRPC, including that a ticket submitted over HTTP is readable over gRPC |
+| `service::streams` (6) | NDJSON framing and paging over the sample channels |
+
+Two conventions matter here. A lane that needs a service **fails** rather than skipping
+unless `OUREALIS_ALLOW_SKIP=1` is set: a lane that silently passes without the stack it
+exists to exercise is worse than one that reports the problem. And the browser lane
+builds the service in **release**, because a debug build plans a route in tens of seconds,
+which turns its timeouts into a measurement of the planner rather than of the page.
+
+## The front-end lanes
+
+Playwright runs all four, one per directory:
+
+| Lane | Command | What it covers |
+|---|---|---|
+| unit (139) | `run test:unit` | Pure logic, no browser: DTO mirrors, unit conversion, colormap mapping, paging windows, SSE and NDJSON parsing, metric formatting, chart option builders, the two catalogues' key sets, the chunk crop, and the render engine's backend probe |
+| e2e (20) | `run test:e2e` | A real browser against a real service: import → list → preview (with `?engine=webgl2`), the workspace (draw a route, watch it plan, pick a candidate, submit, read the result), the map menu, the touch gestures, a refused route point, the whole simulation slice (trajectory, sensors, audit against a second run, OMF round-trip, batch sweep), the shell's theme and language, and one engine across views |
+| fuzz (6) | `run test:fuzz` | Seeded random input: random bytes as an image, a truncated or bit-flipped image, random job bodies, absurd path parameters, and the persisted-state guards |
+| monkey (3) | `run test:monkey` | Seeded random operation sequences over the stores and the interface, asserting no console error, no unhandled rejection and no failed request outside the expected set |
+
+The browser lanes talk to the service at `OUREALIS_SERVICE_URL` (default
+`http://127.0.0.1:8080`), which they build and start themselves for `test:e2e`.
+
 ## Conventions
+
 
 * Tests live under `tests/`, never in the source tree. Integration tests are
   `crates/*/tests/*.rs`; unit tests for private items are

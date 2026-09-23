@@ -191,7 +191,7 @@ export interface MapMetadata {
   /** Magnetic field declaration, when present. */
   magnetic_field?: unknown
   /** Global statistics, when present. */
-  global_stats?: unknown
+  global_stats?: GlobalStats | null
   /** Registered layers. */
   layers: LayerInfo[]
   /** Optional sections and their sizes. */
@@ -200,6 +200,45 @@ export interface MapMetadata {
   skeleton_nodes: number
   /** Derived layers and whether their fingerprints still check out. */
   derived: DerivedLayer[]
+}
+
+/** One channel's whole-map statistics, as `GLOBAL_STATS` carries them. */
+export interface ChannelStats {
+  /** Layer the channel belongs to. */
+  layer_id: number
+  /** Channel index inside that layer. */
+  channel: number
+  /** Minimum real value over the map's own cells. */
+  min: number
+  /** Maximum real value over the map's own cells. */
+  max: number
+  /** Mean real value over the map's own cells. */
+  mean: number
+  /** Fraction of the map's cells the channel covers. */
+  coverage: number
+}
+
+/** Whole-map statistics, used to give a ramp a range the whole surface shares. */
+export interface GlobalStats {
+  /** One entry per channel of every cell layer. */
+  channels: ChannelStats[]
+  /** Fraction of the map that is forbidden, per layer. */
+  forbidden_ratio: Array<[number, number]>
+}
+
+/** Range of one layer's channel, or `null` when the map does not declare one. */
+export function channelRange(
+  stats: GlobalStats | null | undefined,
+  layerId: number,
+  channel = 0,
+): { min: number; max: number } | null {
+  const entry = stats?.channels?.find(
+    (candidate) => candidate.layer_id === layerId && candidate.channel === channel,
+  )
+  if (entry === undefined || !(entry.max > entry.min)) {
+    return null
+  }
+  return { min: entry.min, max: entry.max }
 }
 
 /** Cell and chunk geometry of one raster layer. */

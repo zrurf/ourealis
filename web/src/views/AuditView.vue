@@ -26,6 +26,7 @@ import EChart from '@/components/charts/EChart.vue'
 import { acfOption, whiteNoiseBand } from '@/components/charts/options/acf'
 import { histogramOption } from '@/components/charts/options/histogram'
 import { compareOption } from '@/components/charts/options/series-compare'
+import type { Point } from '@/components/charts/options/types'
 import {
   acfPoints,
   compareRows,
@@ -237,7 +238,17 @@ const compareTable = computed(() => {
   })
 })
 
-/** Speed distributions of the two compared runs, drawn against each other. */
+/**
+ * One run's position on the cadence-against-pace plane.
+ *
+ * The comparison carries each run's mean speed and step frequency and nothing per
+ * sample, so the point is that pair. The KS rows above the chart describe the speed
+ * samples; this is the pair of headline numbers those samples produced.
+ */
+function cadencePacePoint(run: { mean_speed_mps: number; step_frequency_hz: number }): Point[] {
+  return [{ x: run.mean_speed_mps, y: run.step_frequency_hz }]
+}
+
 const compareChart = computed(() => {
   const result = comparison.value
   if (result === null) {
@@ -246,14 +257,11 @@ const compareChart = computed(() => {
   return compareOption({
     x: t('simulation.audit.meanSpeed'),
     y: t('simulation.audit.stepFrequency'),
-    title: t('simulation.audit.stepFrequency'),
+    title: t('simulation.audit.compareChart'),
     differenceLabel: t('simulation.audit.delta'),
     series: [
-      {
-        name: t('simulation.audit.baseline'),
-        data: [{ x: 0, y: result.a.mean_speed_mps }],
-      },
-      { name: t('simulation.audit.other'), data: [{ x: 0, y: result.b.mean_speed_mps }] },
+      { name: t('simulation.audit.baseline'), data: cadencePacePoint(result.a) },
+      { name: t('simulation.audit.other'), data: cadencePacePoint(result.b) },
     ],
   })
 })

@@ -2,7 +2,7 @@
 //!
 //! Every method resolves its resource through the builders of [`crate::api`] and
 //! only the encoding happens here, which is what keeps the two facades from
-//! disagreeing about a map or a job. Structures the web client only inspects —
+//! disagreeing about a map or a task. Structures the web client only inspects —
 //! the metadata tree, the evaluation report, the optional map sections — travel
 //! as JSON strings in the messages that declare them that way, so there is still
 //! exactly one definition of each resource, in [`crate::api::dto`].
@@ -18,13 +18,13 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
 use crate::api::dto::result::{EventDto, SensorSampleDto, TruthSampleDto};
-use crate::api::dto::simulation::SimulationStateDto;
-use crate::api::{maps, omf, routes, simulations, streams, system};
+use crate::api::dto::{TaskKindDto, TaskStateDto};
+use crate::api::{maps, omf, simulations, streams, system, tasks};
 use crate::app::AppState;
 use crate::error::{Result, ServiceError};
 use crate::facade;
-use crate::job::events::EventEnvelope;
 use crate::proto::v1 as pb;
+use crate::task::events::EventEnvelope;
 
 /// Frames queued for one server stream before the producer waits.
 const STREAM_QUEUE: usize = 8;
@@ -41,6 +41,11 @@ struct MapApi {
 
 /// Implements `ourealis.api.v1.SimulationService`.
 struct SimulationApi {
+    state: Arc<AppState>,
+}
+
+/// Implements `ourealis.api.v1.TaskService`.
+struct TaskApi {
     state: Arc<AppState>,
 }
 
@@ -62,7 +67,12 @@ pub async fn spawn(
     })
     .max_decoding_message_size(max_message)
     .max_encoding_message_size(max_message);
-    let jobs = pb::simulation_service_server::SimulationServiceServer::new(SimulationApi {
+    let runs = pb::simulation_service_server::SimulationServiceServer::new(SimulationApi {
+        state: Arc::clone(&state),
+    })
+    .max_decoding_message_size(max_message)
+    .max_encoding_message_size(max_message);
+    let tasks = pb::task_service_server::TaskServiceServer::new(TaskApi {
         state: Arc::clone(&state),
     })
     .max_decoding_message_size(max_message)
@@ -74,7 +84,8 @@ pub async fn spawn(
             .max_concurrent_streams(max_streams)
             .add_service(system)
             .add_service(maps)
-            .add_service(jobs)
+            .add_service(runs)
+            .add_service(tasks)
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 facade::wait_for_shutdown(&mut shutdown).await
             })
@@ -191,7 +202,8 @@ impl pb::map_service_server::MapService for MapApi {
             bytes.extend_from_slice(&chunk.data);
         }
         let given = (!name.trim().is_empty()).then_some(name.as_str());
-        let summary = maps::add_image(&self.state, &bytes, "import", given).map_err(status)?;
+        let summary =
+            maps::add_image(self.state.maps.as_ref(), &bytes, "import", given).map_err(status)?;
         Ok(Response::new(summary_to_pb(
             &summary,
             self.created_at_ms(&summary),
@@ -395,10 +407,15 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
                 .map_err(|error| status(ServiceError::Invalid(format!("request_json: {error}"))))?;
         simulations::validate_request(&parsed).map_err(status)?;
         let id = crate::store::identifier(parsed.name.as_deref().unwrap_or("run"));
-        let job = self.state.runner.submit(id, parsed).await.map_err(status)?;
+        let task = self
+            .state
+            .runner
+            .submit_simulation(id, parsed)
+            .await
+            .map_err(status)?;
         Ok(Response::new(pb::SubmitReply {
-            id: job.id().to_string(),
-            state: job_state(job.state()),
+            id: task.id().to_string(),
+            state: task_state(task.state()),
         }))
     }
 
@@ -411,13 +428,13 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
             offset: request.offset as usize,
             limit: request.limit as usize,
         });
-        let all = self.state.jobs.list();
+        let all = self.state.tasks.list();
         let total = all.len() as u32;
         let items = all
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(|job| simulation_state(&job.to_dto()))
+            .map(|task| task_record(&task.to_dto()))
             .collect();
         Ok(Response::new(pb::ListSimulationsReply { items, total }))
     }
@@ -425,10 +442,10 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
     async fn get(
         &self,
         request: Request<pb::GetSimulationRequest>,
-    ) -> std::result::Result<Response<pb::SimulationState>, Status> {
+    ) -> std::result::Result<Response<pb::TaskRecord>, Status> {
         let id = request.into_inner().id;
-        let job = self.state.jobs.get(&id).map_err(status)?;
-        Ok(Response::new(simulation_state(&job.to_dto())))
+        let task = self.state.tasks.get(&id).map_err(status)?;
+        Ok(Response::new(task_record(&task.to_dto())))
     }
 
     async fn cancel(
@@ -436,11 +453,11 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
         request: Request<pb::CancelRequest>,
     ) -> std::result::Result<Response<pb::Empty>, Status> {
         let id = request.into_inner().id;
-        let job = self.state.jobs.get(&id).map_err(status)?;
-        if !job.cancel() {
+        let task = self.state.tasks.get(&id).map_err(status)?;
+        if !task.cancel() {
             return Err(status(ServiceError::Conflict(format!(
                 "simulation {id} already finished with state {}",
-                job.state().to_string_name()
+                task.state().to_string_name()
             ))));
         }
         Ok(Response::new(pb::Empty {}))
@@ -453,51 +470,7 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
         request: Request<pb::WatchRequest>,
     ) -> std::result::Result<Response<Self::WatchStream>, Status> {
         let request = request.into_inner();
-        let job = self.state.jobs.get(&request.id).map_err(status)?;
-        let topics = request.topics;
-        let (sender, receiver) = mpsc::channel(STREAM_QUEUE);
-        tokio::spawn(async move {
-            let mut events = job.subscribe();
-            if send_event(&sender, &state_event(&job)).await.is_err() {
-                return;
-            }
-            if job.state().is_terminal() {
-                let _ = send_event(&sender, &terminal_event(&job)).await;
-                return;
-            }
-            loop {
-                match events.recv().await {
-                    Ok(envelope) => {
-                        let terminal = envelope.is_terminal();
-                        if (terminal || crate::job::events::accepts(&topics, &envelope.event))
-                            && send_envelope(&sender, &envelope).await.is_err()
-                        {
-                            return;
-                        }
-                        if terminal {
-                            return;
-                        }
-                    }
-                    // Progress events are idempotent snapshots, so a subscriber
-                    // that fell behind is brought up to date rather than replayed.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if send_event(&sender, &state_event(&job)).await.is_err() {
-                            return;
-                        }
-                        // The run may have ended while this stream was behind;
-                        // without this the stream would wait for an event the job
-                        // never publishes, because the job holds its broadcast
-                        // sender for its whole life in the registry.
-                        if job.state().is_terminal() {
-                            let _ = send_event(&sender, &terminal_event(&job)).await;
-                            return;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(receiver)))
+        watch_stream(&self.state, request.id, request.topics)
     }
 
     async fn summary(
@@ -505,8 +478,8 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
         request: Request<pb::SummaryRequest>,
     ) -> std::result::Result<Response<pb::SummaryReply>, Status> {
         let id = request.into_inner().id;
-        let job = self.state.jobs.get(&id).map_err(status)?;
-        let output = simulations::finished(&job).map_err(status)?;
+        let task = self.state.tasks.get(&id).map_err(status)?;
+        let output = simulations::finished(&task).map_err(status)?;
         let summary = simulations::build_summary(&id, &output).map_err(status)?;
         Ok(Response::new(pb::SummaryReply {
             summary_json: json_string(&summary)?,
@@ -520,8 +493,8 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
         request: Request<pb::StreamRequest>,
     ) -> std::result::Result<Response<Self::TruthStream>, Status> {
         let request = request.into_inner();
-        let job = self.state.jobs.get(&request.id).map_err(status)?;
-        let output = simulations::finished(&job).map_err(status)?;
+        let task = self.state.tasks.get(&request.id).map_err(status)?;
+        let output = simulations::finished(&task).map_err(status)?;
         let frame = self.frame_size(request.limit);
         let (sender, receiver) = mpsc::channel(STREAM_QUEUE);
         tokio::spawn(async move {
@@ -550,8 +523,8 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
         request: Request<pb::StreamRequest>,
     ) -> std::result::Result<Response<Self::SensorsStream>, Status> {
         let request = request.into_inner();
-        let job = self.state.jobs.get(&request.id).map_err(status)?;
-        let output = simulations::finished(&job).map_err(status)?;
+        let task = self.state.tasks.get(&request.id).map_err(status)?;
+        let output = simulations::finished(&task).map_err(status)?;
         let channel = request.channel;
         let total = streams::channel_len(&output, &channel).map_err(status)?;
         let frame = self.frame_size(request.limit);
@@ -578,22 +551,62 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
     }
+}
 
-    async fn preview(
-        &self,
-        request: Request<pb::RoutePreviewRequest>,
-    ) -> std::result::Result<Response<pb::RoutePreviewReply>, Status> {
-        let request = request.into_inner();
-        let parsed: crate::api::dto::SimulationRequest =
-            serde_json::from_str(&request.request_json)
-                .map_err(|error| status(ServiceError::Invalid(format!("request_json: {error}"))))?;
-        let preview = routes::plan_in_background(Arc::clone(&self.state), parsed, true)
-            .await
-            .map_err(status)?;
-        Ok(Response::new(pb::RoutePreviewReply {
-            preview_json: json_string(&preview)?,
-        }))
-    }
+/// One task's event stream, whatever service asked for it.
+///
+/// The simulation and task services expose the same stream: the events of a run are
+/// the events of a task, and duplicating the pump would be two places for the
+/// terminal-event rule to drift.
+fn watch_stream(
+    state: &Arc<AppState>,
+    id: String,
+    topics: Vec<String>,
+) -> std::result::Result<Response<ReceiverStream<std::result::Result<pb::Event, Status>>>, Status> {
+    let task = state.tasks.get(&id).map_err(status)?;
+    let (sender, receiver) = mpsc::channel(STREAM_QUEUE);
+    tokio::spawn(async move {
+        let mut events = task.subscribe();
+        if send_event(&sender, &state_event(&task)).await.is_err() {
+            return;
+        }
+        if task.state().is_terminal() {
+            let _ = send_event(&sender, &terminal_event(&task)).await;
+            return;
+        }
+        loop {
+            match events.recv().await {
+                Ok(envelope) => {
+                    let terminal = envelope.is_terminal();
+                    if (terminal || crate::task::events::accepts(&topics, &envelope.event))
+                        && send_envelope(&sender, &envelope).await.is_err()
+                    {
+                        return;
+                    }
+                    if terminal {
+                        return;
+                    }
+                }
+                // Progress events are idempotent snapshots, so a subscriber
+                // that fell behind is brought up to date rather than replayed.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if send_event(&sender, &state_event(&task)).await.is_err() {
+                        return;
+                    }
+                    // The run may have ended while this stream was behind;
+                    // without this the stream would wait for an event the task
+                    // never publishes, because the task holds its broadcast
+                    // sender for its whole life in the registry.
+                    if task.state().is_terminal() {
+                        let _ = send_event(&sender, &terminal_event(&task)).await;
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+    Ok(Response::new(ReceiverStream::new(receiver)))
 }
 
 impl SimulationApi {
@@ -650,21 +663,149 @@ fn summary_to_pb(summary: &crate::api::dto::MapSummary, created_at_unix_ms: i64)
 }
 
 /// Lifecycle state as the protobuf enum.
-fn job_state(state: crate::api::dto::JobStateDto) -> i32 {
+fn task_state(state: crate::api::dto::TaskState) -> i32 {
     match state {
-        crate::api::dto::JobStateDto::Queued => pb::JobState::Queued as i32,
-        crate::api::dto::JobStateDto::Running => pb::JobState::Running as i32,
-        crate::api::dto::JobStateDto::Succeeded => pb::JobState::Succeeded as i32,
-        crate::api::dto::JobStateDto::Failed => pb::JobState::Failed as i32,
-        crate::api::dto::JobStateDto::Cancelled => pb::JobState::Cancelled as i32,
+        crate::api::dto::TaskState::Queued => pb::TaskState::Queued as i32,
+        crate::api::dto::TaskState::Running => pb::TaskState::Running as i32,
+        crate::api::dto::TaskState::Succeeded => pb::TaskState::Succeeded as i32,
+        crate::api::dto::TaskState::Failed => pb::TaskState::Failed as i32,
+        crate::api::dto::TaskState::Cancelled => pb::TaskState::Cancelled as i32,
     }
 }
 
-/// One job's state as a protobuf message.
-fn simulation_state(dto: &SimulationStateDto) -> pb::SimulationState {
-    pb::SimulationState {
+#[tonic::async_trait]
+impl pb::task_service_server::TaskService for TaskApi {
+    async fn submit(
+        &self,
+        request: Request<pb::SubmitTaskRequest>,
+    ) -> std::result::Result<Response<pb::SubmitTaskReply>, Status> {
+        let body: crate::api::dto::TaskSubmit =
+            serde_json::from_str(&request.into_inner().body_json)
+                .map_err(|error| status(ServiceError::Invalid(format!("body_json: {error}"))))?;
+        let reply = tasks::submit_payload(&self.state, body)
+            .await
+            .map_err(status)?;
+        Ok(Response::new(pb::SubmitTaskReply {
+            id: reply.id,
+            kind: task_kind(reply.kind),
+            state: task_state(reply.state),
+        }))
+    }
+
+    async fn list(
+        &self,
+        request: Request<pb::ListTasksRequest>,
+    ) -> std::result::Result<Response<pb::ListTasksReply>, Status> {
+        let request = request.into_inner();
+        let (offset, limit) = self.state.page(crate::api::dto::PageQuery {
+            offset: request.offset as usize,
+            limit: request.limit as usize,
+        });
+        let kind = task_kind_from_pb(request.kind);
+        let all = match kind {
+            Some(kind) => self.state.tasks.list_kind(kind),
+            None => self.state.tasks.list(),
+        };
+        let total = all.len() as u32;
+        let items = all
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|task| task_record(&task.to_dto()))
+            .collect();
+        Ok(Response::new(pb::ListTasksReply { items, total }))
+    }
+
+    async fn get(
+        &self,
+        request: Request<pb::GetTaskRequest>,
+    ) -> std::result::Result<Response<pb::TaskRecord>, Status> {
+        let id = request.into_inner().id;
+        let task = self.state.tasks.get(&id).map_err(status)?;
+        Ok(Response::new(task_record(&task.to_dto())))
+    }
+
+    async fn cancel(
+        &self,
+        request: Request<pb::CancelTaskRequest>,
+    ) -> std::result::Result<Response<pb::Empty>, Status> {
+        let id = request.into_inner().id;
+        let task = self.state.tasks.get(&id).map_err(status)?;
+        if !task.cancel() {
+            return Err(status(ServiceError::Conflict(format!(
+                "task {id} is {}: it cannot be cancelled",
+                task.state().to_string_name()
+            ))));
+        }
+        Ok(Response::new(pb::Empty {}))
+    }
+
+    type WatchStream = ReceiverStream<std::result::Result<pb::Event, Status>>;
+
+    async fn watch(
+        &self,
+        request: Request<pb::WatchTaskRequest>,
+    ) -> std::result::Result<Response<Self::WatchStream>, Status> {
+        let request = request.into_inner();
+        watch_stream(&self.state, request.id, request.topics)
+    }
+
+    async fn result(
+        &self,
+        request: Request<pb::TaskResultRequest>,
+    ) -> std::result::Result<Response<pb::TaskResultReply>, Status> {
+        let id = request.into_inner().id;
+        let task = self.state.tasks.get(&id).map_err(status)?;
+        let result = tasks::result_dto(&task).map_err(status)?;
+        Ok(Response::new(pb::TaskResultReply {
+            id: task.id().to_string(),
+            kind: task_kind(task.kind()),
+            result_json: json_string(&result)?,
+        }))
+    }
+
+    async fn result_ref(
+        &self,
+        request: Request<pb::TaskResultRequest>,
+    ) -> std::result::Result<Response<pb::TaskResultRef>, Status> {
+        let id = request.into_inner().id;
+        let task = self.state.tasks.get(&id).map_err(status)?;
+        Ok(Response::new(pb::TaskResultRef {
+            id: task.id().to_string(),
+            kind: task_kind(task.kind()),
+            url: task.result_url(),
+        }))
+    }
+}
+
+/// Kind of a task as the protobuf enum.
+fn task_kind(kind: TaskKindDto) -> i32 {
+    match kind {
+        TaskKindDto::Simulation => pb::TaskKind::Simulation as i32,
+        TaskKindDto::RoutePreview => pb::TaskKind::RoutePreview as i32,
+        TaskKindDto::RoutePlan => pb::TaskKind::RoutePlan as i32,
+        TaskKindDto::SyntheticMap => pb::TaskKind::SyntheticMap as i32,
+    }
+}
+
+/// Kind of a task from the protobuf enum; `None` for the unspecified value, which
+/// means "every kind".
+fn task_kind_from_pb(value: i32) -> Option<TaskKindDto> {
+    match pb::TaskKind::try_from(value).ok()? {
+        pb::TaskKind::Unspecified => None,
+        pb::TaskKind::Simulation => Some(TaskKindDto::Simulation),
+        pb::TaskKind::RoutePreview => Some(TaskKindDto::RoutePreview),
+        pb::TaskKind::RoutePlan => Some(TaskKindDto::RoutePlan),
+        pb::TaskKind::SyntheticMap => Some(TaskKindDto::SyntheticMap),
+    }
+}
+
+/// One task's state as a protobuf message.
+fn task_record(dto: &TaskStateDto) -> pb::TaskRecord {
+    pb::TaskRecord {
         id: dto.id.clone(),
-        state: job_state(dto.state),
+        kind: task_kind(dto.kind),
+        state: task_state(dto.state),
         stage: dto.stage.clone(),
         progress: dto.progress,
         elapsed_s: dto.elapsed_s,
@@ -768,8 +909,8 @@ async fn send_envelope(
 }
 
 /// The current state as an event.
-fn state_event(job: &crate::job::Job) -> EventDto {
-    let dto = job.to_dto();
+fn state_event(task: &crate::task::Task) -> EventDto {
+    let dto = task.to_dto();
     EventDto::State {
         state: dto.state.to_string_name().to_string(),
         stage: dto.stage,
@@ -778,11 +919,11 @@ fn state_event(job: &crate::job::Job) -> EventDto {
     }
 }
 
-/// The outcome of a job that already finished.
-fn terminal_event(job: &crate::job::Job) -> EventDto {
-    let dto = job.to_dto();
+/// The outcome of a task that already finished.
+fn terminal_event(task: &crate::task::Task) -> EventDto {
+    let dto = task.to_dto();
     match dto.state {
-        crate::api::dto::JobStateDto::Failed => EventDto::Error {
+        crate::api::dto::TaskState::Failed => EventDto::Error {
             kind: dto.error_kind.unwrap_or_else(|| "internal".to_string()),
             message: dto
                 .error
@@ -790,11 +931,9 @@ fn terminal_event(job: &crate::job::Job) -> EventDto {
         },
         _ => EventDto::Done {
             state: dto.state.to_string_name().to_string(),
-            summary_url: format!(
-                "{}/simulations/{}/summary",
-                crate::api::API_PREFIX,
-                job.id()
-            ),
+            // A run's digest and a plan's are at different paths, and the task knows
+            // which one it is: the event carries the same URL the HTTP reply does.
+            summary_url: format!("{}{}", crate::api::API_PREFIX, task.result_url()),
         },
     }
 }

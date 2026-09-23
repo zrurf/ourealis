@@ -82,6 +82,55 @@ fn json(bytes: &[u8]) -> Value {
     })
 }
 
+/// Submits a task and polls the ticket until it reaches a terminal state.
+async fn run_task(router: &Router, body: Value) -> Value {
+    let (status, _, bytes) = send(
+        router,
+        "POST",
+        "/api/v1/tasks",
+        Body::from(serde_json::to_vec(&body).expect("body")),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let ticket = json(&bytes)["id"].as_str().expect("a ticket").to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let (status, bytes) = get(router, &format!("/api/v1/tasks/{ticket}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let state = json(&bytes);
+        match state["state"].as_str().unwrap_or_default() {
+            "succeeded" => return state,
+            "failed" | "cancelled" => {
+                panic!("task {ticket} ended as {state}");
+            }
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task {ticket} did not finish: {state}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The result of a task that has finished.
+async fn task_result(router: &Router, id: &str) -> Value {
+    let (status, bytes) = get(router, &format!("/api/v1/tasks/{id}/result")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    json(&bytes)
+}
+
 #[tokio::test]
 async fn health_and_system_info_describe_the_service() {
     let (router, _state) = app().await;
@@ -729,22 +778,15 @@ async fn the_synthetic_generator_honours_the_requested_seed() {
         });
         let router = router.clone();
         async move {
-            let (status, _, bytes) = send(
+            let ticket = run_task(
                 &router,
-                "POST",
-                "/api/v1/maps/synthetic",
-                Body::from(serde_json::to_vec(&body).expect("body")),
-                &[("content-type", "application/json")],
+                json!({ "kind": "synthetic_map", "spec": body, "name": "seeded" }),
             )
             .await;
-            assert_eq!(
-                status,
-                StatusCode::CREATED,
-                "{}",
-                String::from_utf8_lossy(&bytes)
-            );
-            let summary = json(&bytes);
-            let id = summary["id"].as_str().expect("an id").to_string();
+            let id = ticket["id"].as_str().expect("a ticket").to_string();
+            let summary = task_result(&router, &id).await;
+            // A task result is tagged by its kind, so the map is under `map`.
+            let id = summary["map"]["id"].as_str().expect("an id").to_string();
             let (status, bytes) = get(
                 &router,
                 &format!("/api/v1/maps/{id}/layers/{FORBIDDEN}/grid"),
@@ -934,4 +976,126 @@ async fn a_configuration_with_cors_lists_the_allowed_origin() {
             .and_then(|value| value.to_str().ok()),
         Some("http://localhost:5173")
     );
+}
+
+#[tokio::test]
+async fn a_request_the_generator_could_not_rasterise_is_a_bad_request() {
+    // The generator holds one `f32` per cell per layer, so this body used to abort the
+    // whole process inside the allocator instead of answering. Every field that scales
+    // an allocation is checked here.
+    let (router, _state) = app().await;
+    for body in [
+        json!({"preset": "huge", "width_m": 3_000_000.0, "height_m": 3_000_000.0, "resolution_m": 1.0}),
+        json!({"preset": "custom", "width_m": 5000.0, "height_m": 5000.0, "resolution_m": 0.1}),
+    ] {
+        let (status, _, bytes) = send(
+            &router,
+            "POST",
+            "/api/v1/tasks",
+            Body::from(
+                serde_json::to_vec(&json!({ "kind": "synthetic_map", "spec": body }))
+                    .expect("body"),
+            ),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{body} must be refused, got {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(json(&bytes)["error"]["kind"], "invalid");
+    }
+    // The service is still answering, which is the point of refusing rather than
+    // allocating.
+    let (status, _) = get(&router, "/api/v1/health").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_wide_preset_is_a_different_shape_from_the_default_one() {
+    // The picker offers `wide` beside `default`; an unrecognised preset used to fall
+    // through to the custom branch, whose defaults are the `default` footprint, so the
+    // option silently produced the same map.
+    let (router, _state) = app().await;
+    let bounds = |preset: &'static str| {
+        let router = router.clone();
+        async move {
+            let body = json!({ "preset": preset, "seed": 7 });
+            let ticket = run_task(
+                &router,
+                json!({ "kind": "synthetic_map", "spec": body, "name": preset }),
+            )
+            .await;
+            let id = ticket["id"].as_str().expect("a ticket").to_string();
+            let summary = task_result(&router, &id).await["map"].clone();
+            (
+                summary["bounds"]["max_x"].as_f64().expect("width"),
+                summary["bounds"]["max_y"].as_f64().expect("height"),
+            )
+        }
+    };
+    let wide = bounds("wide").await;
+    let default = bounds("default").await;
+    assert_ne!(
+        wide, default,
+        "the wide preset must not be the default shape"
+    );
+    assert_eq!(wide, (900.0, 400.0));
+}
+
+#[tokio::test]
+async fn a_spec_that_asks_for_an_impossible_workload_is_a_bad_request() {
+    // Each of these scales an allocation directly — points per metre of path, and
+    // samples per second of run — and each used to be accepted, then aborted the
+    // process on the job thread instead of failing the request.
+    let (router, _state) = app().await;
+    let cases = [
+        json!({"settings": {"route": {"sample_spacing_m": 1e-9}}}),
+        json!({"settings": {"sensors": {"imu_rate_hz": 1e12}}}),
+        json!({"settings": {"motion": {"sample_rate_hz": 1e12}}}),
+        json!({"settings": {"limits": {"a_lat_max": 0.0}}}),
+    ];
+    for settings in cases {
+        let body = json!({
+            "route": {"mode": "standard", "start": {"x": 40.0, "y": 60.0},
+                      "goal": {"x": 250.0, "y": 150.0}},
+            "settings": settings["settings"].clone()
+        });
+        let (status, _, bytes) = send(
+            &router,
+            "POST",
+            "/api/v1/tasks",
+            Body::from(
+                serde_json::to_vec(&json!({ "kind": "route_preview", "request": body }))
+                    .expect("body"),
+            ),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "{body} must not be accepted, got {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_wrong_api_version_is_not_answered_with_the_page() {
+    // The page must never be handed to a client expecting JSON: it would try to parse
+    // HTML as a reply. Everything under `/api` is the API's, whatever the version.
+    let (router, _state) = app().await;
+    for path in ["/api", "/api/", "/api/v2/maps", "/api/v1"] {
+        let (status, _, bytes) = send(&router, "GET", path, Body::empty(), &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{path} must not fall back to the page: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(json(&bytes)["error"]["kind"], "not_found");
+    }
 }

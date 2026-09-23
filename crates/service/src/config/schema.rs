@@ -241,7 +241,7 @@ impl HttpConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SimulationConfigSection {
-    /// Jobs allowed to run at once. `core` already parallelises inside a job, so
+    /// Jobs allowed to run at once. `core` already parallelises inside a task, so
     /// this is deliberately small.
     pub max_concurrent: usize,
     /// Jobs allowed to wait; a submission beyond it is rejected with `busy`.

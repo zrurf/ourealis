@@ -14,7 +14,7 @@ const routes: RouteRecordRaw[] = [
     name: 'map-studio',
     component: () => import('@/views/MapStudioView.vue'),
   },
-  { path: '/routes', name: 'route-studio', component: () => import('@/views/RouteStudioView.vue') },
+  { path: '/run', name: 'run', component: () => import('@/views/RunView.vue') },
   {
     path: '/simulations/:id',
     name: 'simulation',

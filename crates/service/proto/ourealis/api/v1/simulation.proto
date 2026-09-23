@@ -1,22 +1,15 @@
-// Simulation jobs: submission, progress and result streaming.
+// Simulations: submission, progress and result streaming.
+//
+// A run is a task, so its lifecycle fields are the ones `task.proto` defines; this
+// file only adds the run-specific resources (summary, samples, exports) and the
+// service that submits one.
 
 syntax = "proto3";
 
 package ourealis.api.v1;
 
 import "ourealis/api/v1/common.proto";
-
-// Lifecycle state of a job.
-enum JobState {
-  JOB_STATE_UNSPECIFIED = 0;
-  // Waiting for a worker slot.
-  JOB_STATE_QUEUED = 1;
-  // Running; see `stage` for how far it has come.
-  JOB_STATE_RUNNING = 2;
-  JOB_STATE_SUCCEEDED = 3;
-  JOB_STATE_FAILED = 4;
-  JOB_STATE_CANCELLED = 5;
-}
+import "ourealis/api/v1/task.proto";
 
 // One submitted simulation.
 message SubmitRequest {
@@ -29,39 +22,11 @@ message SubmitRequest {
 
 message SubmitReply {
   string id = 1;
-  JobState state = 2;
+  TaskState state = 2;
 }
 
 message GetSimulationRequest {
   string id = 1;
-}
-
-// State of one job.
-message SimulationState {
-  string id = 1;
-  JobState state = 2;
-  // Pipeline stage the job is in: "queued", "environment", "planning",
-  // "motion", "sensors", "metrics", "done".
-  string stage = 3;
-  // Fraction of the run completed, 0 to 1. Unset while the service cannot say:
-  // the simulator's run is one call, so a running job reports no fraction and a
-  // client shows elapsed time instead.
-  optional double progress = 4;
-  // Wall-clock time the job has been running, seconds; unset while queued.
-  optional double elapsed_s = 13;
-  // Job name, when one was given.
-  string name = 5;
-  // Failure message, empty unless the state is failed.
-  string error = 6;
-  // Error kind, empty unless the state is failed.
-  string error_kind = 7;
-  int64 created_at_unix_ms = 8;
-  int64 started_at_unix_ms = 9;
-  int64 finished_at_unix_ms = 10;
-  // Map the run used.
-  string map_id = 11;
-  // Planning mode: "standard", "loop" or "dynamic".
-  string mode = 12;
 }
 
 message ListSimulationsRequest {
@@ -70,24 +35,13 @@ message ListSimulationsRequest {
 }
 
 message ListSimulationsReply {
-  repeated SimulationState items = 1;
+  repeated TaskRecord items = 1;
   uint32 total = 2;
 }
 
 message CancelRequest {
   string id = 1;
 }
-
-// Progress and log events of a job, identical to the SSE stream.
-message Event {
-  // "state", "stage", "log", "done" or "error".
-  string type = 1;
-  // Event payload as JSON, shaped like the corresponding HTTP event.
-  string data_json = 2;
-  // Server time of the event, Unix milliseconds.
-  int64 at_unix_ms = 3;
-}
-
 message WatchRequest {
   string id = 1;
   // Topics to forward; empty means state, stage and log, but not the result
@@ -166,21 +120,10 @@ message SummaryReply {
   string summary_json = 1;
 }
 
-// A route preview: planning only, no motion or sensors.
-message RoutePreviewRequest {
-  string request_json = 1;
-}
-
-message RoutePreviewReply {
-  // Preview payload as JSON: candidate paths with cost, length, selection
-  // probability and geometry.
-  string preview_json = 1;
-}
-
 service SimulationService {
   rpc Submit(SubmitRequest) returns (SubmitReply);
   rpc List(ListSimulationsRequest) returns (ListSimulationsReply);
-  rpc Get(GetSimulationRequest) returns (SimulationState);
+  rpc Get(GetSimulationRequest) returns (TaskRecord);
   rpc Cancel(CancelRequest) returns (Empty);
   // Server-side stream of progress and log events.
   rpc Watch(WatchRequest) returns (stream Event);
@@ -189,5 +132,4 @@ service SimulationService {
   rpc Truth(StreamRequest) returns (stream TruthSample);
   // One sensor channel streamed in frames of `limit` samples.
   rpc Sensors(StreamRequest) returns (stream SensorSample);
-  rpc Preview(RoutePreviewRequest) returns (RoutePreviewReply);
 }

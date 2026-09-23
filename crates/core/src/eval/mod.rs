@@ -153,7 +153,15 @@ impl MetricsReport {
 
         let lap_times = lap_times(trajectory);
         let lap_time_cv = lap_time_cv(trajectory);
-        let mean_abs_curvature = if trajectory.samples.is_empty() {
+        // Moving samples only, in both terms: a standing start and an end hold carry
+        // no curvature, so dividing by them would make a healthy route read a lower
+        // curvature the longer the runner stood still.
+        let moving_count = trajectory
+            .samples
+            .iter()
+            .filter(|sample| sample.is_moving())
+            .count();
+        let mean_abs_curvature = if moving_count == 0 {
             0.0
         } else {
             trajectory
@@ -162,7 +170,7 @@ impl MetricsReport {
                 .filter(|sample| sample.is_moving())
                 .map(|sample| sample.kappa_eff.abs())
                 .sum::<f64>()
-                / trajectory.samples.len() as f64
+                / moving_count as f64
         };
 
         Self {

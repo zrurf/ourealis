@@ -5,6 +5,7 @@ mod fixtures;
 use glam::DVec2;
 use ourealis_core::math::fft::Spectrum;
 use ourealis_core::math::{LocalFrame, angle_difference, bilinear};
+use ourealis_core::path::resample;
 use ourealis_core::terrain::{DistanceField, Grid2D, Terrain};
 use ourealis_map_format::Aabb;
 
@@ -214,4 +215,35 @@ fn fft_amplitude_survives_a_record_that_is_not_a_power_of_two() {
             peak.magnitude
         );
     }
+}
+
+#[test]
+fn spectrum_of_an_empty_signal_is_empty_and_does_not_panic() {
+    // The spectrum is the last stage of every spectral metric, and those metrics are
+    // reachable with a record that holds no samples: a run whose sensors produced
+    // nothing, a channel the map does not carry. Returning an empty spectrum lets the
+    // caller report "not measured"; reading the first sample panicked instead.
+    let spectrum = Spectrum::of(&[], 100.0);
+    assert!(spectrum.magnitudes.is_empty());
+    assert!(spectrum.frequencies_hz.is_empty());
+    assert!(spectrum.peak_in_band(0.0, 10.0).is_none());
+}
+
+#[test]
+fn resampling_floor_keeps_a_sub_millimetre_spacing_bounded() {
+    // One point is stored per spacing, so a spacing below the millimetre tolerance asks
+    // for a point count that grows without bound while carrying no shape the tolerance
+    // would keep.
+    let points = vec![DVec2::new(0.0, 0.0), DVec2::new(500.0, 0.0)];
+    let fine = resample(&points, 1e-9);
+    let millimetre = resample(&points, ourealis_core::path::MIN_SEGMENT_M);
+    assert_eq!(fine.len(), millimetre.len());
+    assert!(
+        fine.len() < 1_000_000,
+        "a 500 m path must not expand past a million points: {}",
+        fine.len()
+    );
+    // A spacing the caller can use is still honoured.
+    let metre = resample(&points, 1.0);
+    assert_eq!(metre.len(), 501);
 }

@@ -194,8 +194,8 @@ fn unusable_values_are_rejected_with_the_field_name() {
 
 #[test]
 fn a_log_directive_list_is_accepted() {
-    let loaded = loaded("[log]\nlevel = \"info,ourealis::job=trace\"");
-    assert_eq!(loaded.config.log.level, "info,ourealis::job=trace");
+    let loaded = loaded("[log]\nlevel = \"info,ourealis::task=trace\"");
+    assert_eq!(loaded.config.log.level, "info,ourealis::task=trace");
     // The first directive decides whether the level is usable at all.
     let error = Config::from_toml("[log]\nlevel = \"verbose,ourealis=trace\"")
         .expect_err("an unknown base level is refused");

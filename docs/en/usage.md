@@ -25,6 +25,132 @@ with `--no-default-features` for a CPU-only binary; the CPU backend is a complet
 implementation of every kernel and is the semantic reference the GPU is compared
 against.
 
+## Service and web interface
+
+The service is one binary in `crates/service` (crate and binary name `ourealis`).
+It reads one TOML file, serves three facades and embeds the page:
+
+```bash
+pnpm --dir web install --frozen-lockfile         # once
+cargo build --release -p ourealis                 # build.rs runs the Vite build and embeds web/dist
+./target/release/ourealis --config dev.toml       # or with no argument: the defaults, loopback only
+./target/release/ourealis --print-config          # the effective configuration, after defaults
+```
+
+| Facade | Switch | Carries |
+|---|---|---|
+| RPC | `server.rpc_enabled` | gRPC, package `ourealis.api.v1` |
+| HTTP | `server.http_enabled` | REST under `/api/v1`, plus WebSocket and SSE |
+| Web | `server.web_enabled` | the embedded page, at `/` (requires HTTP) |
+
+### The run workspace
+
+Open `/` and the interface is there. A run is produced on one page, `/run`, in five
+stages:
+
+| Stage | What it decides |
+|---|---|
+| Map | which map to plan against |
+| Route | the mode and the points, drawn by clicking and dragging on the map |
+| Runner | the preset, the seed and — in expert mode — every individual parameter |
+| Sensors | the sample rates and, in expert mode, the noise and event switches |
+| Run | the name, the metrics switch, and the button that submits |
+
+A route is **drawn, not typed**: click the ground to place the start and the goal, drag
+a handle to move it, double-click a handle to remove it. Planning is automatic — as soon
+as the route is complete a preview runs — so the summary (length, path ratio, estimated
+time) and the candidate table update as the route changes, and no run is needed to see
+what a change did. The planner's own choice is marked in the candidate table: a run
+takes that one, because path choice follows the route and the seed rather than a row in
+a list.
+
+**Simple** shows the decisions that change the result; **Expert** shows everything,
+grouped, with a badge per group reporting how many fields differ from the recipe or the
+defaults. Four recipes — campus jog, track intervals, phone and watch, clean truth —
+fill the whole configuration in one click and stay editable.
+
+Other pages: `/maps` (import, generate, download), `/maps/{id}` (preview with a cell
+inspector and layer drapes), `/maps/{id}/studio` (draw regions and connectors, export),
+`/batch` (multi-individual sweeps), `/omf` (structure tree, metadata edits, patches),
+`/simulations/{id}` and its `/trajectory`, `/sensors`, `/audit` tabs, `/settings`.
+
+### Tasks: every long operation is a ticket
+
+Planning a route, taking a profile or generating a map takes seconds to minutes, so no
+endpoint holds a request open for it. `POST /api/v1/tasks` returns `202` with a ticket
+and the work runs on a blocking worker:
+
+```jsonc
+// POST /api/v1/tasks
+{"kind": "route_preview", "request": { /* the same body POST /simulations takes */ }}
+{"kind": "route_plan",    "request": { /* … */ }}
+{"kind": "synthetic_map", "spec": { "preset": "compact", "seed": 7 }, "name": "fixture"}
+```
+
+| Call | Answers |
+|---|---|
+| `GET /api/v1/tasks/{id}` | `kind`, `state` (`queued`/`running`/`succeeded`/`failed`/`cancelled`), `stage`, `elapsed_s`, `error` |
+| `GET /api/v1/tasks/{id}/result` | the payload, tagged by kind: `{"route": {…}}` or `{"map": {…}}`; `409` while it runs |
+| `GET /api/v1/tasks/{id}/result/ref` | where the result lives, without fetching it |
+| `DELETE /api/v1/tasks/{id}` | cancel; a queued task stops at once, a running one at the next boundary |
+| `GET /api/v1/tasks/{id}/events` | SSE: state, stage, log, and one terminal event |
+| `GET /api/v1/tasks/{id}/ws` | the same session over WebSocket |
+| `GET /api/v1/tasks?kind=route_plan` | the tickets, newest first, filtered by kind |
+
+A **run is a task too**, and `GET /tasks/{id}` answers for a run id, so one poller can
+watch everything. A run's data stays on its own endpoints (`/simulations/{id}/summary`,
+`/truth`, `/sensors`, `/export`) because a whole run does not fit in one response —
+`/tasks/{id}/result` answers `415` for one and says so.
+
+Requests are validated at submission when the answer does not need the map, so an
+impossible individual or an unusable sensor rate is a `400` on the call rather than a
+failure to poll for. Anything that needs the map (a corrupt image, no feasible path) is
+a failed task with a message.
+
+The page uses the same surface: work the interface waits on appears behind a modal
+loader with its elapsed time and a cancel button; the rest is reported in the header's
+task tray. Neither shows a percentage — the simulator's run is a single call, so there
+is no fraction to report.
+
+### Where a point may be
+
+The map says where a runner can be, and the page cannot read it: the hard-forbidden mask
+is a layer in the file, while the page draws only the surface. `POST
+/api/v1/maps/{id}/feasibility` answers it for a list of points:
+
+```jsonc
+{"points": [{"x": 234, "y": 156}, {"x": 36, "y": 100}], "safe_radius_m": 0.75}
+// { "items": [
+//   {"point": …, "legal": false, "reason": "forbidden", "distance_m": 0,    "cell": [117, 78], "elevation_m": 13.8},
+//   {"point": …, "legal": true,  "reason": "ok",        "distance_m": 0.75, "cell": [18, 50],  "elevation_m": 12.6}
+// ]}
+```
+
+`reason` is `ok`, `outside` (beyond the map), `forbidden` (a blocked cell) or `too_close`
+(passable, but nearer an obstacle than `safe_radius_m` — the rule the simulator's own
+offset stage applies, so a point this call accepts is one the planner will take). The
+endpoint reads the mask and the neighbouring cells only — no cost field, no graph — so it
+answers in milliseconds and the workspace calls it as a point is dropped, marking a
+refused point in the error colour and saying why in words.
+
+### Front-end checks
+
+```bash
+pnpm --dir web run typecheck      # vue-tsc over src *and* tests, plus the node configs
+pnpm --dir web run lint           # oxlint
+pnpm --dir web run format:check   # oxfmt
+pnpm --dir web run build          # the bundled page build.rs embeds
+pnpm --dir web run test:unit      # pure logic, no browser
+pnpm --dir web run test:e2e       # a real browser against a real service (builds it in release)
+pnpm --dir web run test:fuzz      # seeded random input
+pnpm --dir web run test:monkey    # seeded random operation sequences
+```
+
+The e2e lane needs a service: `test:e2e` builds it in release and expects it at
+`OUREALIS_SERVICE_URL` (default `http://127.0.0.1:8080`). It fails rather than skipping
+when there is none, unless `OUREALIS_ALLOW_SKIP=1` is set — a lane that silently passes
+without the stack it exists to exercise is worse than one that reports the problem.
+
 ## Examples
 
 ```bash

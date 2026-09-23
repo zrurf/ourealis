@@ -169,3 +169,120 @@ fn hard_mask_bitmap_preserves_blocked_cells() {
     let local_y = ((lake.1 - layers.bounds.min_y) / cell) as u32 - origin.1;
     assert_eq!(chunk.get(local_x, local_y, 0), 1.0);
 }
+
+#[test]
+fn an_unbounded_grid_is_rejected_instead_of_allocated() {
+    // The generator holds one `f32` per cell for seven layers, so a request like this
+    // asks for tens of terabytes and used to abort the process in the allocator.
+    let spec = SyntheticMapSpec {
+        width_m: 3_000_000.0,
+        height_m: 3_000_000.0,
+        resolution_m: 1.0,
+        ..SyntheticMapSpec::default()
+    };
+    let error = spec
+        .validate()
+        .expect_err("a 9e12-cell grid must be refused");
+    assert!(
+        error.to_string().contains("above the"),
+        "the message must name the bound: {error}"
+    );
+    assert!(build(&spec).is_err(), "build must refuse it too");
+}
+
+#[test]
+fn a_resolution_the_header_cannot_record_is_rejected() {
+    for resolution_m in [0.0, -1.0, 0.005, 1000.0] {
+        let spec = SyntheticMapSpec {
+            resolution_m,
+            ..SyntheticMapSpec::compact()
+        };
+        assert!(
+            spec.validate().is_err(),
+            "{resolution_m} m resolution must be refused"
+        );
+    }
+}
+
+#[test]
+fn the_header_states_the_resolution_the_grid_was_rasterised_at() {
+    // Readers derive every cell position from the header's centimetre field, so a
+    // spec that is not a whole number of centimetres has to rasterise at the rounded
+    // value rather than at the one it was asked for.
+    let spec = SyntheticMapSpec {
+        width_m: 705.0,
+        height_m: 705.0,
+        resolution_m: 0.705,
+        ..SyntheticMapSpec::compact()
+    };
+    let bytes = build(&spec).expect("build");
+    let map = Map::from_bytes(bytes).expect("open");
+    let declared = map.header().base_res_cm as f64 / 100.0;
+    assert!((declared - 0.71).abs() < 1e-9, "declared {declared} m");
+    let cell = map.grid().cell_size_m(0);
+    assert!(
+        (cell - declared).abs() < 1e-9,
+        "the grid must use the declared resolution: {cell} m against {declared} m"
+    );
+    // The map extent must hold the number of cells the header implies.
+    let expected = (
+        (spec.width_m / declared).ceil() as u32,
+        (spec.height_m / declared).ceil() as u32,
+    );
+    assert_eq!(spec.cell_dims(), expected);
+}
+
+#[test]
+fn global_stats_describe_the_map_and_not_its_padding() {
+    let spec = SyntheticMapSpec::compact();
+    let bytes = build(&spec).expect("build");
+    let map = Map::from_bytes(bytes).expect("open");
+    let stats = map.global_stats().expect("read").expect("present");
+
+    // The synthetic campus has a hill but no cell at zero elevation, and its extent is
+    // not a whole number of chunks. Counting the chunks' zero padding pulled the
+    // minimum down to zero, and folding in the decimated levels shifted the mean.
+    let elevation = stats
+        .channels
+        .iter()
+        .find(|channel| channel.layer_id == LayerId::ELEVATION && channel.channel == 0)
+        .expect("elevation statistics");
+    assert!(
+        elevation.min > 0.0,
+        "the minimum must come from the map, not from padding: {}",
+        elevation.min
+    );
+    assert!(
+        (elevation.coverage - 1.0).abs() < 1e-6,
+        "a full-coverage layer reports 1, not {}",
+        elevation.coverage
+    );
+
+    // The same data, averaged over the in-map cells of the level-0 chunks: the reported
+    // mean can only agree if neither the padding nor the upper levels are counted.
+    let (map_cells_x, map_cells_y) = map.grid().cell_dims(0);
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    for record in map.directory().for_layer_level(LayerId::ELEVATION, 0) {
+        let chunk_id = record.chunk_id;
+        let Some(chunk) = map.chunk(LayerId::ELEVATION, 0, chunk_id).expect("read") else {
+            continue;
+        };
+        let (origin_x, origin_y) = map.grid().chunk_origin_cell(chunk_id);
+        let in_map_w = map_cells_x.saturating_sub(origin_x).min(chunk.width);
+        let in_map_h = map_cells_y.saturating_sub(origin_y).min(chunk.height);
+        for y in 0..in_map_h {
+            for x in 0..in_map_w {
+                sum += chunk.get(x, y, 0) as f64;
+                count += 1;
+            }
+        }
+    }
+    assert!(count > 0, "the elevation layer must have level-0 cells");
+    let measured = (sum / count as f64) as f32;
+    assert!(
+        (measured - elevation.mean).abs() < 1e-2,
+        "reported mean {} against the in-map mean {measured}",
+        elevation.mean
+    );
+}

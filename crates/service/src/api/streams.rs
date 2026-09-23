@@ -39,8 +39,8 @@ pub async fn truth_ndjson(
     path: Result<Path<String>, PathRejection>,
 ) -> Result<Response> {
     let id = path.map_err(path_rejection)?.0;
-    let job = state.jobs.get(&id)?;
-    let output = crate::api::simulations::finished(&job)?;
+    let task = state.tasks.get(&id)?;
+    let output = crate::api::simulations::finished(&task)?;
     let frame = state.config.simulation.stream_frame_samples;
     Ok(ndjson_response(
         stream_ndjson(output, None, frame),
@@ -60,8 +60,8 @@ pub async fn sensors_any(
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Response> {
     let (id, tail) = path.map_err(path_rejection)?.0;
-    let job = state.jobs.get(&id)?;
-    let output = crate::api::simulations::finished(&job)?;
+    let task = state.tasks.get(&id)?;
+    let output = crate::api::simulations::finished(&task)?;
     match tail.strip_suffix(".ndjson") {
         Some(channel) => {
             channel_len(&output, channel)?;

@@ -51,6 +51,7 @@ const channel = ref<Channel>('accel')
 const truth = ref<TruthSample[]>([])
 const samples = ref<SensorSample[]>([])
 const accelSamples = ref<SensorSample[]>([])
+const gnssSamples = ref<SensorSample[]>([])
 const status = ref<'idle' | 'loading' | 'ready' | 'failed'>('idle')
 const failure = ref<string | null>(null)
 const exporting = ref<ExportFormat | null>(null)
@@ -67,7 +68,7 @@ const report = computed(() => reportOf(simulations.currentSummary))
 
 /** Rows of the GNSS usability summary. */
 const gnssRows = computed(() => {
-  const fixes = samples.value.filter((sample) => sample.channel === 'gnss')
+  const fixes = gnssSamples.value.filter((sample) => sample.channel === 'gnss')
   const valid = fixes.filter((sample) => sample.valid === true).length
   return {
     valid,
@@ -98,7 +99,7 @@ const channelSeries = computed(() => {
 /** GNSS fixes against the truth, in the map plane. */
 const trackOption = computed(() => {
   const fixes = downsample(
-    samples.value.filter((entry) => entry.channel === 'gnss'),
+    gnssSamples.value.filter((entry) => entry.channel === 'gnss'),
     3_000,
   )
   const fixesPoints = fixes
@@ -174,7 +175,7 @@ function componentNames(): string[] {
     case 'gnss':
       return [t('simulation.trajectory.channelSpeed')]
     case 'baro':
-      return [t('simulation.sensors.axes.altitude')]
+      return [t('simulation.sensors.axes.pressure')]
     case 'accel':
       return ['x', 'y', 'z']
     case 'gyro':
@@ -213,37 +214,36 @@ function axisLabel(): string {
 
 /** GNSS error of every fix, matched to the truth sample nearest its time. */
 function errorPoints(): Array<{ east: number; north: number }> {
-  const fixes = samples.value.filter((entry) => entry.channel === 'gnss')
-  if (fixes.length === 0 || truth.value.length === 0) {
+  const fixes = gnssSamples.value.filter((entry) => entry.channel === 'gnss')
+  const timeline = truth.value
+  if (fixes.length === 0 || timeline.length === 0) {
     return []
   }
   const out: Array<{ east: number; north: number }> = []
+  // Both series ascend in time, so one cursor walks the timeline across all fixes
+  // instead of rescanning it per fix. The fix list is short but the timeline runs at
+  // the inertial rate, and the per-fix scan over it dominated this page's render.
+  let cursor = 0
+  const distanceAt = (index: number, time_s: number): number =>
+    Math.abs((timeline[index]?.time_s ?? 0) - time_s)
   for (const fix of downsample(fixes, 5_000)) {
     const v = fix.v
     if (v === null || v === undefined) {
       continue
     }
-    const reference = nearestTruth(fix.time_s)
-    if (reference === null) {
+    while (
+      cursor + 1 < timeline.length &&
+      distanceAt(cursor + 1, fix.time_s) <= distanceAt(cursor, fix.time_s)
+    ) {
+      cursor += 1
+    }
+    const reference = timeline[cursor]
+    if (reference === undefined || Math.abs(reference.time_s - fix.time_s) > 0.5) {
       continue
     }
     out.push({ east: v[0] - reference.position.x, north: v[1] - reference.position.y })
   }
   return out
-}
-
-/** Truth sample nearest a time. */
-function nearestTruth(time_s: number): TruthSample | null {
-  let best: TruthSample | null = null
-  let bestDistance = Number.POSITIVE_INFINITY
-  for (const sample of truth.value) {
-    const distance = Math.abs(sample.time_s - time_s)
-    if (distance < bestDistance) {
-      bestDistance = distance
-      best = sample
-    }
-  }
-  return bestDistance <= 0.5 ? best : null
 }
 
 /** Sample rate of the accelerometer channel, hertz, from its own time stamps. */
@@ -297,15 +297,27 @@ async function load(): Promise<void> {
   await simulations.refreshJob(jobId.value)
   await simulations.loadSummary(jobId.value)
   truth.value = await simulations.loadAllTruth()
-  // The accelerometer channel is read even when another one is shown, because the
-  // spectrum panel is always the inertial spectrum.
+  // The accelerometer channel feeds the spectrum panel and the GNSS channel feeds the
+  // error card and the track chart. Both are read whatever channel the picker shows,
+  // because those panels are always on the page.
   accelSamples.value = await simulations.loadAllSensor('accel')
-  samples.value =
-    channel.value === 'accel' ? accelSamples.value : await simulations.loadAllSensor(channel.value)
+  gnssSamples.value = await simulations.loadAllSensor('gnss')
+  samples.value = await selectChannel(channel.value)
   status.value = 'ready'
   if (simulations.resultStatus === 'failed') {
     failure.value = simulations.resultError
   }
+}
+
+/** Samples of one channel, reusing the two already loaded. */
+async function selectChannel(name: Channel): Promise<SensorSample[]> {
+  if (name === 'accel') {
+    return accelSamples.value
+  }
+  if (name === 'gnss') {
+    return gnssSamples.value
+  }
+  return simulations.loadAllSensor(name)
 }
 
 /** Downloads one export in the requested format. */
@@ -340,7 +352,7 @@ function format(value: number, digits = 2): string {
 }
 
 watch(channel, async () => {
-  samples.value = await simulations.loadAllSensor(channel.value)
+  samples.value = await selectChannel(channel.value)
 })
 
 onMounted(() => {

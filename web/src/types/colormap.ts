@@ -135,23 +135,69 @@ export const SPEED_RAMP: readonly Rgb[] = [
   [180, 52, 47],
 ]
 
-/** Elevation ramp: low ground to ridge line. */
+/**
+ * Elevation ramp of the *layer* view: low ground to ridge line.
+ *
+ * A hypsometric ramp — the convention a topographic map uses — so a height read as a
+ * layer is a height: deep green for the lowest ground, then grass, then dry grass, then
+ * rock, then snow. The surface itself is drawn in {@link TERRAIN_RAMP} instead: a
+ * thematic layer may be terrain-shaped, the terrain is not a thematic layer.
+ */
 export const HEIGHT_RAMP: readonly Rgb[] = [
-  [58, 74, 62],
-  [122, 132, 96],
-  [186, 174, 130],
-  [230, 226, 214],
+  [46, 84, 66],
+  [86, 122, 74],
+  [140, 156, 92],
+  [196, 182, 121],
+  [172, 147, 116],
+  [150, 146, 146],
+  [238, 240, 242],
+]
+
+/**
+ * Surface ramp of the model: a neutral clay.
+ *
+ * Almost no colour, so the shape is told by light and terracing and the *layers* keep
+ * their meaning: a saturated ground ramp competes with every drape laid on it, and a
+ * green one reads as vegetation the data does not contain. The ramp still runs from
+ * darker to lighter with height, which is what keeps relief readable at a glance.
+ */
+export const TERRAIN_RAMP: readonly Rgb[] = [
+  [156, 165, 176],
+  [186, 193, 202],
+  [214, 219, 225],
+  [236, 239, 242],
+  [248, 249, 251],
+]
+
+/** The same ramp for the dark appearance: a dark clay rather than a white slab. */
+export const TERRAIN_RAMP_DARK: readonly Rgb[] = [
+  [58, 63, 70],
+  [86, 93, 102],
+  [118, 126, 136],
+  [152, 160, 170],
+  [188, 195, 203],
+]
+
+/** Cost ramp: a sequential cool-to-warm ramp for derived cost and distance fields. */
+export const COST_RAMP: readonly Rgb[] = [
+  [32, 82, 116],
+  [42, 128, 138],
+  [142, 160, 96],
+  [183, 121, 31],
+  [146, 62, 92],
 ]
 
 /** The ramps the layer panel offers for scalar data. */
-export const SCALAR_RAMPS: Readonly<Record<'grey' | 'speed' | 'height', readonly Rgb[]>> = {
-  grey: GREY_RAMP,
-  speed: SPEED_RAMP,
-  height: HEIGHT_RAMP,
-}
+export const SCALAR_RAMPS: Readonly<Record<'grey' | 'speed' | 'height' | 'cost', readonly Rgb[]>> =
+  {
+    grey: GREY_RAMP,
+    speed: SPEED_RAMP,
+    height: HEIGHT_RAMP,
+    cost: COST_RAMP,
+  }
 
 /** Picks the colour of one sample under a named mapping. */
-export function colorFor(value: number, mapping: 'grey' | 'speed' | 'height'): Rgb {
+export function colorFor(value: number, mapping: 'grey' | 'speed' | 'height' | 'cost'): Rgb {
   return rampAt(SCALAR_RAMPS[mapping], value)
 }
 

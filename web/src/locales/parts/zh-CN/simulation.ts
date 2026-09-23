@@ -79,6 +79,7 @@ export default {
       off: '关闭',
       smooth: '平滑路径',
       submitFailed: '作业提交失败。',
+      submitted: '作业已入队。',
       noPresets: '服务未返回任何预设，表单无法生成。',
     },
     person: {
@@ -346,6 +347,7 @@ export default {
       plausibilityFail: '超出设计的合理区间。',
       compare: '对照',
       compareHint: '通过 /simulations/compare 与另一次已完成作业对照。',
+      compareChart: '步频与配速',
       compareWith: '对照作业',
       compareAction: '对照',
       comparing: '对照中…',

@@ -15,11 +15,11 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::get;
 use ourealis_map_format::graph::vector::VectorKind;
 use ourealis_map_format::layer::{DType, LayerId, LayerKind};
 use ourealis_map_format::quadtree::QNode;
@@ -37,12 +37,11 @@ use crate::api::dto::map::{
     ChunkData, DerivedLayerDto, FooterDto, HeaderDto, LayerGridDto, LayerInfo, MapMetadata,
     MapSummary, SectionCounts, SectionJson, SkeletonDto, SkeletonNodeDto,
 };
-use crate::api::dto::simulation::SyntheticSpec;
 use crate::api::dto::{Page, PageQuery};
-use crate::api::error::{json_rejection, query_rejection};
+use crate::api::error::query_rejection;
 use crate::app::AppState;
 use crate::error::{Result, ServiceError};
-use crate::store::MapEntry;
+use crate::store::{MapEntry, MapStore};
 
 /// Query of the upload and generation endpoints.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -89,7 +88,7 @@ pub async fn create(
     body: Bytes,
 ) -> Result<(StatusCode, Json<MapSummary>)> {
     let query = query.map_err(query_rejection)?.0;
-    let summary = add_image(&state, &body, "import", query.name.as_deref())?;
+    let summary = add_image(state.maps.as_ref(), &body, "import", query.name.as_deref())?;
     Ok((StatusCode::CREATED, Json(summary)))
 }
 
@@ -260,29 +259,10 @@ pub async fn skeleton(
     Ok(Json(skeleton_dto(&map)))
 }
 
-/// Builds a synthetic map and adds it to the library.
-///
-/// A named preset fixes the map's shape; the request's resolution, chunk size and
-/// candidate-library switch are applied on top of it, and its seed always
-/// replaces the preset's.
-pub async fn synthetic(
-    State(state): State<Arc<AppState>>,
-    query: Result<Query<NameQuery>, QueryRejection>,
-    body: Result<Json<SyntheticSpec>, JsonRejection>,
-) -> Result<(StatusCode, Json<MapSummary>)> {
-    let query = query.map_err(query_rejection)?.0;
-    let spec = body.map_err(json_rejection)?.0;
-    let native = spec.to_spec();
-    let bytes = ourealis_map_format::synthetic::build(&native)?;
-    let summary = add_image(&state, &bytes, "synthetic", query.name.as_deref())?;
-    Ok((StatusCode::CREATED, Json(summary)))
-}
-
 /// Every route of this module.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/maps", get(list).post(create))
-        .route("/maps/synthetic", post(synthetic))
         .route("/maps/{id}", get(metadata).delete(remove))
         .route("/maps/{id}/image", get(download))
         .route("/maps/{id}/layers/{layer}/grid", get(layer_grid))
@@ -356,7 +336,7 @@ fn summary_of(
 /// wins, then the map's own, then the identifier — and the image is parsed before
 /// it is stored, so a corrupt file never enters the library.
 pub(crate) fn add_image(
-    state: &AppState,
+    maps: &dyn MapStore,
     bytes: &[u8],
     source: &str,
     name: Option<&str>,
@@ -370,10 +350,10 @@ pub(crate) fn add_image(
     let mut summary = summarise("pending", bytes, source, created_at_ms)?;
     // The library id is derived from the name the map will be listed under, so the
     // summary is built once to learn that name and then keyed by the chosen id.
-    let id = state.maps.next_id(&summary.name);
+    let id = maps.next_id(&summary.name);
     summary.id = id.clone();
     summary.name = preferred_name(name, &summary.name, &id);
-    state.maps.insert(MapEntry {
+    maps.insert(MapEntry {
         id: id.clone(),
         name: summary.name.clone(),
         source: source.to_string(),

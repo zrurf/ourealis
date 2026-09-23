@@ -40,7 +40,7 @@ use crate::api::maps::path_rejection;
 use crate::api::streams::{channel_len, sensor_page, truth_page};
 use crate::app::AppState;
 use crate::error::{Result, ServiceError};
-use crate::job::Job;
+use crate::task::Task;
 
 /// Default number of samples one fetch returns when the client does not say.
 const DEFAULT_FETCH_LIMIT: usize = 20_000;
@@ -48,14 +48,19 @@ const DEFAULT_FETCH_LIMIT: usize = 20_000;
 /// Frames queued for one socket before a slow client starts losing them.
 const OUTGOING_QUEUE: usize = 64;
 
-/// The WebSocket route, merged into the job API.
+/// The WebSocket routes, merged into the task and simulation APIs.
+///
+/// Both paths serve the same session: a run is a task, so progress subscription,
+/// chunked fetch and cancellation work identically for a plan or a map build.
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/simulations/{id}/ws", get(upgrade))
+    Router::new()
+        .route("/tasks/{id}/ws", get(upgrade))
+        .route("/simulations/{id}/ws", get(upgrade))
 }
 
 /// Upgrades the connection, or fails before it does.
 ///
-/// A job that does not exist is an ordinary JSON 404: opening a socket only to
+/// A task that does not exist is an ordinary JSON 404: opening a socket only to
 /// close it with an error frame would make a client's failure handling depend on
 /// its transport.
 pub async fn upgrade(
@@ -64,8 +69,8 @@ pub async fn upgrade(
     upgrade: WebSocketUpgrade,
 ) -> Result<Response> {
     let id = path.map_err(path_rejection)?.0;
-    let job = state.jobs.get(&id)?;
-    Ok(upgrade.on_upgrade(move |socket| session(state, job, socket)))
+    let task = state.tasks.get(&id)?;
+    Ok(upgrade.on_upgrade(move |socket| session(state, task, socket)))
 }
 
 /// One client frame.
@@ -89,7 +94,7 @@ pub enum ClientFrame {
         #[serde(default = "default_fetch_limit")]
         limit: usize,
     },
-    /// Cancel the job.
+    /// Cancel the task.
     Cancel,
     /// Keep-alive probe.
     Ping,
@@ -103,17 +108,17 @@ fn default_fetch_limit() -> usize {
 /// One connection's shared state.
 struct Session {
     state: Arc<AppState>,
-    job: Arc<Job>,
+    task: Arc<Task>,
     out: mpsc::Sender<Message>,
     topics: std::sync::RwLock<Vec<String>>,
 }
 
 /// Runs one connection until either side stops.
-async fn session(state: Arc<AppState>, job: Arc<Job>, mut socket: WebSocket) {
+async fn session(state: Arc<AppState>, task: Arc<Task>, mut socket: WebSocket) {
     let (out, mut outgoing) = mpsc::channel::<Message>(OUTGOING_QUEUE);
     let session = Arc::new(Session {
         state,
-        job,
+        task,
         out,
         topics: std::sync::RwLock::new(Vec::new()),
     });
@@ -176,7 +181,7 @@ async fn handle_text(session: &Arc<Session>, text: &str) {
             }
             // The subscriber gets the current state at once instead of waiting for
             // the next change, which on a long run may be the end of the run.
-            send_now(session, state_frame(&session.job));
+            send_now(session, state_frame(&session.task));
         }
         ClientFrame::Fetch {
             channel,
@@ -184,23 +189,23 @@ async fn handle_text(session: &Arc<Session>, text: &str) {
             limit,
         } => fetch(session, &channel, offset, limit).await,
         ClientFrame::Cancel => {
-            if session.job.cancel() {
+            if session.task.cancel() {
                 send_now(
                     session,
                     json!({
                         "type": "log",
                         "level": "info",
                         "message": "cancellation requested",
-                        "elapsed_s": session.job.elapsed_s().unwrap_or(0.0),
+                        "elapsed_s": session.task.elapsed_s().unwrap_or(0.0),
                     }),
                 );
             } else {
-                let state = session.job.state().to_string_name();
+                let state = session.task.state().to_string_name();
                 send_error(
                     session,
                     &ServiceError::Conflict(format!(
                         "simulation {} already finished with state {state}",
-                        session.job.id()
+                        session.task.id()
                     )),
                 )
                 .await;
@@ -212,7 +217,7 @@ async fn handle_text(session: &Arc<Session>, text: &str) {
 
 /// Answers one fetch with chunk frames.
 async fn fetch(session: &Arc<Session>, channel: &str, offset: usize, limit: usize) {
-    let output = match crate::api::simulations::finished(&session.job) {
+    let output = match crate::api::simulations::finished(&session.task) {
         Ok(output) => output,
         Err(error) => {
             send_error(session, &error).await;
@@ -279,18 +284,18 @@ async fn fetch(session: &Arc<Session>, channel: &str, offset: usize, limit: usiz
     }
 }
 
-/// Forwards the job's events until it reaches a terminal state.
+/// Forwards the task's events until it reaches a terminal state.
 async fn forward_events(session: Arc<Session>) {
-    let mut receiver = session.job.subscribe();
+    let mut receiver = session.task.subscribe();
     session
         .out
-        .send(Message::text(state_frame(&session.job).to_string()))
+        .send(Message::text(state_frame(&session.task).to_string()))
         .await
         .ok();
-    if session.job.state().is_terminal() {
+    if session.task.state().is_terminal() {
         session
             .out
-            .send(Message::text(terminal_frame(&session.job).to_string()))
+            .send(Message::text(terminal_frame(&session.task).to_string()))
             .await
             .ok();
         return;
@@ -317,7 +322,7 @@ async fn forward_events(session: Arc<Session>) {
             // Progress events are idempotent, so a client that fell behind is
             // brought up to date by the current state instead of a replay.
             Err(RecvError::Lagged(_)) => {
-                let frame = state_frame(&session.job);
+                let frame = state_frame(&session.task);
                 if session
                     .out
                     .send(Message::text(frame.to_string()))
@@ -327,13 +332,13 @@ async fn forward_events(session: Arc<Session>) {
                     return;
                 }
                 // The run may have ended while this socket was behind; without
-                // this the socket would wait for an event the job never publishes,
-                // because the job holds its broadcast sender for its whole life in
+                // this the socket would wait for an event the task never publishes,
+                // because the task holds its broadcast sender for its whole life in
                 // the registry.
-                if session.job.state().is_terminal() {
+                if session.task.state().is_terminal() {
                     let _ = session
                         .out
-                        .send(Message::text(terminal_frame(&session.job).to_string()))
+                        .send(Message::text(terminal_frame(&session.task).to_string()))
                         .await;
                     return;
                 }
@@ -352,7 +357,7 @@ fn is_terminal(event: &EventDto) -> bool {
 fn accepted(session: &Session, event: &EventDto) -> bool {
     if is_terminal(event) {
         // The terminal event ends the stream, so it is never filtered out: a client
-        // that asked only for logs must still learn that the job is over.
+        // that asked only for logs must still learn that the task is over.
         return true;
     }
     let topics = session
@@ -360,19 +365,19 @@ fn accepted(session: &Session, event: &EventDto) -> bool {
         .read()
         .map(|topics| topics.clone())
         .unwrap_or_default();
-    crate::job::events::accepts(&topics, event)
+    crate::task::events::accepts(&topics, event)
 }
 
 /// The current state as a frame.
-fn state_frame(job: &Job) -> Value {
-    frame_of(&state_event(job))
+fn state_frame(task: &Task) -> Value {
+    frame_of(&state_event(task))
 }
 
-/// The outcome of a job that already finished.
-fn terminal_frame(job: &Job) -> Value {
-    let dto = job.to_dto();
+/// The outcome of a task that already finished.
+fn terminal_frame(task: &Task) -> Value {
+    let dto = task.to_dto();
     match dto.state {
-        crate::api::dto::JobStateDto::Failed => frame_of(&EventDto::Error {
+        crate::api::dto::TaskState::Failed => frame_of(&EventDto::Error {
             kind: dto.error_kind.unwrap_or_else(|| "internal".to_string()),
             message: dto
                 .error
@@ -380,14 +385,14 @@ fn terminal_frame(job: &Job) -> Value {
         }),
         _ => frame_of(&EventDto::Done {
             state: dto.state.to_string_name().to_string(),
-            summary_url: format!("{API_PREFIX}/simulations/{}/summary", job.id()),
+            summary_url: format!("{API_PREFIX}/simulations/{}/summary", task.id()),
         }),
     }
 }
 
 /// The current state as an event.
-fn state_event(job: &Job) -> EventDto {
-    let dto = job.to_dto();
+fn state_event(task: &Task) -> EventDto {
+    let dto = task.to_dto();
     EventDto::State {
         state: dto.state.to_string_name().to_string(),
         stage: dto.stage,

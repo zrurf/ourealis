@@ -34,7 +34,7 @@ interface Shortcut {
 
 const SHORTCUTS: readonly Shortcut[] = [
   { path: '/maps', titleKey: 'nav.maps', bodyKey: 'dashboard.mapsBody' },
-  { path: '/routes', titleKey: 'nav.routes', bodyKey: 'dashboard.routesBody' },
+  { path: '/run', titleKey: 'nav.run', bodyKey: 'dashboard.routesBody' },
   { path: '/batch', titleKey: 'nav.batch', bodyKey: 'dashboard.batchBody' },
   { path: '/omf', titleKey: 'nav.omf', bodyKey: 'dashboard.omfBody' },
   { path: '/settings', titleKey: 'nav.settings', bodyKey: 'dashboard.settingsBody' },

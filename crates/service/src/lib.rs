@@ -33,8 +33,8 @@ pub mod config;
 pub mod embed;
 pub mod error;
 pub mod facade;
-pub mod job;
 pub mod store;
+pub mod task;
 
 /// Protobuf bindings generated from `proto/` by the build script.
 pub mod proto {

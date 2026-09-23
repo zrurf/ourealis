@@ -1,11 +1,17 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
-import { Button as TButton, Select as TSelect, Tooltip as TTooltip } from 'tdesign-vue-next'
+import { Button as TButton, Select as TSelect } from 'tdesign-vue-next'
+import AppIcon from '@/components/layout/AppIcon.vue'
+import type { IconName } from '@/components/layout/icons'
 import { isSupportedLocale } from '@/locales'
 import { useLocaleStore } from '@/stores/locale'
 import { useThemeStore } from '@/stores/theme'
+import { readStored, writeStored } from '@/utils/storage'
+import TaskModal from '@/components/common/TaskModal.vue'
+import TaskTray from '@/components/layout/TaskTray.vue'
+import TTooltip from '@/components/common/AppTooltip.vue'
 
 /** A sidebar entry: a route a user reaches without an identifier in the path. */
 interface NavItem {
@@ -13,21 +19,34 @@ interface NavItem {
   path: string
   /** Catalog key of the entry's label. */
   labelKey: string
+  /** Icon drawn beside the label, and the whole of it while the rail is collapsed. */
+  icon: IconName
 }
 
 const NAV_ITEMS: readonly NavItem[] = [
-  { path: '/', labelKey: 'nav.dashboard' },
-  { path: '/maps', labelKey: 'nav.maps' },
-  { path: '/routes', labelKey: 'nav.routes' },
-  { path: '/batch', labelKey: 'nav.batch' },
-  { path: '/omf', labelKey: 'nav.omf' },
-  { path: '/settings', labelKey: 'nav.settings' },
+  { path: '/', labelKey: 'nav.dashboard', icon: 'dashboard' },
+  { path: '/maps', labelKey: 'nav.maps', icon: 'maps' },
+  { path: '/run', labelKey: 'nav.run', icon: 'run' },
+  { path: '/batch', labelKey: 'nav.batch', icon: 'batch' },
+  { path: '/omf', labelKey: 'nav.omf', icon: 'inspect' },
+  { path: '/settings', labelKey: 'nav.settings', icon: 'settings' },
 ]
 
 const { t } = useI18n({ useScope: 'global' })
 const route = useRoute()
 const themeStore = useThemeStore()
 const localeStore = useLocaleStore()
+
+/** Sidebar collapse, remembered like the appearance: it is a working preference. */
+const COLLAPSE_KEY = 'ourealis.nav.collapsed'
+
+const collapsed = ref(readStored(COLLAPSE_KEY) === '1')
+
+/** Folds the sidebar down to its icons, or back out. */
+function toggleNav(): void {
+  collapsed.value = !collapsed.value
+  writeStored(COLLAPSE_KEY, collapsed.value ? '1' : '0')
+}
 
 const themeAction = computed(() => (themeStore.isDark ? t('theme.light') : t('theme.dark')))
 
@@ -48,29 +67,60 @@ function onLocaleChange(value: unknown): void {
 
 <template>
   <div class="flex min-h-screen bg-page text-ink">
-    <aside class="flex w-56 shrink-0 flex-col border-r border-line bg-surface">
-      <RouterLink to="/" class="px-5 py-4 text-base font-semibold text-ink">
-        {{ t('app.title') }}
-      </RouterLink>
+    <aside
+      class="flex shrink-0 flex-col border-r border-line bg-surface transition-[width] duration-150 ease-out"
+      :class="collapsed ? 'w-14' : 'w-56'"
+      data-testid="app-sidebar"
+    >
+      <div class="flex items-center gap-2 px-3 py-3">
+        <RouterLink v-if="!collapsed" to="/" class="flex-1 text-base font-semibold text-ink">
+          {{ t('app.title') }}
+        </RouterLink>
+        <TTooltip placement="right" :content="collapsed ? t('nav.expand') : t('nav.collapse')">
+          <button
+            type="button"
+            class="rounded-control p-1.5 text-muted transition-colors hover:bg-page hover:text-ink"
+            :aria-expanded="!collapsed"
+            :aria-label="collapsed ? t('nav.expand') : t('nav.collapse')"
+            data-testid="nav-toggle"
+            @click="toggleNav()"
+          >
+            <AppIcon :name="collapsed ? 'chevron-right' : 'panel-left'" />
+          </button>
+        </TTooltip>
+      </div>
       <nav class="flex flex-col gap-0.5 px-2 pb-4">
-        <RouterLink
+        <!-- Collapsed, the icon *is* the entry, and its tooltip is what names it. -->
+        <TTooltip
           v-for="item in NAV_ITEMS"
           :key="item.path"
-          :to="item.path"
-          class="rounded-control px-3 py-2 text-sm transition-colors duration-150 ease-out"
-          :class="
-            isActive(item.path)
-              ? 'bg-page font-medium text-brand'
-              : 'text-muted hover:bg-page hover:text-ink'
-          "
+          placement="right"
+          :content="collapsed ? t(item.labelKey) : ''"
         >
-          {{ t(item.labelKey) }}
-        </RouterLink>
+          <RouterLink
+            :to="item.path"
+            class="flex items-center gap-2.5 rounded-control py-2 text-sm transition-colors duration-150 ease-out"
+            :class="[
+              collapsed ? 'justify-center px-0' : 'px-3',
+              isActive(item.path)
+                ? 'bg-page font-medium text-brand'
+                : 'text-muted hover:bg-page hover:text-ink',
+            ]"
+            :title="collapsed ? t(item.labelKey) : undefined"
+          >
+            <AppIcon :name="item.icon" />
+            <span v-if="!collapsed">{{ t(item.labelKey) }}</span>
+          </RouterLink>
+        </TTooltip>
       </nav>
     </aside>
 
     <div class="flex min-w-0 flex-1 flex-col">
       <header class="flex h-14 shrink-0 items-center justify-end gap-2 border-b border-line px-6">
+        <!-- Work that runs out of the way still has to be visible: a build that failed
+             while the user was on another page must be discoverable without
+             remembering that it was started. -->
+        <TaskTray />
         <!-- The icon is decorative: the button's accessible name is the action it
              performs, which is also what the tooltip shows. -->
         <TTooltip :content="themeAction">
@@ -128,5 +178,9 @@ function onLocaleChange(value: unknown): void {
         <RouterView />
       </main>
     </div>
+
+    <!-- One loader for the whole application: a blocking task is a property of the
+         session, not of the page that started it. -->
+    <TaskModal />
   </div>
 </template>

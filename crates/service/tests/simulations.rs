@@ -613,20 +613,51 @@ async fn a_route_between_two_walls_reports_no_path() {
 async fn the_route_preview_returns_candidates_without_running_motion() {
     let (router, _state) = app(1).await;
     let map_id = upload(&router).await;
+    // A preview is a task: the submission returns a ticket and the candidates arrive
+    // under it, so the request never waits on the planner.
     let (status, _, bytes) = send(
         &router,
         "POST",
-        "/api/v1/routes/preview",
-        body_of(&request_on_map(&map_id, 99)),
+        "/api/v1/tasks",
+        body_of(&json!({
+            "kind": "route_preview",
+            "request": request_on_map(&map_id, 99),
+        })),
     )
     .await;
     assert_eq!(
         status,
-        StatusCode::OK,
+        StatusCode::ACCEPTED,
         "{}",
         String::from_utf8_lossy(&bytes)
     );
-    let preview: Value = serde_json::from_slice(&bytes).expect("preview");
+    let ticket: Value = serde_json::from_slice(&bytes).expect("ticket");
+    assert_eq!(ticket["kind"], "route_preview");
+    let id = ticket["id"].as_str().expect("a ticket").to_string();
+    let deadline = Instant::now() + JOB_TIMEOUT;
+    loop {
+        let (status, state) = get_json(&router, &format!("/api/v1/tasks/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        if state["state"] == "succeeded" {
+            break;
+        }
+        assert!(
+            matches!(state["state"].as_str(), Some("queued" | "running")),
+            "the preview must not fail: {state}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the preview did not finish: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (status, preview) = get_json(&router, &format!("/api/v1/tasks/{id}/result")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the ticket must carry the preview: {preview}"
+    );
+    let preview = preview["route"].clone();
     let candidates = preview["candidates"].as_array().expect("candidates");
     assert!(!candidates.is_empty(), "at least one candidate: {preview}");
     assert!(
@@ -647,4 +678,58 @@ async fn the_route_preview_returns_candidates_without_running_motion() {
         (probabilities - 1.0).abs() < 1e-6,
         "the Logit probabilities must sum to one, got {probabilities}"
     );
+}
+
+#[tokio::test]
+async fn failed_runs_do_not_evict_the_successful_ones_beyond_the_bound() {
+    // `simulation.keep_results` bounds how many *results* are held in memory. Counting
+    // terminal jobs instead meant a failure — which holds no result — consumed the
+    // budget, so a handful of failures evicted successful runs the configuration said
+    // to keep and answered their summaries with "evicted from memory".
+    let mut config = test_config();
+    config.simulation.keep_results = 1;
+    config.simulation.max_concurrent = 2;
+    let state = AppState::new(config).expect("state");
+    let router = ourealis::facade::http::router(Arc::clone(&state));
+    let map_id = upload(&router).await;
+
+    let submit = |body: Value| {
+        let router = router.clone();
+        async move {
+            let (status, _, bytes) =
+                send(&router, "POST", "/api/v1/simulations", body_of(&body)).await;
+            assert_eq!(
+                status,
+                StatusCode::ACCEPTED,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            serde_json::from_slice::<Value>(&bytes).expect("reply")["id"]
+                .as_str()
+                .expect("an id")
+                .to_string()
+        }
+    };
+
+    // One run that succeeds and therefore holds a result, then enough failures to
+    // exceed the bound if failures were counted.
+    let good = submit(request_on_map(&map_id, 21)).await;
+    assert_eq!(wait_for(&router, &good).await["state"], "succeeded");
+    for seed in 22..26 {
+        let mut body = request_on_map(&map_id, seed);
+        // A start well outside the map fails during planning, which is the cheapest
+        // way to produce a terminal job with no result.
+        body["route"]["start"] = json!({ "x": 100_000.0, "y": 100_000.0 });
+        let failed = submit(body).await;
+        assert_eq!(wait_for(&router, &failed).await["state"], "failed");
+    }
+
+    // The successful run's result is still there, and so is the run itself.
+    let (status, summary) = get_json(&router, &format!("/api/v1/simulations/{good}/summary")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the kept result must survive later failures: {summary}"
+    );
+    assert_eq!(summary["id"], good.as_str());
 }

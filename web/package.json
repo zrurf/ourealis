@@ -12,9 +12,10 @@
     "format": "oxfmt",
     "format:check": "oxfmt --check .",
     "test:unit": "playwright test --project=unit",
-    "test:e2e": "playwright test --project=e2e",
+    "test:e2e": "pnpm run build:service && playwright test --project=e2e",
     "test:fuzz": "playwright test --project=fuzz",
-    "test:monkey": "playwright test --project=monkey"
+    "test:monkey": "playwright test --project=monkey",
+    "build:service": "cd .. && RUSTFLAGS=\"-Clinker=rust-lld\" cargo build --release -p ourealis"
   },
   "dependencies": {
     "@babylonjs/core": "9.27.1",

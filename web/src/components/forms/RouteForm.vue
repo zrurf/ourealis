@@ -13,6 +13,7 @@ import type { MapSummary } from '@/api/types'
 import {
   newCheckpoint,
   newWaypoint,
+  numberOrNull,
   setPointCoordinate,
   type CheckpointDraft,
   type PickTarget,
@@ -22,6 +23,14 @@ import {
 } from './request'
 
 const props = defineProps<{
+  /**
+   * Whether to show only what decides the route.
+   *
+   * The map choice and the seed belong to the run rather than to the route, and the waypoints'
+   * numeric fields are the exactness a reader reaches for after drawing the shape; simple mode
+   * keeps the mode, the ends and the waypoint list, and leaves the rest to the service defaults.
+   */
+  simple?: boolean
   /** The form state this component edits. */
   modelValue: SimulationFormState
   /** Maps the run may be planned against. */
@@ -151,7 +160,7 @@ function requestPick(target: PickTarget): void {
 
 <template>
   <section data-testid="route-form">
-    <div class="grid grid-cols-4 gap-3">
+    <div class="grid grid-cols-2 gap-3 @lg:grid-cols-4">
       <label>
         <span class="text-sm text-muted">{{ t('simulation.route.mode') }}</span>
         <TSelect
@@ -161,7 +170,7 @@ function requestPick(target: PickTarget): void {
           @change="(value) => patch({ mode: String(value) as SimulationFormState['mode'] })"
         />
       </label>
-      <label class="col-span-2">
+      <label v-if="!simple" class="col-span-2">
         <span class="text-sm text-muted">{{ t('simulation.form.map') }}</span>
         <TSelect
           :value="modelValue.mapId ?? ''"
@@ -174,18 +183,18 @@ function requestPick(target: PickTarget): void {
         />
         <span class="text-xs text-muted">{{ t('simulation.form.mapHint') }}</span>
       </label>
-      <label>
+      <label v-if="!simple">
         <span class="text-sm text-muted">{{ t('simulation.form.seed') }}</span>
         <TInputNumber
           :value="modelValue.seed"
           :min="0"
           data-testid="route-seed"
-          @change="(value) => patch({ seed: Number(value) })"
+          @change="(value) => patch({ seed: numberOrNull(value) ?? 0 })"
         />
       </label>
     </div>
 
-    <div class="mt-3 grid grid-cols-2 gap-3">
+    <div class="@container mt-3 grid grid-cols-1 gap-3 @md:grid-cols-2">
       <div class="rounded-card border border-line px-3 py-2">
         <div class="flex items-center justify-between">
           <span class="text-sm font-medium text-ink">{{ t('simulation.route.start') }}</span>
@@ -198,20 +207,22 @@ function requestPick(target: PickTarget): void {
             {{ t('simulation.route.pick') }}
           </TButton>
         </div>
-        <div class="mt-1 flex gap-2">
+        <div class="mt-1 grid grid-cols-2 gap-2">
           <TInputNumber
+            class="w-full"
             :value="modelValue.start.x ?? undefined"
             :decimal-places="3"
             :placeholder="t('simulation.route.x')"
             data-testid="start-x"
-            @change="(value) => setPoint('start', 'x', Number(value))"
+            @change="(value) => setPoint('start', 'x', numberOrNull(value))"
           />
           <TInputNumber
+            class="w-full"
             :value="modelValue.start.y ?? undefined"
             :decimal-places="3"
             :placeholder="t('simulation.route.y')"
             data-testid="start-y"
-            @change="(value) => setPoint('start', 'y', Number(value))"
+            @change="(value) => setPoint('start', 'y', numberOrNull(value))"
           />
         </div>
       </div>
@@ -228,20 +239,22 @@ function requestPick(target: PickTarget): void {
             {{ t('simulation.route.pick') }}
           </TButton>
         </div>
-        <div class="mt-1 flex gap-2">
+        <div class="mt-1 grid grid-cols-2 gap-2">
           <TInputNumber
+            class="w-full"
             :value="modelValue.goal.x ?? undefined"
             :decimal-places="3"
             :placeholder="t('simulation.route.x')"
             data-testid="goal-x"
-            @change="(value) => setPoint('goal', 'x', Number(value))"
+            @change="(value) => setPoint('goal', 'x', numberOrNull(value))"
           />
           <TInputNumber
+            class="w-full"
             :value="modelValue.goal.y ?? undefined"
             :decimal-places="3"
             :placeholder="t('simulation.route.y')"
             data-testid="goal-y"
-            @change="(value) => setPoint('goal', 'y', Number(value))"
+            @change="(value) => setPoint('goal', 'y', numberOrNull(value))"
           />
         </div>
       </div>
@@ -263,16 +276,18 @@ function requestPick(target: PickTarget): void {
         </div>
         <div class="mt-1 flex items-end gap-2">
           <TInputNumber
+            class="w-full"
             :value="modelValue.reference.x ?? undefined"
             :decimal-places="3"
             :placeholder="t('simulation.route.x')"
-            @change="(value) => setPoint('reference', 'x', Number(value))"
+            @change="(value) => setPoint('reference', 'x', numberOrNull(value))"
           />
           <TInputNumber
+            class="w-full"
             :value="modelValue.reference.y ?? undefined"
             :decimal-places="3"
             :placeholder="t('simulation.route.y')"
-            @change="(value) => setPoint('reference', 'y', Number(value))"
+            @change="(value) => setPoint('reference', 'y', numberOrNull(value))"
           />
           <label class="w-32">
             <span class="text-sm text-muted">{{ t('simulation.route.laps') }}</span>
@@ -280,7 +295,7 @@ function requestPick(target: PickTarget): void {
               :value="modelValue.laps"
               :min="1"
               data-testid="route-laps"
-              @change="(value) => patch({ laps: Number(value) })"
+              @change="(value) => patch({ laps: numberOrNull(value) ?? 1 })"
             />
           </label>
         </div>
@@ -305,29 +320,31 @@ function requestPick(target: PickTarget): void {
       <div
         v-for="(waypoint, index) in modelValue.waypoints"
         :key="index"
-        class="mt-2 grid grid-cols-12 items-end gap-2 rounded-card border border-line px-3 py-2"
+        class="mt-2 grid grid-cols-4 items-end gap-2 rounded-card border border-line px-3 py-2 @lg:grid-cols-12"
         :data-testid="`waypoint-${index}`"
       >
-        <span class="col-span-2 text-sm text-ink">
+        <span class="col-span-4 text-sm text-ink @lg:col-span-2">
           {{ t('simulation.route.waypoint', { index: index + 1 }) }}
         </span>
-        <label class="col-span-3">
+        <label class="col-span-2 @lg:col-span-3">
           <span class="text-xs text-muted">{{ t('simulation.route.x') }}</span>
           <TInputNumber
+            class="w-full"
             :value="waypoint.position.x ?? undefined"
             :decimal-places="3"
-            @change="(value) => setWaypointCoordinate(index, 'x', Number(value))"
+            @change="(value) => setWaypointCoordinate(index, 'x', numberOrNull(value))"
           />
         </label>
-        <label class="col-span-3">
+        <label class="col-span-2 @lg:col-span-3">
           <span class="text-xs text-muted">{{ t('simulation.route.y') }}</span>
           <TInputNumber
+            class="w-full"
             :value="waypoint.position.y ?? undefined"
             :decimal-places="3"
-            @change="(value) => setWaypointCoordinate(index, 'y', Number(value))"
+            @change="(value) => setWaypointCoordinate(index, 'y', numberOrNull(value))"
           />
         </label>
-        <label class="col-span-2">
+        <label class="col-span-2 @lg:col-span-2">
           <span class="text-xs text-muted">{{ t('simulation.route.semantics') }}</span>
           <TSelect
             :value="waypoint.semantics"
@@ -336,22 +353,25 @@ function requestPick(target: PickTarget): void {
             @change="(value) => setWaypoint(index, { semantics: String(value) as SemanticsKind })"
           />
         </label>
-        <label v-if="waypoint.semantics === 'dwell'" class="col-span-1">
+        <label v-if="waypoint.semantics === 'dwell'" class="col-span-2 @lg:col-span-1">
           <span class="text-xs text-muted">{{ t('simulation.route.duration') }}</span>
           <TInputNumber
+            class="w-full"
+            :data-testid="`waypoint-${index}-duration`"
             :value="waypoint.duration_s"
             :min="0"
             size="small"
-            @change="(value) => setWaypoint(index, { duration_s: Number(value) })"
+            @change="(value) => setWaypoint(index, { duration_s: numberOrNull(value) ?? 0 })"
           />
         </label>
         <label v-else-if="waypoint.semantics === 'slow'" class="col-span-1">
           <span class="text-xs text-muted">{{ t('simulation.route.radius') }}</span>
           <TInputNumber
+            class="w-full"
             :value="waypoint.radius_m"
             :min="0"
             size="small"
-            @change="(value) => setWaypoint(index, { radius_m: Number(value) })"
+            @change="(value) => setWaypoint(index, { radius_m: numberOrNull(value) ?? 5 })"
           />
         </label>
         <div class="col-span-1 flex items-center justify-end gap-1">
@@ -388,30 +408,33 @@ function requestPick(target: PickTarget): void {
       <div
         v-for="(checkpoint, index) in modelValue.checkpoints"
         :key="index"
-        class="mt-2 flex items-end gap-2 rounded-card border border-line px-3 py-2"
+        class="mt-2 grid grid-cols-2 items-end gap-2 rounded-card border border-line px-3 py-2 @lg:grid-cols-[8rem_1fr_1fr_1fr_auto]"
         :data-testid="`checkpoint-${index}`"
       >
-        <span class="w-32 text-sm text-ink">
+        <span class="text-sm text-ink">
           {{ t('simulation.route.checkpoint', { index: index + 1 }) }}
         </span>
         <TInputNumber
+          class="w-full"
           :value="checkpoint.position.x ?? undefined"
           :decimal-places="3"
           :placeholder="t('simulation.route.x')"
-          @change="(value) => setCheckpointCoordinate(index, 'x', Number(value))"
+          @change="(value) => setCheckpointCoordinate(index, 'x', numberOrNull(value))"
         />
         <TInputNumber
+          class="w-full"
           :value="checkpoint.position.y ?? undefined"
           :decimal-places="3"
           :placeholder="t('simulation.route.y')"
-          @change="(value) => setCheckpointCoordinate(index, 'y', Number(value))"
+          @change="(value) => setCheckpointCoordinate(index, 'y', numberOrNull(value))"
         />
-        <label class="flex-1">
+        <label>
           <span class="text-xs text-muted">{{ t('simulation.route.issuedAt') }}</span>
           <TInputNumber
+            class="w-full"
             :value="checkpoint.issued_at_s"
             :min="0"
-            @change="(value) => setCheckpoint(index, { issued_at_s: Number(value) })"
+            @change="(value) => setCheckpoint(index, { issued_at_s: numberOrNull(value) ?? 0 })"
           />
         </label>
         <TButton

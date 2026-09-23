@@ -1,212 +1,72 @@
 /*
  * Elevation chunks as meshes.
  *
- * One mesh per `(level, chunk)` pair, built straight from the decoded samples, so
- * a chunk that arrives late is added beside the ones already drawn rather than
- * triggering a rebuild of the surface. Levels are chosen by the caller
- * (`selectLevel` in `types/map.ts`), which is what makes a coarse level show
- * first and finer levels fill in.
+ * The thin part: this hands the vertex data `render/terrainMesh.ts` builds to Babylon, and
+ * keeps one mesh per `(level, chunk)` pair plus the slab that goes under it. A chunk that
+ * arrives late is added beside the ones already drawn rather than triggering a rebuild of
+ * the surface, which is what lets a coarse level show first and finer levels fill in.
  *
- * The geometry is built by pure functions that return typed arrays; the class at
- * the bottom is the thin part that hands them to Babylon.
+ * Both meshes of a chunk register with the scene's height exaggeration, so a change to the
+ * vertical scale moves the surface and its slab together.
  */
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
 import { Color3 } from '@babylonjs/core/Maths/math.color'
 import { Mesh } from '@babylonjs/core/Meshes/mesh'
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData'
 import type { Scene } from '@babylonjs/core/scene'
-import { HEIGHT_RAMP, normalize, rampAt, valueRange } from '@/types/colormap'
-import { chunkBounds, levelCellSize, type DecodedChunk } from '@/types/map'
-import type { LayerGrid } from '@/api/types'
+import { GRAIN_COMPENSATION, grainTexture } from './grain'
 import type { MapScene } from './scene'
+import type { ChunkMeshData, MeshData } from './terrainMesh'
 
-/** Vertex data of one chunk mesh, in world metres with the elevation in y. */
-export interface ChunkMeshData {
-  /** Vertex positions, `x, y, z` per vertex. */
-  positions: Float32Array
-  /** Triangle indices. */
-  indices: Uint32Array
-  /** Vertex normals. */
-  normals: Float32Array
-  /** Vertex colours, `r, g, b, a` per vertex, from the elevation ramp. */
-  colors: Float32Array
-  /** Grid dimensions the vertices were laid out on, `(columns, rows)`. */
-  grid: { columns: number; rows: number }
-}
+export type { ChunkMeshData, ChunkMeshOptions, MeshData } from './terrainMesh'
+export { buildChunkMesh, chunkEdges, elevationRange, heightFieldNormals } from './terrainMesh'
 
-/** Options of {@link buildChunkMesh}. */
-export interface ChunkMeshOptions {
-  /** Origin of the map's local plane, which the chunk offsets are relative to. */
-  origin?: { x: number; y: number }
-  /** Vertical offset of the whole surface, metres. */
-  baseY?: number
-  /** Colour ramp for the elevation; the shared height ramp applies by default. */
-  ramp?: readonly (readonly [number, number, number])[]
-}
-
-/**
- * Builds the mesh of one elevation chunk.
- *
- * A chunk of `W × H` cells becomes `(W + 1) × (H + 1)` vertices at the cell
- * corners, each taking the elevation of the nearest stored cell. Corners are used
- * rather than cell centres so two adjacent chunks share an edge line instead of
- * leaving a half-cell gap; the two sides of that edge sample different cells, so a
- * faint step can remain at a chunk boundary, which is the price of not carrying a
- * one-cell apron through the whole grid.
- */
-export function buildChunkMesh(
-  chunk: DecodedChunk,
-  grid: LayerGrid,
-  chunkSize: number,
-  options: ChunkMeshOptions = {},
-): ChunkMeshData {
-  const columns = chunk.width + 1
-  const rows = chunk.height + 1
-  const cell = levelCellSize(grid, chunk.level)
-  const bounds = chunkBounds(grid, chunkSize, chunk.level, chunk.chunkId, options.origin)
-  const channel = 0
-  const heights = new Float32Array(columns * rows)
-  for (let row = 0; row < rows; row += 1) {
-    for (let column = 0; column < columns; column += 1) {
-      // Clamping the sample cell keeps the border vertices on the last stored cell.
-      const sourceX = Math.min(chunk.width - 1, column)
-      const sourceY = Math.min(chunk.height - 1, row)
-      const index = (sourceY * chunk.width + sourceX) * chunk.channels + channel
-      heights[row * columns + column] = chunk.values[index] ?? 0
-    }
-  }
-
-  const positions = new Float32Array(columns * rows * 3)
-  const baseY = options.baseY ?? 0
-  for (let row = 0; row < rows; row += 1) {
-    for (let column = 0; column < columns; column += 1) {
-      const vertex = row * columns + column
-      positions[vertex * 3] = bounds.min_x + column * cell
-      positions[vertex * 3 + 1] = baseY + (heights[vertex] ?? 0)
-      positions[vertex * 3 + 2] = bounds.min_y + row * cell
-    }
-  }
-
-  const indices = new Uint32Array(chunk.width * chunk.height * 6)
-  let cursor = 0
-  for (let row = 0; row < chunk.height; row += 1) {
-    for (let column = 0; column < chunk.width; column += 1) {
-      const topLeft = row * columns + column
-      const topRight = topLeft + 1
-      const bottomLeft = topLeft + columns
-      const bottomRight = bottomLeft + 1
-      // Babylon culls the side that the vertex order's right-hand normal points away
-      // from, so this order — which puts that normal downwards — leaves the front
-      // face up, toward the height normals and the default camera. Reversing it puts
-      // the front face down and hides the whole surface from above.
-      indices[cursor] = topLeft
-      indices[cursor + 1] = topRight
-      indices[cursor + 2] = bottomLeft
-      indices[cursor + 3] = topRight
-      indices[cursor + 4] = bottomRight
-      indices[cursor + 5] = bottomLeft
-      cursor += 6
-    }
-  }
-
-  const range = valueRange(heights)
-  const ramp = options.ramp ?? HEIGHT_RAMP
-  const colors = new Float32Array(columns * rows * 4)
-  for (let vertex = 0; vertex < columns * rows; vertex += 1) {
-    const height = heights[vertex] ?? 0
-    const color = rampAt(ramp, normalize(height, range.min, range.max))
-    colors[vertex * 4] = color[0] / 255
-    colors[vertex * 4 + 1] = color[1] / 255
-    colors[vertex * 4 + 2] = color[2] / 255
-    colors[vertex * 4 + 3] = 1
-  }
-
-  return {
-    positions,
-    indices,
-    normals: heightFieldNormals(positions, columns, rows, cell),
-    colors,
-    grid: { columns, rows },
-  }
-}
-
-/**
- * Normals of a height field, from the difference to the neighbouring vertices.
- *
- * Edge vertices repeat their inward neighbour's difference, which is cheaper than
- * a normal of fewer vertices and avoids a black seam on the chunk border.
- */
-export function heightFieldNormals(
-  positions: Float32Array,
-  columns: number,
-  rows: number,
-  cell: number,
-): Float32Array {
-  const normals = new Float32Array(columns * rows * 3)
-  const step = Math.max(cell, 1e-6)
-  const at = (column: number, row: number): number =>
-    positions[(row * columns + column) * 3 + 1] ?? 0
-  for (let row = 0; row < rows; row += 1) {
-    for (let column = 0; column < columns; column += 1) {
-      const left = Math.max(0, column - 1)
-      const right = Math.min(columns - 1, column + 1)
-      const up = Math.max(0, row - 1)
-      const down = Math.min(rows - 1, row + 1)
-      const dhdx = (at(right, row) - at(left, row)) / (step * (right - left || 1))
-      const dhdz = (at(column, down) - at(column, up)) / (step * (down - up || 1))
-      // A height field's normal is (-dh/dx, 1, -dh/dz) before normalisation.
-      const length = Math.hypot(dhdx, 1, dhdz)
-      const vertex = (row * columns + column) * 3
-      normals[vertex] = -dhdx / length
-      normals[vertex + 1] = 1 / length
-      normals[vertex + 2] = -dhdz / length
-    }
-  }
-  return normals
-}
-
-/** Elevation of a mesh vertex grid, in metres; used to frame the camera and to drape layers. */
-export function elevationRange(mesh: ChunkMeshData): { min: number; max: number } {
-  let min = Number.POSITIVE_INFINITY
-  let max = Number.NEGATIVE_INFINITY
-  for (let index = 1; index < mesh.positions.length; index += 3) {
-    const value = mesh.positions[index] ?? 0
-    min = Math.min(min, value)
-    max = Math.max(max, value)
-  }
-  return min === Number.POSITIVE_INFINITY ? { min: 0, max: 0 } : { min, max }
-}
-
-/** The elevation surface of one map, one mesh per loaded chunk. */
+/** The elevation surface of one map, one mesh per loaded chunk plus its slab. */
 export class TerrainLayer {
   private readonly scene: Scene
   private readonly mapScene: MapScene
   private readonly material: StandardMaterial
+  private readonly slabMaterial: StandardMaterial
   private readonly meshes = new Map<string, Mesh>()
+  private readonly slabs = new Map<string, Mesh>()
 
   constructor(scene: Scene, mapScene: MapScene) {
     this.scene = scene
     this.mapScene = mapScene
     this.material = new StandardMaterial('terrainMaterial', scene)
     this.material.specularColor = new Color3(0, 0, 0)
-    this.material.diffuseColor = new Color3(1, 1, 1)
+    // The grain is a near-white noise whose mean is below white, so the albedo is scaled up
+    // by the reciprocal: the surface keeps the colour the ramp gave it, and gains detail.
+    this.material.diffuseColor = new Color3(
+      GRAIN_COMPENSATION,
+      GRAIN_COMPENSATION,
+      GRAIN_COMPENSATION,
+    )
+    this.material.diffuseTexture = grainTexture(scene)
     this.material.backFaceCulling = true
+    // The slab is seen from outside the model, and its winding follows the map's own
+    // rim; not culling it keeps a wall readable from an angle where its front face is
+    // turned away.
+    this.slabMaterial = new StandardMaterial('terrainSlabMaterial', scene)
+    this.slabMaterial.specularColor = new Color3(0, 0, 0)
+    this.slabMaterial.diffuseColor = new Color3(
+      GRAIN_COMPENSATION,
+      GRAIN_COMPENSATION,
+      GRAIN_COMPENSATION,
+    )
+    this.slabMaterial.diffuseTexture = grainTexture(scene)
+    this.slabMaterial.backFaceCulling = false
   }
 
-  /** Adds or replaces the mesh of one chunk. */
+  /** Adds or replaces the mesh of one chunk and the slab it carries. */
   setChunk(key: string, data: ChunkMeshData): Mesh {
-    this.meshes.get(key)?.dispose()
-    const mesh = new Mesh(`terrain:${key}`, this.scene)
-    const vertexData = new VertexData()
-    vertexData.positions = data.positions
-    vertexData.indices = data.indices
-    vertexData.normals = data.normals
-    vertexData.colors = data.colors
-    vertexData.applyToMesh(mesh, false)
-    mesh.material = this.material
+    this.drop(key)
+    const mesh = this.create(`terrain:${key}`, data, this.material)
     mesh.isPickable = true
-    this.mapScene.trackHeightMesh(mesh)
+    const slab = this.create(`terrain-slab:${key}`, data.slab, this.slabMaterial)
+    slab.isPickable = false
     this.meshes.set(key, mesh)
+    this.slabs.set(key, slab)
     return mesh
   }
 
@@ -215,6 +75,9 @@ export class TerrainLayer {
     for (const mesh of this.meshes.values()) {
       mesh.setEnabled(visible)
     }
+    for (const slab of this.slabs.values()) {
+      slab.setEnabled(visible)
+    }
   }
 
   /** True when the chunk already has a mesh. */
@@ -222,23 +85,50 @@ export class TerrainLayer {
     return this.meshes.has(key)
   }
 
-  /** Meshes currently drawn, for picking and for a bounds fit. */
+  /** Surface meshes currently drawn, for picking and for a bounds fit. */
   get list(): Mesh[] {
     return [...this.meshes.values()]
   }
 
   /** Removes every mesh; a level change or a map change rebuilds from scratch. */
   clear(): void {
-    for (const mesh of this.meshes.values()) {
-      this.mapScene.untrackHeightMesh(mesh)
-      mesh.dispose()
+    for (const key of Array.from(this.meshes.keys())) {
+      this.drop(key)
     }
-    this.meshes.clear()
   }
 
-  /** Disposes the meshes and the material. */
+  /** Disposes the meshes and the materials. */
   dispose(): void {
     this.clear()
     this.material.dispose()
+    this.slabMaterial.dispose()
+  }
+
+  /** Builds one mesh of vertex data and registers it with the height exaggeration. */
+  private create(name: string, data: MeshData, material: StandardMaterial): Mesh {
+    const mesh = new Mesh(name, this.scene)
+    const vertexData = new VertexData()
+    vertexData.positions = data.positions
+    vertexData.indices = data.indices
+    vertexData.normals = data.normals
+    vertexData.colors = data.colors
+    vertexData.uvs = data.uvs
+    vertexData.applyToMesh(mesh, false)
+    mesh.material = material
+    this.mapScene.trackHeightMesh(mesh)
+    return mesh
+  }
+
+  /** Disposes one chunk's meshes. */
+  private drop(key: string): void {
+    for (const mesh of [this.meshes.get(key), this.slabs.get(key)]) {
+      if (mesh === undefined) {
+        continue
+      }
+      this.mapScene.untrackHeightMesh(mesh)
+      mesh.dispose()
+    }
+    this.meshes.delete(key)
+    this.slabs.delete(key)
   }
 }

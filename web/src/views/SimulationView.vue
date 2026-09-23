@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /*
- * A run: the submission form at `/simulations/new`, one job's live state and its
+ * A run: one job's live state and its
  * result at `/simulations/<id>`.
  *
  * The live panel is built around what the service actually reports (doc §4.5):
@@ -197,7 +197,7 @@ async function submit(request: SimulationRequest): Promise<void> {
   try {
     const id = await simulations.submit(request)
     await router.replace({ name: 'simulation', params: { id } })
-    notifications.push({ kind: 'success', message: t('simulation.result.title') })
+    notifications.push({ kind: 'success', message: t('simulation.form.submitted') })
   } catch (error) {
     notifications.pushError(t('simulation.form.submitFailed'), error)
   } finally {
@@ -263,12 +263,7 @@ onBeforeUnmount(() => {
         </TTag>
       </div>
       <div class="flex items-center gap-2">
-        <TButton
-          v-if="!isNew"
-          variant="outline"
-          data-testid="new-run"
-          @click="router.push('/simulations/new')"
-        >
+        <TButton v-if="!isNew" variant="outline" data-testid="new-run" @click="router.push('/run')">
           {{ t('simulation.form.submit') }}
         </TButton>
         <TButton

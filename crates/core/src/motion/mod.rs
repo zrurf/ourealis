@@ -593,9 +593,12 @@ fn assemble_timeline(
     // The walk advances by at most one sample interval of arc length, so the
     // sample count is bounded by the duration; anything beyond a generous
     // multiple of that means the walk is stuck and is reported instead of
-    // allocating without limit.
-    let sample_budget =
-        ((trajectory_length_estimate(path, total_length) / dt) as usize).max(16) * 8;
+    // allocating without limit. The absolute ceiling is what bounds a request that
+    // asks for a high sample rate over a long path: the duration-relative budget
+    // alone grows with the rate, so it cannot.
+    let sample_budget = (((trajectory_length_estimate(path, total_length) / dt) as usize).max(16)
+        * 8)
+    .min(MAX_TRAJECTORY_SAMPLES);
     while arc < total_length && samples.len() < sample_budget {
         // A turn holds the runner in place while the heading rotates.
         if let Some(Maneuver::Turn {
@@ -785,8 +788,33 @@ fn assemble_timeline(
         {
             step = step.min(stop.s - arc);
         }
+        if step <= 0.0 {
+            // The walk cannot advance, so every further iteration would emit the same
+            // position at the next timestamp and the arrival sample would then attach
+            // the finish's arc length to a position far short of it. A zero limit is
+            // the only way to get here — the quadratic term keeps a standing start
+            // moving — and it means the profile forbids passing this point, which is
+            // not something a trajectory can express.
+            return Err(CoreError::config(format!(
+                "the profile gives zero speed at {arc:.3} m of {total_length:.3} m, \
+                 so the run cannot continue past it"
+            )));
+        }
         arc += step;
         time += dt;
+    }
+
+    if arc < total_length {
+        // The sample budget ran out before the walk reached the finish. Reporting it
+        // is the point of the budget: the alternative is a trajectory that claims the
+        // whole path with a tail of samples that never moved, plus an allocation that
+        // grows with whatever sample rate was asked for.
+        return Err(CoreError::config(format!(
+            "the walk stopped at {arc:.3} m of {total_length:.3} m after {} samples \
+             (budget {sample_budget}): either the speed limit is zero along the way or \
+             the run needs a lower sample rate",
+            samples.len()
+        )));
     }
 
     // The last step is clamped to the remaining length, so a runner who stops at
@@ -1056,7 +1084,13 @@ fn assemble_timeline(
     // is coarser than either. A placement that is legal at one profile sample can
     // therefore be illegal between two of them, so the final positions are
     // checked here and the offset is pulled in where it has to be.
-    cap_offsets(&mut samples, hard, distance_field, backend);
+    cap_offsets(
+        &mut samples,
+        hard,
+        distance_field,
+        config.offset.safe_radius_m,
+        backend,
+    );
     freeze_stands(&mut samples);
 
     Ok(samples)
@@ -1125,6 +1159,15 @@ fn continue_from(sample: &mut TrajectorySample, anchor: &TrajectorySample) {
 /// `s v`; a tenth keeps that well inside the few tenths of a metre per second a
 /// runner can move sideways.
 const OFFSET_CAP_SLOPE: f64 = 0.1;
+
+/// Largest number of samples one trajectory may hold.
+///
+/// The dense sequence carries a full sample struct each — position, attitude,
+/// curvature, both headings — so this is the ceiling on the memory a run can
+/// commit, and it is what stops a high sample rate over a long path from turning
+/// a large request into a failed allocation. Two million samples is over five
+/// hours at the default 100 Hz.
+pub const MAX_TRAJECTORY_SAMPLES: usize = 2_000_000;
 
 /// Bounds the lateral acceleration the offset asks for.
 ///
@@ -1205,6 +1248,7 @@ fn cap_offsets(
     samples: &mut [TrajectorySample],
     hard: &HardMask,
     distance_field: &DistanceField,
+    safe_radius_m: f64,
     backend: Option<&dyn crate::gpu::ComputeBackend>,
 ) {
     let count = samples.len();
@@ -1232,7 +1276,8 @@ fn cap_offsets(
     // Whether each probe's centre is legal at all, and then the halvings. The order of
     // the probes is the order of the samples, so the answers index back one for one.
     let centres: Vec<DVec2> = probes.iter().map(|probe| probe.centre).collect();
-    let forbidden_at_centre = forbidden_flags(hard, distance_field, backend, &centres);
+    let forbidden_at_centre =
+        forbidden_flags(hard, distance_field, safe_radius_m, backend, &centres);
     for (index, probe) in probes.iter_mut().enumerate() {
         if forbidden_at_centre[index] {
             // Even the centre line is unusable; the smoothing stage's projection owns
@@ -1258,7 +1303,7 @@ fn cap_offsets(
             .zip(mids.iter())
             .map(|(probe, mid)| probe.centre + probe.normal * *mid)
             .collect();
-        let forbidden = forbidden_flags(hard, distance_field, backend, &points);
+        let forbidden = forbidden_flags(hard, distance_field, safe_radius_m, backend, &points);
         for index in 0..count {
             if forbidden[index] {
                 high[index] = mids[index];
@@ -1306,18 +1351,27 @@ struct Probe {
 /// Two paths that must agree: the mask is read directly when there is no backend,
 /// which keeps the CPU cost to one grid lookup per point, and through the compute
 /// backend otherwise, where the whole batch is answered at once. Both answer the
-/// same question — the cell containing the point, and whether its bit is set — so
-/// the caller cannot tell which one ran.
+/// same question — the cell containing the point, whether its bit is set, and
+/// whether the point clears the obstacles by `safe_radius_m` — so the caller
+/// cannot tell which one ran.
+///
+/// The distance rule belongs here and not only in the offset stage: that stage
+/// resolves the limit along the *path* normal, while the placement this pass
+/// bounds uses the *body* heading normal. The two differ wherever the heading lags
+/// the tangent, so a placement can end up closer to an obstacle than the radius
+/// allows after the stage that last had a say.
 fn forbidden_flags(
     hard: &HardMask,
     distance_field: &DistanceField,
+    safe_radius_m: f64,
     backend: Option<&dyn crate::gpu::ComputeBackend>,
     points: &[DVec2],
 ) -> Vec<bool> {
+    let too_close = |point: DVec2| distance_field.distance_at(point) < safe_radius_m;
     let Some(backend) = backend else {
         return points
             .iter()
-            .map(|point| hard.is_forbidden(*point))
+            .map(|point| hard.is_forbidden(*point) || too_close(*point))
             .collect();
     };
     match crate::gpu::projection_batch_from(
@@ -1328,8 +1382,14 @@ fn forbidden_flags(
     )
     .and_then(|batch| backend.projection_check_batch(&batch))
     {
+        // A backend that answered for fewer points than it was asked about leaves
+        // `get` to return its default answer, whose zero distance counts as blocked —
+        // the same side the error path falls on.
         Ok(answers) => (0..points.len())
-            .map(|index| answers.get(index).forbidden)
+            .map(|index| {
+                let answer = answers.get(index);
+                answer.forbidden || answer.distance_m < safe_radius_m as f32
+            })
             .collect(),
         Err(error) => {
             // A backend that cannot answer is not a reason to produce a trajectory
@@ -1340,7 +1400,7 @@ fn forbidden_flags(
             );
             points
                 .iter()
-                .map(|point| hard.is_forbidden(*point))
+                .map(|point| hard.is_forbidden(*point) || too_close(*point))
                 .collect()
         }
     }

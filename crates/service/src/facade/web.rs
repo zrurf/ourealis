@@ -20,13 +20,19 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::get;
 
-use crate::api::API_PREFIX;
 use crate::app::AppState;
 use crate::embed;
 use crate::error::ServiceError;
 
 /// Header announcing that the embedded page is the build placeholder.
 const PLACEHOLDER_HEADER: HeaderName = HeaderName::from_static("x-ourealis-web");
+
+/// First path segment of the API surface, spelled out because the guard has to
+/// cover every version under it and not only the one this build serves.
+const API_ROOT: &str = "api";
+
+/// [`API_ROOT`] with the separator a deeper path carries.
+const API_ROOT_WITH_SLASH: &str = "api/";
 
 /// The page and every file it needs.
 pub fn router() -> Router<Arc<AppState>> {
@@ -50,12 +56,13 @@ async fn file(
     headers: HeaderMap,
 ) -> Result<Response, ServiceError> {
     let path = path.trim_start_matches('/').to_string();
-    if path.starts_with(API_PREFIX.trim_start_matches('/')) {
+    // Everything under `api`, not just the current version prefix: a client that
+    // mistypes the version must get the API's JSON 404 rather than the page, which
+    // it would otherwise try to parse as a reply.
+    if path == API_ROOT || path.starts_with(API_ROOT_WITH_SLASH) {
         // The API router is nested ahead of this one and matches first; this is a
         // guard on the invariant, not a substitute for the routing.
-        return Err(ServiceError::not_found(format!(
-            "{path} is under the API prefix"
-        )));
+        return Err(ServiceError::not_found(format!("{path} is under /api")));
     }
     if embed::get(&path).is_some() {
         return serve(&state, &path, &headers);

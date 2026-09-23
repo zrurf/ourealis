@@ -94,6 +94,14 @@ export interface SensorDraft {
   reference_pressure_pa: number | null
 }
 
+/** A route point the map can place or retag, as the context menu names it. */
+export interface RoutePointRef {
+  /** Field the point belongs to. */
+  kind: 'start' | 'goal' | 'reference' | 'waypoint' | 'checkpoint'
+  /** Index inside `waypoints` or `checkpoints`; `-1` appends a waypoint. */
+  index: number
+}
+
 /** Values a person override may carry: a number, a choice or a label. */
 export type OverrideValue = number | string | null
 
@@ -455,6 +463,23 @@ export function validateForm(state: SimulationFormState): FormIssue[] {
 }
 
 /** Sets one field of a point, leaving the other coordinate alone. */
+/**
+ * Reads a numeric field, treating an empty one as "no value".
+ *
+ * A numeric input reports `undefined` while it is being edited and `''` after it is
+ * cleared, and `Number()` turns both into something wrong — `NaN` for the first, `0`
+ * for the second. A coordinate that becomes `NaN` serialises to `null` and the service
+ * refuses the whole request; a latitude that silently becomes `0` is worse, because the
+ * request is accepted and the run is not the one that was asked for.
+ */
+export function numberOrNull(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') {
+    return null
+  }
+  const parsed = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
 export function setPointCoordinate(
   point: PointDraft,
   axis: 'x' | 'y',

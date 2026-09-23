@@ -1,9 +1,9 @@
-//! Job event stream.
+//! Task event stream.
 //!
-//! One broadcast channel per job, fanned out to whichever transports are
+//! One broadcast channel per task, fanned out to whichever transports are
 //! subscribed: SSE, WebSocket and the gRPC `Watch` stream. The channel is bounded,
 //! so a subscriber that stops reading is told it fell behind instead of stalling
-//! the job; progress events are idempotent, so re-reading the state after a gap is
+//! the task; progress events are idempotent, so re-reading the state after a gap is
 //! enough to recover.
 
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ pub mod topic {
 
 /// Whether a topic filter accepts an event.
 ///
-/// An empty filter accepts everything, which is what a client asking for "the job"
+/// An empty filter accepts everything, which is what a client asking for "the task"
 /// without naming topics expects.
 pub fn accepts(topics: &[String], event: &EventDto) -> bool {
     if topics.is_empty() {

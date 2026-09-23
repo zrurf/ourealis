@@ -14,6 +14,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import en from '../../src/locales/en'
 import { SERVICE_URL, serviceGate } from '../support/service'
+import { buildSyntheticMap } from '../support/tasks'
 
 /** Comfortably above two sequential runs on the compact map. */
 const SWEEP_TIMEOUT_MS = 240_000
@@ -32,10 +33,7 @@ async function ensureMap(request: import('@playwright/test').APIRequestContext):
   if (body.total > 0) {
     return
   }
-  const created = await request.post(`${SERVICE_URL}/api/v1/maps/synthetic`, {
-    data: { preset: 'compact', seed: 4242, with_kpath_library: false },
-  })
-  expect(created.status(), 'a map must be creatable for the sweep').toBe(201)
+  await buildSyntheticMap(request, { preset: 'compact', seed: 4242, with_kpath_library: false })
 }
 
 /** Fills a numeric field of the route form. */

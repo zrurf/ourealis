@@ -20,7 +20,7 @@ pub fn now_unix_ms() -> i64 {
 
 /// Formats Unix milliseconds as an RFC 3339 UTC timestamp.
 ///
-/// Sub-second precision is dropped: the API reports job and library entry times,
+/// Sub-second precision is dropped: the API reports task and library entry times,
 /// and milliseconds past the second are noise at that granularity.
 pub fn unix_ms_to_rfc3339(millis: i64) -> String {
     let seconds = millis.div_euclid(1000);

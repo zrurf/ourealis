@@ -7,6 +7,7 @@
  * it needs.
  */
 import { api, ApiClient, pageQuery } from './client'
+import { useTasksStore } from '@/stores/tasks'
 import { fileNameOf } from './omf'
 import type {
   ChunkPayload,
@@ -120,18 +121,70 @@ export function importMap(
   })
 }
 
-/** Builds a synthetic map and adds it to the library. */
+/**
+ * Builds a synthetic map and adds it to the library.
+ *
+ * Generation takes tens of seconds for a large map, so it is a task: the submission
+ * returns a ticket and the map appears in the library when it finishes. The caller
+ * waits through the task manager, which shows the wait as a blocking loader because
+ * the page cannot go on without the map.
+ */
 export function createSyntheticMap(
   spec: SyntheticSpec,
   name?: string,
-  client: ApiClient = api,
-  signal?: AbortSignal,
+  options: { blocking?: boolean } = {},
 ): Promise<MapSummary> {
-  return client.post<MapSummary>('maps/synthetic', {
-    query: { name },
-    body: JSON.stringify(spec),
-    signal,
-  })
+  return useTasksStore().run<MapSummary>(
+    { kind: 'synthetic_map', spec, ...(name === undefined ? {} : { name }) },
+    { labelKey: 'tasks.labels.synthetic', blocking: options.blocking !== false },
+  )
+}
+
+/** Why a point is or is not a place a runner can be. */
+export type FeasibilityReason = 'ok' | 'outside' | 'forbidden' | 'too_close' | 'unknown'
+
+/** One point's verdict. */
+export interface FeasibilityAnswer {
+  /** The point that was tested. */
+  point: { x: number; y: number }
+  /** Whether the planner would accept it. */
+  legal: boolean
+  /** Why. */
+  reason: FeasibilityReason
+  /** Distance to the nearest blocked cell, metres; absent without a mask. */
+  distance_m: number | null
+  /** Cell the point falls in, in the map's own grid. */
+  cell: [number, number] | null
+  /** Elevation at the point, metres. */
+  elevation_m: number | null
+}
+
+/**
+ * Asks whether the map allows a runner at these points.
+ *
+ * A route point dropped inside a building cannot be detected by the page — the hard
+ * mask lives in the map, and the page only draws the surface — so the service answers
+ * it. The reply also carries the distance to the nearest obstacle, which is the rule
+ * the simulator's own offset stage applies: a point can be on passable ground and still
+ * be unusable because it stands against a wall.
+ */
+export async function checkFeasibility(
+  mapId: string,
+  points: Array<{ x: number; y: number }>,
+  options: { safeRadiusM?: number; client?: ApiClient; signal?: AbortSignal } = {},
+): Promise<FeasibilityAnswer[]> {
+  const client = options.client ?? api
+  const reply = await client.post<{ items: FeasibilityAnswer[] }>(
+    `maps/${encodeURIComponent(mapId)}/feasibility`,
+    {
+      body: JSON.stringify({
+        points,
+        ...(options.safeRadiusM === undefined ? {} : { safe_radius_m: options.safeRadiusM }),
+      }),
+      signal: options.signal,
+    },
+  )
+  return reply.items
 }
 
 /**
