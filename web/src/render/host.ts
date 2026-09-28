@@ -17,6 +17,7 @@
  * in the debug hook climbing, which would make that hook useless to the e2e lane.
  */
 import { MapScene, updateDebug } from './scene'
+import { bindSceneAppearance } from './theme'
 import type { EngineBackend } from './engine'
 
 /** A view's hold on the shared engine. */
@@ -36,6 +37,7 @@ class RenderHost {
   private scene: MapScene | null = null
   private backend: EngineBackend | null = null
   private starting: Promise<MapScene> | null = null
+  private unbindAppearance: (() => void) | null = null
   private held = false
 
   /**
@@ -91,6 +93,8 @@ class RenderHost {
 
   /** Disposes the engine outright; the next `acquire` builds a new one. */
   destroy(): void {
+    this.unbindAppearance?.()
+    this.unbindAppearance = null
     this.scene?.dispose()
     this.scene = null
     this.backend = null
@@ -109,6 +113,10 @@ class RenderHost {
     canvas.setAttribute('data-testid', 'shared-canvas')
     const scene = await MapScene.create({ canvas, backend })
     this.canvas = canvas
+    // One binding for the engine's whole life, made here because the host owns the engine
+    // and the views that borrow it come and go.
+    this.unbindAppearance?.()
+    this.unbindAppearance = bindSceneAppearance(scene)
     updateDebug({ canvasId: canvasIdOf(canvas) })
     return scene
   }

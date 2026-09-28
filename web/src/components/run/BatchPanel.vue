@@ -3,7 +3,7 @@
  * Population sweep: N individuals over one route.
  *
  * Each individual is a job of its own — the service has no batch endpoint — so
- * this page submits N requests, watches each one's own event stream, and collects
+ * this panel submits N requests, watches each one's own event stream, and collects
  * the summaries as they land. Nothing here polls: the state of a run arrives on
  * its SSE stream, and only a finished run is read once through `/summary`.
  *
@@ -307,8 +307,10 @@ async function deriveFrequencies(
           if (run !== undefined) {
             copy[index] = {
               ...run,
-              chosen: preview.chosen,
-              candidateCount: preview.candidates.length,
+              // A batch individual is one single-leg route, so the first leg carries
+              // the choice the frequency chart is about.
+              chosen: preview.legs[0]?.chosen ?? null,
+              candidateCount: preview.legs.reduce((total, leg) => total + leg.candidates.length, 0),
             }
             runs.value = copy
           }
@@ -453,7 +455,7 @@ function closeStreams(): void {
   subscriptions = []
 }
 
-/** Keeps a failure of one run visible in the page's own banner. */
+/** Keeps a failure of one run visible in the panel's own banner. */
 function errorText(error: string | null): string {
   return error ?? ''
 }
@@ -468,38 +470,31 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="mx-auto max-w-7xl px-8 py-8" data-testid="batch-view">
-    <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <h1 class="font-semibold text-ink">{{ t('views.batch.title') }}</h1>
-        <span class="text-sm text-muted">{{ t('simulation.batch.hint') }}</span>
-      </div>
-      <div class="flex items-center gap-3">
-        <label class="flex items-center gap-2">
-          <span class="text-sm text-muted">{{ t('simulation.batch.individuals') }}</span>
-          <TInputNumber
-            v-model="population"
-            :min="1"
-            :max="64"
-            class="w-24"
-            data-testid="batch-population"
-          />
-        </label>
-        <TButton
-          v-if="runs.length > 0 && finished.length < runs.length"
-          theme="danger"
-          variant="outline"
-          data-testid="batch-cancel"
-          @click="cancelAll()"
-        >
-          {{ t('simulation.batch.cancelAll') }}
-        </TButton>
-      </div>
+  <div class="flex flex-col gap-6" data-testid="batch-view">
+    <div class="flex items-center justify-end gap-3">
+      <label class="flex items-center gap-2">
+        <span class="text-sm text-muted">{{ t('simulation.batch.individuals') }}</span>
+        <TInputNumber
+          v-model="population"
+          :min="1"
+          :max="64"
+          class="w-24"
+          data-testid="batch-population"
+        />
+      </label>
+      <TButton
+        v-if="runs.length > 0 && finished.length < runs.length"
+        theme="danger"
+        variant="outline"
+        data-testid="batch-cancel"
+        @click="cancelAll()"
+      >
+        {{ t('simulation.batch.cancelAll') }}
+      </TButton>
     </div>
 
     <TAlert
       v-if="failure !== null"
-      class="mt-4"
       theme="error"
       :message="t('simulation.batch.submitFailed')"
       data-testid="batch-error"
@@ -507,7 +502,7 @@ onBeforeUnmount(() => {
       <p class="text-sm text-muted">{{ errorText(failure) }}</p>
     </TAlert>
 
-    <TCard class="mt-6" :title="t('simulation.form.title')" size="small">
+    <TCard :title="t('simulation.form.title')" size="small">
       <SimulationForm
         :maps="maps.summaries"
         :busy="starting"
@@ -517,37 +512,31 @@ onBeforeUnmount(() => {
     </TCard>
 
     <template v-if="started">
-      <div class="mt-6 flex items-center gap-3">
+      <div class="flex items-center gap-3">
         <TTag variant="light" theme="warning" data-testid="batch-progress">{{ progressText }}</TTag>
         <span v-if="streamProblems > 0" class="text-sm text-muted">
           {{ t('simulation.live.streamFailed') }} ({{ streamProblems }})
         </span>
       </div>
 
-      <div class="mt-4">
-        <TTable
-          :data="tableRows"
-          :columns="columns"
-          row-key="key"
-          size="small"
-          data-testid="batch-table"
-        >
-          <template #state="{ row }">
-            <TTag size="small" variant="light" :theme="row.stateTheme">{{ row.state }}</TTag>
-          </template>
-          <template #open="{ row }">
-            <TButton
-              v-if="row.id !== null"
-              variant="text"
-              @click="router.push(`/simulations/${row.id}`)"
-            >
-              {{ t('simulation.list.open') }}
-            </TButton>
-          </template>
-        </TTable>
-      </div>
+      <TTable
+        :data="tableRows"
+        :columns="columns"
+        row-key="key"
+        size="small"
+        data-testid="batch-table"
+      >
+        <template #state="{ row }">
+          <TTag size="small" variant="light" :theme="row.stateTheme">{{ row.state }}</TTag>
+        </template>
+        <template #open="{ row }">
+          <TButton v-if="row.id !== null" variant="text" @click="router.push(`/runs/${row.id}`)">
+            {{ t('simulation.list.open') }}
+          </TButton>
+        </template>
+      </TTable>
 
-      <div class="mt-6 grid grid-cols-2 gap-6">
+      <div class="grid grid-cols-2 gap-6">
         <TCard :title="t('simulation.batch.frequency')" size="small">
           <p class="text-sm text-muted">{{ t('simulation.batch.frequencyHint') }}</p>
           <p v-if="frequencies.length === 0" class="mt-2 text-sm text-muted">
@@ -575,5 +564,5 @@ onBeforeUnmount(() => {
         </TCard>
       </div>
     </template>
-  </section>
+  </div>
 </template>

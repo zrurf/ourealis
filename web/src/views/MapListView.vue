@@ -7,6 +7,7 @@ import {
   Alert as TAlert,
   Button as TButton,
   DialogPlugin,
+  Drawer as TDrawer,
   Input as TInput,
   InputNumber as TInputNumber,
   Select as TSelect,
@@ -14,8 +15,11 @@ import {
   Tag as TTag,
 } from 'tdesign-vue-next'
 import type { MapSummary } from '@/api/types'
+import OmfPanel from '@/components/library/OmfPanel.vue'
+import StudioPanel from '@/components/library/StudioPanel.vue'
 import { useMapsStore } from '@/stores/maps'
 import { useNotificationsStore } from '@/stores/notifications'
+import { useOmfStore } from '@/stores/omf'
 
 /** One row of the table: the fields as they are shown, already formatted. */
 type MapRow = {
@@ -41,6 +45,7 @@ const { t, locale } = useI18n({ useScope: 'global' })
 const router = useRouter()
 const maps = useMapsStore()
 const notifications = useNotificationsStore()
+const omf = useOmfStore()
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const importName = ref('')
@@ -50,6 +55,19 @@ const syntheticPreset = ref('default')
 const syntheticSeed = ref(0x0ddb1a5e)
 const generating = ref(false)
 const loadError = ref<string | null>(null)
+/** Map whose areas and links are being edited, or `null` while the drawer is shut. */
+const studioFor = ref<string | null>(null)
+const inspectOpen = ref(false)
+
+/** Whether the studio drawer is showing, as the drawer's own `visible` model. */
+const studioVisible = computed({
+  get: () => studioFor.value !== null,
+  set: (isOpen: boolean) => {
+    if (!isOpen) {
+      studioFor.value = null
+    }
+  },
+})
 
 const presetOptions = computed(() => [
   { value: 'default', label: t('map.list.syntheticPresetDefault') },
@@ -65,7 +83,7 @@ const columns = computed(() => [
   { colKey: 'source', title: t('map.list.columnSource'), width: 110 },
   { colKey: 'size', title: t('map.list.columnSize'), width: 110 },
   { colKey: 'created', title: t('map.list.columnCreated'), width: 190 },
-  { colKey: 'actions', title: ' ', width: 230 },
+  { colKey: 'actions', title: ' ', width: 360 },
 ])
 
 const rows = computed<MapRow[]>(() => maps.summaries.map(toRow))
@@ -153,6 +171,8 @@ async function onFileChosen(event: Event): Promise<void> {
       kind: 'success',
       message: t('map.list.importDone', { name: summary.name }),
     })
+    await omf.inspect(bytes, file.name)
+    inspectOpen.value = true
   } catch (error) {
     notifications.pushError(t('map.list.importFailed'), error)
   } finally {
@@ -207,6 +227,11 @@ function open(row: MapRow): void {
   void router.push({ name: 'map-viewer', params: { id: row.id } })
 }
 
+/** Opens the areas-and-links editor on one map. */
+function edit(row: MapRow): void {
+  studioFor.value = row.id
+}
+
 onMounted(() => {
   void refresh()
 })
@@ -218,6 +243,9 @@ onMounted(() => {
       <h1 class="font-semibold text-ink">{{ t('views.mapList.title') }}</h1>
       <div class="flex items-center gap-3">
         <span class="text-sm text-muted">{{ t('map.list.count', { total: maps.mapCount }) }}</span>
+        <TButton variant="outline" data-testid="map-inspect" @click="inspectOpen = true">
+          {{ t('map.list.inspect') }}
+        </TButton>
         <TButton variant="outline" :loading="maps.listStatus === 'loading'" @click="refresh()">
           {{ t('common.refresh') }}
         </TButton>
@@ -335,8 +363,18 @@ onMounted(() => {
         </template>
         <template #actions="{ row }">
           <div class="flex items-center gap-2">
-            <TButton variant="text" @click="open(row)">{{ t('map.list.open') }}</TButton>
-            <TButton variant="text" theme="danger" @click="confirmDelete(row)">
+            <TButton variant="text" data-testid="map-edit" @click="edit(row)">
+              {{ t('map.list.studio') }}
+            </TButton>
+            <TButton variant="text" data-testid="map-open" @click="open(row)">
+              {{ t('map.list.open') }}
+            </TButton>
+            <TButton
+              variant="text"
+              theme="danger"
+              data-testid="map-delete"
+              @click="confirmDelete(row)"
+            >
               {{ t('map.list.delete') }}
             </TButton>
           </div>
@@ -347,5 +385,25 @@ onMounted(() => {
       </p>
       <TAlert v-else-if="maps.listStatus === 'ready'" theme="info" :message="t('map.list.empty')" />
     </div>
+
+    <TDrawer
+      v-model:visible="studioVisible"
+      size="90%"
+      :header="t('map.list.studioTitle')"
+      :footer="false"
+      data-testid="studio-drawer"
+    >
+      <StudioPanel v-if="studioFor !== null" :map-id="studioFor" />
+    </TDrawer>
+
+    <TDrawer
+      v-model:visible="inspectOpen"
+      size="90%"
+      :header="t('map.list.inspectTitle')"
+      :footer="false"
+      data-testid="omf-drawer"
+    >
+      <OmfPanel />
+    </TDrawer>
   </section>
 </template>

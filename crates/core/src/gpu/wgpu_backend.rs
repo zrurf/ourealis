@@ -2,7 +2,8 @@
 //!
 //! Two kernels cover the parallel work:
 //!
-//! * `cost_gemm` — one invocation per `(cell, mode)` pair, looping over the
+//! * `cost_gemm` — one invocation per `(cell, mode)` pair, walking a grid stride so
+//!   that a field wider than the dispatch cap is still covered, and looping over the
 //!   feature dimension. `D` is small (8–16 in practice), so a tiled shared-memory
 //!   product would add complexity without changing the arithmetic intensity;
 //!   the weight column is kept in registers instead;
@@ -28,6 +29,17 @@ use super::{
 const COST_SHADER: &str = include_str!("shaders/cost_gemm.wgsl");
 const NOISE_SHADER: &str = include_str!("shaders/noise_batch.wgsl");
 const PROJECTION_SHADER: &str = include_str!("shaders/projection_check.wgsl");
+
+/// Invocations per workgroup of the cost kernel, matching its `@workgroup_size`.
+const COST_WORKGROUP_SIZE: u32 = 64;
+
+/// Largest workgroup count one dispatch dimension accepts.
+///
+/// The interface caps every dimension of a dispatch at 65 535 workgroups, and the cost
+/// field of a whole map is millions of cells — more than that cap covers. The kernels
+/// whose grid is sized by a map therefore walk it in strides rather than dispatching
+/// past the cap, which would be rejected as a validation error and abort the device.
+const MAX_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 /// Uniform block of the cost kernel.
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -355,8 +367,10 @@ impl ComputeBackend for WgpuBackend {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.cost_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = (output_len as u32).div_ceil(64);
-            pass.dispatch_workgroups(workgroups.max(1), 1, 1);
+            let workgroups = (output_len as u32)
+                .div_ceil(COST_WORKGROUP_SIZE)
+                .clamp(1, MAX_WORKGROUPS_PER_DIMENSION);
+            pass.dispatch_workgroups(workgroups, 1, 1);
         }
         self.queue.submit([encoder.finish()]);
 

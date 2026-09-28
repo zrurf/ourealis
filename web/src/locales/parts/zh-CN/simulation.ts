@@ -5,6 +5,12 @@
  */
 export default {
   simulation: {
+    tabs: {
+      overview: '概览',
+      trajectory: '轨迹',
+      sensors: '传感器',
+      audit: '审计',
+    },
     job: {
       queued: '排队中',
       running: '运行中',
@@ -378,14 +384,14 @@ export default {
       routeRequired: '请先设置路线与地图。',
       frequency: '所选路径频率',
       frequencyHint: '按每个个体做一次规划预览得到；预览与运行抽取同一套 Logit 选择。',
-      candidate: '候选 {index}',
+      candidate: '路线方案 {index}',
       share: '占比',
       applied: '个体占比',
       runs: '逐个结果',
       columnIndividual: '个体',
       columnState: '状态',
       columnSeed: '随机种子',
-      columnChosen: '所选路径',
+      columnChosen: '规划方案',
       columnPathRatio: '路径比',
       columnMeanSpeed: '平均速度（米/秒）',
       columnStepFrequency: '步频（Hz）',
@@ -444,11 +450,6 @@ export default {
     fieldMaps: '地图库',
     fieldInFlight: '运行中作业',
     recentJobs: '最近作业',
-    mapsBody: '导入、生成与预览地图。',
-    routesBody: '先规划路线并比较候选，再决定是否运行。',
-    batchBody: '在同一路线上扫描群体参数。',
-    omfBody: '检视、编辑与打补丁。',
-    settingsBody: '语言、外观、单位与服务端有效配置。',
   },
   settings: {
     interface: '界面',

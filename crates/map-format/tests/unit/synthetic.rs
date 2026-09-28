@@ -69,7 +69,7 @@ fn forbidden_cells_exist_and_are_limited() {
 fn feature_schema_matches_the_generated_channels() {
     let schema = feature_schema();
     assert_eq!(schema.dim(), 5);
-    assert_eq!(schema.dims[0].palette.len(), 5);
+    assert_eq!(schema.dims[0].palette.len(), crate::surface::COUNT);
     assert_eq!(schema.dims[4].kind, FeatureKind::Direction);
 }
 

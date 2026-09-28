@@ -2,7 +2,7 @@
  * Procedural surface patterns.
  *
  * Colour on a draped layer carries the *meaning* of a cell; a pattern carries its
- * *material* — asphalt, grass, water, a façade — so a map reads as a place rather than as a
+ * *material* — asphalt, grass, gravel, water — so a map reads as a place rather than as a
  * coloured grid. The patterns are generated here rather than shipped as images: a tiling
  * texture that is a pure function of world position needs no asset, no loading state and no
  * new dependency, and it can be tested as arithmetic.
@@ -20,7 +20,6 @@ export type SurfacePattern =
   | 'asphalt'
   | 'grass'
   | 'water'
-  | 'building'
   | 'gravel'
   | 'hatch'
   | 'contour'
@@ -48,8 +47,6 @@ export function patternAt(
       return tufts(x, y)
     case 'water':
       return waves(x, y)
-    case 'building':
-      return facade(x, y)
     case 'gravel':
       return speckle(x, y, 0.8)
     case 'hatch':
@@ -105,13 +102,6 @@ function waves(x: number, y: number): number {
   const wave = Math.sin((x * 0.6 + y * 0.35) / 3.1) * 0.5 + 0.5
   const ripple = noiseAt(x / 1.6, y / 1.6)
   return 1 + (wave * 0.6 + ripple * 0.4 - 0.5) * 0.22
-}
-
-/** A building: a façade grid with a light band every floor and a pier every bay. */
-function facade(x: number, y: number): number {
-  const bay = Math.abs((((x % 4) + 4) % 4) - 2) / 2
-  const floor = Math.abs((((y % 3.2) + 3.2) % 3.2) - 1.6) / 1.6
-  return 1 + (0.5 - Math.min(bay, floor)) * 0.3
 }
 
 /** Diagonal stripes: the convention for "restricted" or "no data" on a plan. */

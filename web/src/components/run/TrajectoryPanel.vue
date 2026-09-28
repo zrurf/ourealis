@@ -3,28 +3,28 @@
  * Trajectory playback: the truth timeline over the map surface, the runner marker
  * at the playhead, and the channels drawn against time.
  *
- * The page owns the clock. Its frame loop advances a time in simulated seconds by
+ * The panel owns the clock. Its frame loop advances a time in simulated seconds by
  * `dt * rate`, which keeps the runner's motion smooth at any rate instead of
  * stepping sample by sample; the charts and the 3D marker read the same time, so
  * they cannot drift apart.
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRoute, useRouter } from 'vue-router'
-import { Alert as TAlert, Button as TButton, Card as TCard, Tag as TTag } from 'tdesign-vue-next'
+import { Alert as TAlert, Card as TCard } from 'tdesign-vue-next'
 import { api } from '@/api/client'
 import { isApiError } from '@/api/errors'
 import { JobSocket } from '@/api/ws'
 import type { ChunkRef } from '@/api/maps'
 import { LAYER_ELEVATION, chunkKey, selectLevel } from '@/types/map'
 import type { TruthSample } from '@/types/result'
-import { backendLabel, engineFromQuery, probeEngine, type EngineBackend } from '@/render/engine'
+import { engineFromQuery, probeEngine } from '@/render/engine'
 import { updateDebug } from '@/render/scene'
 import { renderHost, type SceneLease } from '@/render/host'
 import type { MapScene } from '@/render/scene'
 import { TerrainLayer } from '@/render/terrain'
 import { buildChunkMesh, chunkGrid } from '@/render/terrainMesh'
 import { createCellSampler } from '@/render/cellSampler'
+import { createSurfaceSampler } from '@/render/inspect'
 import { TrajectoryLine, sampleTrajectory, type TrajectoryChannel } from '@/render/trajectory'
 import EChart from '@/components/charts/EChart.vue'
 import { lineOption } from '@/components/charts/options/line'
@@ -45,9 +45,9 @@ import {
 /** Resolution the camera is treated as showing when the level is chosen, m/px. */
 const TARGET_METRES_PER_PIXEL = 2
 
+const props = defineProps<{ jobId: string }>()
+
 const { t, locale } = useI18n({ useScope: 'global' })
-const route = useRoute()
-const router = useRouter()
 const maps = useMapsStore()
 const simulations = useSimulationsStore()
 
@@ -59,7 +59,6 @@ const rate = ref(1)
 const channel = ref<TrajectoryChannel>('speed')
 const status = ref<'idle' | 'loading' | 'ready' | 'failed'>('idle')
 const failure = ref<string | null>(null)
-const backend = ref<EngineBackend | null>(null)
 
 let scene: MapScene | null = null
 let lease: SceneLease | null = null
@@ -69,7 +68,7 @@ let frame: number | null = null
 let lastFrameMs = 0
 let disposed = false
 
-const jobId = computed(() => String(route.params.id ?? ''))
+const jobId = computed(() => props.jobId)
 
 /** Times of the loaded samples, seconds. */
 const times = computed(() => samples.value.map((sample) => sample.time_s))
@@ -94,7 +93,6 @@ const speedRange = computed(() => {
 /** Trajectory points handed to the 3D line: a strided view of the raw pages. */
 const points = computed(() => sampleTrajectory(downsample(samples.value), channel.value))
 
-/** Series of one channel against time, reduced to what a chart can draw. */
 /** One channel against time, reduced to what a chart can draw. */
 function seriesOf(read: (sample: TruthSample) => number): Array<{ x: number; y: number }> {
   return downsample(samples.value).map((sample) => ({ x: sample.time_s, y: read(sample) }))
@@ -196,9 +194,6 @@ function format(value: number, digits = 2): string {
   return new Intl.NumberFormat(locale.value, { maximumFractionDigits: digits }).format(value)
 }
 
-/** Engine label of the renderer, or an empty string before the probe answered. */
-const engineText = computed(() => (backend.value === null ? '' : backendLabel(backend.value)))
-
 /** Starts or stops the frame loop. */
 function togglePlayback(): void {
   playing.value = !playing.value
@@ -269,7 +264,7 @@ function rewind(): void {
 /**
  * Loads the run's truth pages, then the surface and the line.
  *
- * The component can be unmounted while one of the awaits is pending, so every one
+ * The panel can be unmounted while one of the awaits is pending, so every one
  * of them is followed by the guard: a resumed load must not build a scene on a
  * canvas that is already detached.
  */
@@ -327,7 +322,7 @@ async function loadTruth(): Promise<TruthSample[]> {
       return truth
     }
   } catch {
-    // Reported by the fallback path below, which is what the page uses.
+    // Reported by the fallback path below, which is what the panel uses.
   } finally {
     socket.close()
   }
@@ -393,11 +388,10 @@ async function startScene(): Promise<void> {
     failure.value = t('map.viewer.engineFailed')
     return
   }
-  backend.value = probe.backend
   const borrowing = await renderHost().acquire(canvasElement, probe.backend)
   if (disposed) {
-    // The view went away while the engine was starting; giving the lease straight back
-    // parks the canvas rather than leaving a render loop on a canvas nobody sees.
+    // The panel went away while the engine was starting; giving the lease straight
+    // back parks the canvas rather than leaving a render loop on a canvas nobody sees.
     borrowing.release()
     return
   }
@@ -455,6 +449,15 @@ async function loadSurface(): Promise<void> {
       level,
       layerId: LAYER_ELEVATION,
     })
+    // Second channel of the elevation layer; `null` when the map carries no building mask.
+    const building = createCellSampler({
+      chunks: maps.chunks,
+      grid,
+      chunkSize: info.summary.chunk_size,
+      level,
+      layerId: LAYER_ELEVATION,
+      channel: 1,
+    })
     for (const chunkRef of refs) {
       const key = chunkKey(chunkRef.layerId, chunkRef.level, chunkRef.chunkId)
       if (maps.chunkOf(key) === null) {
@@ -465,9 +468,20 @@ async function loadSurface(): Promise<void> {
         buildChunkMesh(
           chunkGrid(grid, info.summary.chunk_size, level, chunkRef.chunkId, maps.originOf(mapId)),
           sample,
+          { building },
         ),
       )
     }
+    // The camera target rides the ground, so a close view does not sink under a campus that
+    // stands hundreds of metres above the map's zero plane.
+    const ground = createSurfaceSampler(
+      maps.chunks,
+      grid,
+      info.summary.chunk_size,
+      level,
+      maps.originOf(mapId),
+    )
+    scene.setGroundHeight((x, y) => ground(x, y))
   } catch (error) {
     failure.value = isApiError(error) ? error.message : t('simulation.route.surfaceFailed')
   }
@@ -526,39 +540,20 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="mx-auto max-w-7xl px-8 py-8" data-testid="trajectory-view">
-    <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <h1 class="font-semibold text-ink">{{ t('views.trajectory.title') }}</h1>
-        <span class="font-mono text-xs text-muted">{{ jobId }}</span>
-        <TTag v-if="engineText !== ''" size="small" variant="light">{{ engineText }}</TTag>
-        <span class="text-sm text-muted">{{
-          t('simulation.trajectory.samples', { count: samples.length })
-        }}</span>
-      </div>
-      <TButton variant="outline" @click="router.push(`/simulations/${jobId}`)">
-        {{ t('common.back') }}
-      </TButton>
-    </div>
-
+  <div class="flex flex-col gap-6" data-testid="trajectory-view">
     <TAlert
       v-if="failure !== null"
-      class="mt-4"
       theme="error"
       :message="t('simulation.trajectory.loadFailed')"
       data-testid="trajectory-error"
     >
       <p class="text-sm text-muted">{{ failure }}</p>
     </TAlert>
-    <p
-      v-else-if="status === 'loading'"
-      class="mt-4 text-sm text-muted"
-      data-testid="trajectory-loading"
-    >
+    <p v-else-if="status === 'loading'" class="text-sm text-muted" data-testid="trajectory-loading">
       {{ t('simulation.trajectory.loading') }}
     </p>
 
-    <div class="mt-4 grid grid-cols-4 gap-6">
+    <div class="grid grid-cols-4 gap-6">
       <div class="col-span-3">
         <div class="relative h-[28rem] rounded-card border border-line bg-surface">
           <div ref="canvas" class="block h-full w-full" data-testid="trajectory-canvas" />
@@ -608,14 +603,14 @@ onBeforeUnmount(() => {
       </aside>
     </div>
 
-    <div v-if="samples.length > 0" class="mt-8">
+    <div v-if="samples.length > 0" class="flex flex-col gap-3">
       <h2 class="text-base font-medium text-ink">{{ t('simulation.trajectory.charts') }}</h2>
-      <div class="mt-3 grid grid-cols-2 gap-6">
+      <div class="grid grid-cols-2 gap-6">
         <EChart :option="speedOption" :height="240" data-testid="chart-speed" />
         <EChart :option="altitudeOption" :height="240" data-testid="chart-altitude" />
         <EChart :option="gradeOption" :height="240" data-testid="chart-grade" />
         <EChart :option="curvatureOption" :height="240" />
       </div>
     </div>
-  </section>
+  </div>
 </template>

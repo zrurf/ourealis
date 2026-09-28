@@ -64,7 +64,14 @@ import { DirectionArrows } from '@/render/directionArrows'
 import { MapPin } from '@/render/markers'
 import { SURFACE_MATERIALS, layerSurfacePlan, featureDimensions } from '@/render/surfaces'
 import { SurfaceGrid } from '@/render/lines'
-import { legendEntries, type LegendLayerInput, type LegendModel } from '@/render/legend'
+import {
+  legendEntries,
+  legendFamilies,
+  OVERLAY_LABEL_KEYS,
+  type LegendFamily,
+  type LegendLayerInput,
+  type LegendModel,
+} from '@/render/legend'
 import AppIcon from '@/components/layout/AppIcon.vue'
 import Legend from '@/components/map/Legend.vue'
 import InspectorPanel from '@/components/map/InspectorPanel.vue'
@@ -90,8 +97,14 @@ import TTooltip from '@/components/common/AppTooltip.vue'
 /** Samples the height distribution is computed from; a chart does not need a whole map. */
 const HEIGHT_SAMPLE_LIMIT = 20_000
 
-/** How many chunks one streaming pass may request. */
-const MAX_CHUNKS_PER_PASS = 24
+/**
+ * Chunks built or draped before the frame loop is yielded to.
+ *
+ * A chunk of the 128-cell grid is a vertex grid plus its slab, laid out in script, so the
+ * batch bounds the frame's own work: too many at once is the stall the reader sees as a
+ * freeze, too few spends the whole stream yielding.
+ */
+const STREAM_BATCH = 8
 
 /** Milliseconds a camera change is coalesced before the visible chunks are re-read. */
 const STREAM_DEBOUNCE_MS = 200
@@ -152,8 +165,20 @@ let scaleGrid: SurfaceGrid | null = null
 let streamTimer: ReturnType<typeof setTimeout> | null = null
 let pointerDown: { x: number; y: number } | null = null
 let lastHoverMs = 0
-let streaming = false
+/**
+ * Token of the newest streaming pass.
+ *
+ * Every pass takes the next token; a pass that finds its token stale stops between
+ * batches, so a camera change that starts a new pass abandons the old one instead of
+ * letting two passes race to fill the same view.
+ */
+let streamGeneration = 0
 let disposed = false
+/** Last ground sampler built by {@link surfaceSampler}, with the key it was built for. */
+let surfaceSamplerCache: {
+  key: string
+  sampler: (x: number, y: number) => number | null
+} | null = null
 
 /** Terrain geometry per chunk, kept so a layer drape can reuse its surface. */
 const terrainData = new Map<string, ChunkMeshData>()
@@ -218,7 +243,6 @@ const surfaceKey = computed(() => buildSurfaceKey(surfaceStyleInput()))
 function surfaceStyleInput(): SurfaceStyleInput {
   return {
     range: surfaceRange.value,
-    dark: theme.isDark,
     terraceM: viewer.terraceStepM,
     sunAzimuthDeg: viewer.sunAzimuthDeg,
   }
@@ -253,9 +277,13 @@ function loadSamples(layerId: number): number[] {
     if (chunk.layerId !== layerId) {
       continue
     }
-    const stride = Math.max(1, Math.ceil(chunk.values.length / (HEIGHT_SAMPLE_LIMIT / 8)))
-    for (let index = 0; index < chunk.values.length; index += stride) {
-      const value = chunk.values[index]
+    // Read by cell rather than by raw sample: a cell may carry several channels — the
+    // elevation layer holds the building mask beside its height — and a histogram of the
+    // interleaved buffer would describe the mask, which is not what the layer measures.
+    const cells = chunk.width * chunk.height
+    const stride = Math.max(1, Math.ceil(cells / (HEIGHT_SAMPLE_LIMIT / 8)))
+    for (let cell = 0; cell < cells; cell += stride) {
+      const value = chunk.values[cell * chunk.channels]
       if (value !== undefined && Number.isFinite(value)) {
         values.push(value)
       }
@@ -341,6 +369,17 @@ function unitFor(layerId: number): string | null {
   return layerId === LAYER_ELEVATION ? t('map.legend.elevation') : null
 }
 
+/** The vector families currently drawn, as the legend names them. */
+const legendFamilyRows = computed<LegendFamily[]>(() => legendFamilies(viewer.activeOverlays))
+
+/** Section families the aside can switch, with the name each row carries. */
+const sectionFamilies = computed(() =>
+  (['regions', 'connectors', 'skeleton', 'prm'] as OverlayKind[]).map((kind) => ({
+    kind,
+    labelKey: OVERLAY_LABEL_KEYS[kind],
+  })),
+)
+
 /** CSS gradient of a layer's ramp, drawn under the mapping select. */
 function rampStyle(mapping: ColorMapping): string {
   if (mapping === 'material') {
@@ -397,7 +436,7 @@ onMounted(async () => {
   lease = borrowing
   scene = borrowing.scene
   terrain = new TerrainLayer(scene.scene, scene)
-  drapes = new LayerOverlay(scene.scene)
+  drapes = new LayerOverlay(scene.scene, scene)
   overlays = new OverlaySet(scene)
   arrows = new DirectionArrows(scene)
   pin = new MapPin(scene)
@@ -405,6 +444,10 @@ onMounted(async () => {
   scaleGrid = new SurfaceGrid(scene)
   updateDebug({ engine: probe.backend, mapId: mapId.value, frames: 0, loaded: false, error: null })
   applyViewport()
+  // The camera target rides the ground. Without it a close view sinks below a campus that
+  // stands hundreds of metres above the map's zero plane, and the terrain — seen from
+  // behind — is culled out of the frame entirely.
+  scene.setGroundHeight((x, z) => surfaceSampler()(x, z))
   // A click that ends a camera drag would otherwise move the readout to wherever the
   // drag stopped, so a pick is only read when the pointer stayed where it went down.
   scene.scene.onPointerDown = () => {
@@ -523,7 +566,7 @@ async function loadMap(): Promise<void> {
       return
     }
     await maps.loadGrid(mapId.value, LAYER_ELEVATION)
-    scene?.frameBounds(info.summary.bounds)
+    scene?.frameBounds(info.summary.bounds, framingElevation())
     scene?.setSun(viewer.sunAzimuthDeg)
     status.value = 'ready'
     await streamVisibleChunks()
@@ -545,47 +588,60 @@ function scheduleStream(): void {
 }
 
 /**
- * Loads the chunks of the visible area at the level the camera can show.
+ * Loads every chunk of the visible area at the level the camera can show.
  *
  * The level comes from the ground resolution the camera sees, so a zoomed-out view
  * reads coarse chunks and a zoomed-in one replaces them with fine chunks; a level
  * change drops the meshes built at the previous level rather than mixing them.
+ *
+ * The pass loads the whole view, then meshes it in batches over successive frames.
+ * Reading only a fixed number of chunks left the rest of the view untextured until the
+ * reader zoomed again; meshing the whole view at once blocked the frame loop and froze
+ * the page. Loading everything first is also what lets a mesh read its neighbours: the
+ * quad that spans a chunk boundary belongs to the left-hand chunk, so a chunk meshed
+ * before its neighbour is in memory gets a cliff along that boundary that is never
+ * rebuilt.
  */
 async function streamVisibleChunks(): Promise<void> {
   const info = metadata.value
   const current = scene
-  if (streaming || disposed || info === null || current === null || terrain === null) {
+  if (disposed || info === null || current === null || terrain === null) {
     return
   }
   const grid = maps.gridOf(mapId.value, LAYER_ELEVATION)
   if (grid === null) {
     return
   }
-  streaming = true
-  try {
-    const chunkSize = info.summary.chunk_size
-    const level = selectLevel(grid, metresPerPixel())
-    if (level !== viewer.terrainLevel) {
-      dropSurface()
-      viewer.terrainLevel = level
-    }
-    const area = cameraFootprint()
-    const refs = maps.chunkRefsInArea(mapId.value, LAYER_ELEVATION, chunkSize, level, area)
-    const missing = refs.filter(
-      (target) => !terrainData.has(chunkKey(target.layerId, target.level, target.chunkId)),
-    )
-    await maps.loadChunks(missing.slice(0, MAX_CHUNKS_PER_PASS), {
-      onError: () => {
-        // A chunk that fails leaves a hole; the count is reported under the canvas.
-      },
-    })
-    buildTerrain(grid, chunkSize, level, refs)
-    refreshGrid()
-    await syncOverlayFamilies()
-    await streamLayerDrapes(level, chunkSize, area)
-  } finally {
-    streaming = false
+  const generation = ++streamGeneration
+  const live = (): boolean => generation === streamGeneration && !disposed
+  const chunkSize = info.summary.chunk_size
+  const level = selectLevel(grid, metresPerPixel())
+  if (level !== viewer.terrainLevel) {
+    dropSurface()
+    viewer.terrainLevel = level
   }
+  const area = cameraFootprint()
+  const refs = maps.chunkRefsInArea(mapId.value, LAYER_ELEVATION, chunkSize, level, area)
+  const missing = refs.filter(
+    (target) => !terrainData.has(chunkKey(target.layerId, target.level, target.chunkId)),
+  )
+  // A chunk that fails leaves a hole; the count is reported under the canvas.
+  await maps.loadChunks(missing, { onError: () => {} })
+  if (!live()) {
+    return
+  }
+  await buildTerrain(grid, chunkSize, level, refs, live)
+  if (!live()) {
+    return
+  }
+  refreshGrid()
+  await syncOverlayFamilies()
+  await streamLayerDrapes(level, chunkSize, area, live)
+}
+
+/** Resolves on the next animation frame, so the renderer draws between streaming batches. */
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()))
 }
 
 /** Drops the surface so the next pass rebuilds it from the cached chunks. */
@@ -604,17 +660,26 @@ async function ensureGrid(layerId: number): Promise<void> {
   }
 }
 
-/** Drapes every visible non-elevation layer over the terrain it covers. */
+/**
+ * Drapes every visible non-elevation layer over the terrain it covers.
+ *
+ * Every visible chunk is draped, in batches that yield to the frame loop for the same
+ * reason the terrain is: a texture per chunk, built for a whole view at once, is what
+ * made the first pass stall. `live` reports whether the pass that started this work is
+ * still the newest one; a superseded pass stops at the next batch.
+ */
 async function streamLayerDrapes(
   level: number,
   chunkSize: number,
   area: { min_x: number; min_y: number; max_x: number; max_y: number },
+  live: () => boolean = () => true,
 ): Promise<void> {
   const manager = drapes
   const elevationGrid = maps.gridOf(mapId.value, LAYER_ELEVATION)
   if (manager === null || elevationGrid === null) {
     return
   }
+  const origin = maps.originOf(mapId.value)
   for (const layer of viewer.visibleLayers) {
     if (layer.layerId === LAYER_ELEVATION) {
       continue
@@ -623,6 +688,9 @@ async function streamLayerDrapes(
     // chunks to drape, and its own overlay is the way to show it.
     if (!drapeable(layer)) {
       continue
+    }
+    if (!live()) {
+      return
     }
     // Layers are draped one after another: each grid is read on demand, and a burst
     // of layer loads on one connection would starve the terrain chunks.
@@ -635,28 +703,24 @@ async function streamLayerDrapes(
     }
     // The layer's own chunks are read at the level the layer stores, which is not
     // necessarily the level the surface is drawn at.
-    const refs = maps
-      .chunkRefsInArea(mapId.value, layer.layerId, chunkSize, sourceLevel, area)
-      .slice(0, MAX_CHUNKS_PER_PASS)
+    const refs = maps.chunkRefsInArea(mapId.value, layer.layerId, chunkSize, sourceLevel, area)
     // oxlint-disable-next-line no-await-in-loop
     await maps.loadChunks(refs)
     const sample = cellSamplerFor(layer.layerId, layerGrid, chunkSize, level, sourceLevel)
+    const plan = surfacePlan(layer)
     // The drape is one mesh per *terrain* chunk: its vertices are the surface's own, and
     // its grid is the surface's grid — a chunk id from the layer's own level names a
     // different area and would put the drape somewhere the chunk is not.
+    let built = 0
     for (const [key, terrainMesh] of terrainData) {
+      if (!live()) {
+        return
+      }
       const drapeKey = `${layer.layerId}:${level}:${key}`
       if (drapedChunks.has(drapeKey) || !key.startsWith(`${LAYER_ELEVATION}/`)) {
         continue
       }
-      const spec = chunkGrid(
-        elevationGrid,
-        chunkSize,
-        level,
-        chunkIdOf(key),
-        maps.originOf(mapId.value),
-      )
-      const plan = surfacePlan(layer)
+      const spec = chunkGrid(elevationGrid, chunkSize, level, chunkIdOf(key), origin)
       manager.setChunk(
         drapeKey,
         layerTextureData(spec, sample, {
@@ -669,6 +733,11 @@ async function streamLayerDrapes(
         drapedMesh(terrainMesh, DRAPE_LIFT_M * drapeOrder(layer.layerId)),
       )
       drapedChunks.add(drapeKey)
+      built += 1
+      if (built % STREAM_BATCH === 0) {
+        // oxlint-disable-next-line no-await-in-loop
+        await nextFrame()
+      }
     }
   }
 }
@@ -764,6 +833,7 @@ function cellSamplerFor(
   chunkSize: number,
   level: number,
   sourceLevel: number = level,
+  channel: number = 0,
 ): CellSampler {
   return createCellSampler({
     chunks: maps.chunks,
@@ -772,29 +842,40 @@ function cellSamplerFor(
     level,
     layerId,
     sourceLevel,
+    channel,
   })
 }
 
 /**
- * Builds every mesh whose surface is ready.
+ * Builds every mesh whose surface is ready, in batches that yield to the frame loop.
  *
- * A chunk's mesh needs its neighbours' cells to draw the quad that spans the boundary, so
- * a chunk whose neighbour is not loaded yet is built with what is known and rebuilt when
- * that neighbour arrives — see {@link buildTerrain}.
+ * The caller loads the whole view before this runs, so the batch here bounds the
+ * synchronous cost of laying out a vertex grid rather than which chunks are available.
+ * A chunk already built is left alone, so a later pass over a moved camera only builds
+ * what arrived since.
  */
-function buildTerrain(
+async function buildTerrain(
   grid: LayerGrid,
   chunkSize: number,
   level: number,
   refs: readonly ChunkRef[],
-): void {
+  live: () => boolean,
+): Promise<void> {
   const manager = terrain
   if (manager === null) {
     return
   }
   const origin = maps.originOf(mapId.value)
   const sample = cellSamplerFor(LAYER_ELEVATION, grid, chunkSize, level)
+  // The building mask rides in the elevation layer's second channel; a map built before the
+  // mask existed has one channel there, the reader answers `null` throughout, and the surface
+  // falls back to the ramp with nothing to distinguish.
+  const building = cellSamplerFor(LAYER_ELEVATION, grid, chunkSize, level, level, 1)
+  let built = 0
   for (const target of refs) {
+    if (!live()) {
+      return
+    }
     const key = chunkKey(target.layerId, target.level, target.chunkId)
     if (maps.chunkOf(key) === null || terrainData.has(key)) {
       continue
@@ -802,10 +883,15 @@ function buildTerrain(
     const data = buildChunkMesh(
       chunkGrid(grid, chunkSize, target.level, target.chunkId, origin),
       sample,
-      surfaceStyle.value,
+      { ...surfaceStyle.value, building },
     )
     terrainData.set(key, data)
     manager.setChunk(key, data)
+    built += 1
+    if (built % STREAM_BATCH === 0) {
+      // oxlint-disable-next-line no-await-in-loop
+      await nextFrame()
+    }
   }
 }
 
@@ -813,14 +899,24 @@ function buildTerrain(
  * The sampler the overlays and the grid read their heights from.
  *
  * Terraced, so an annotation lands on the surface that is drawn rather than on the survey
- * under it.
+ * under it. Cached, because the camera reads a height every frame to keep its target on the
+ * ground, and rebuilding the sampler walks the level's chunk list. The key is everything the
+ * sampler closes over — the map, the level, the terrace step and *how many chunks have
+ * arrived* — because the store replaces its chunk map on every load rather than adding to the
+ * one a sampler holds. A key that ignored the count kept the sampler built while the surface
+ * was still streaming, so every point read back as `null` and the annotations fell to the
+ * map's base plane instead of the ground.
  */
 function surfaceSampler(): (x: number, y: number) => number | null {
   const gridRef = maps.gridOf(mapId.value, LAYER_ELEVATION)
   if (gridRef === null || metadata.value === null) {
     return () => null
   }
-  return terracedSampler(
+  const key = `${mapId.value}:${viewer.terrainLevel}:${surfaceStyle.value.terraceM ?? 0}:${maps.loadedChunkCount}`
+  if (surfaceSamplerCache !== null && surfaceSamplerCache.key === key) {
+    return surfaceSamplerCache.sampler
+  }
+  const sampler = terracedSampler(
     createSurfaceSampler(
       maps.chunks,
       gridRef,
@@ -830,6 +926,8 @@ function surfaceSampler(): (x: number, y: number) => number | null {
     ),
     surfaceStyle.value.terraceM ?? 0,
   )
+  surfaceSamplerCache = { key, sampler }
+  return sampler
 }
 
 /** Rebuilds the scale grid from the terrain currently loaded. */
@@ -999,9 +1097,21 @@ watch(
 function resetView(): void {
   const bounds = metadata.value?.summary.bounds
   if (bounds !== undefined && scene !== null) {
-    scene.frameBounds(bounds)
+    scene.frameBounds(bounds, framingElevation())
     scheduleStream()
   }
+}
+
+/**
+ * Height the camera target starts at when the map is framed, metres.
+ *
+ * The middle of the map's own elevation range: the ground reader corrects the target to the
+ * real surface once chunks arrive, so this only has to keep the first frame — before any
+ * chunk is in memory — from parking the camera at the map's zero plane.
+ */
+function framingElevation(): number | undefined {
+  const range = surfaceRange.value
+  return range === null ? undefined : (range.min + range.max) / 2
 }
 </script>
 
@@ -1074,7 +1184,12 @@ function resetView(): void {
         </div>
 
         <div class="pointer-events-none absolute bottom-4 left-4 flex flex-col gap-3">
-          <Legend :model="legendModel" :label-for="layerLabel" :unit-for="unitFor" />
+          <Legend
+            :model="legendModel"
+            :families="legendFamilyRows"
+            :label-for="layerLabel"
+            :unit-for="unitFor"
+          />
           <ScaleBar :metres="scaleBarMetres" :metres-per-pixel="groundResolution" />
         </div>
 
@@ -1153,25 +1268,21 @@ function resetView(): void {
         <h2 class="text-sm font-medium text-ink">{{ t('map.viewer.overlays') }}</h2>
         <ul class="mt-2 flex flex-col gap-2">
           <li
-            v-for="kind in ['regions', 'connectors', 'skeleton', 'prm'] as OverlayKind[]"
-            :key="kind"
+            v-for="family in sectionFamilies"
+            :key="family.kind"
             class="flex items-center justify-between gap-2"
           >
             <TTooltip
-              :content="overlayAvailability[kind] ? '' : t('map.viewer.overlayUnavailable')"
+              :content="overlayAvailability[family.kind] ? '' : t('map.viewer.overlayUnavailable')"
             >
-              <span class="text-sm text-ink">{{
-                t(
-                  `map.viewer.overlay${kind === 'prm' ? 'Prm' : kind.charAt(0).toUpperCase() + kind.slice(1)}`,
-                )
-              }}</span>
+              <span class="text-sm text-ink">{{ t(family.labelKey) }}</span>
             </TTooltip>
             <TSwitch
-              :value="viewer.overlays[kind]"
+              :value="viewer.overlays[family.kind]"
               size="small"
-              :disabled="!overlayAvailability[kind]"
-              :data-testid="`overlay-${kind}`"
-              @change="viewer.setOverlay(kind, Boolean($event))"
+              :disabled="!overlayAvailability[family.kind]"
+              :data-testid="`overlay-${family.kind}`"
+              @change="viewer.setOverlay(family.kind, Boolean($event))"
             />
           </li>
         </ul>

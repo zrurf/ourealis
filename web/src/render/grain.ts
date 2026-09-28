@@ -28,6 +28,15 @@ export const GRAIN_COMPENSATION = 1 / GRAIN_MEAN
 const GRAIN_AMPLITUDE = 0.055
 
 /**
+ * Anisotropic samples taken along the view direction.
+ *
+ * The ground is read at a glancing angle from a raised camera, where an isotropic filter
+ * samples too coarse a mip and smears the surface along the view; the engine clamps this
+ * to what the device supports.
+ */
+const GRAIN_ANISOTROPY = 8
+
+/**
  * Builds the grain texture.
  *
  * Two octaves, wrapping at the texture edge: a texture that wraps has no seam where it
@@ -62,6 +71,7 @@ export function grainTexture(scene: Scene): RawTexture {
   )
   texture.wrapU = Texture.WRAP_ADDRESSMODE
   texture.wrapV = Texture.WRAP_ADDRESSMODE
+  texture.anisotropicFilteringLevel = GRAIN_ANISOTROPY
   return texture
 }
 

@@ -159,13 +159,28 @@ pub struct RoutePreviewCandidate {
     pub points: Vec<Vec2>,
 }
 
+/// One leg of a route preview.
+///
+/// A route with waypoints is planned leg by leg, and each leg draws its own candidate
+/// set and its own Logit sample. Reporting one leg's candidates as if they were the
+/// whole route is what made a multi-legged preview draw only its first leg.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutePreviewLeg {
+    /// Requested start of the leg, metres.
+    pub from: Vec2,
+    /// Requested end of the leg, metres.
+    pub to: Vec2,
+    /// Index of the candidate the Logit draw selected for this leg.
+    pub chosen: usize,
+    /// Candidate routes of this leg, best first.
+    pub candidates: Vec<RoutePreviewCandidate>,
+}
+
 /// A route preview: planning only, before any motion or sensor work.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutePreview {
-    /// Candidate routes, best first.
-    pub candidates: Vec<RoutePreviewCandidate>,
-    /// Index of the candidate the Logit draw selected.
-    pub chosen: usize,
+    /// The legs of the route, in travel order.
+    pub legs: Vec<RoutePreviewLeg>,
     /// Total length of the chosen route, metres.
     pub length_m: f64,
     /// Cost of the chosen route in equivalent metres.
@@ -174,9 +189,14 @@ pub struct RoutePreview {
     pub straight_line_m: f64,
     /// Time the planning step took, milliseconds.
     pub planning_ms: f64,
-    /// The smoothed path actually used for motion, when smoothing ran.
+    /// The chosen route as one polyline, metres.
+    ///
+    /// The whole route, not one leg: a client draws the line the run will take from this
+    /// one array. Available from a preview, before any profile.
     pub path: Vec<Vec2>,
     /// Speed limit along the smoothed path, m/s, sampled at the profile grid.
+    ///
+    /// Empty while the preview carried no profile.
     pub speed_limit_mps: Vec<f64>,
     /// Arc length of each speed limit sample, metres.
     pub speed_limit_s: Vec<f64>,

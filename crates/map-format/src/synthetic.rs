@@ -23,24 +23,26 @@ use crate::geometry::Aabb;
 use crate::layer::{DType, LayerDesc, LayerId, LayerKind};
 use crate::motion::MotionMode;
 use crate::region::{RegionFeature, RegionSet, RegionTag, TriggerMode};
+use crate::surface;
 use crate::tlv::value::*;
 use crate::writer::MapHeaderSpec;
 
-/// Surface categories used by the synthetic map.
-pub mod surface {
-    /// Asphalt road.
-    pub const ROAD: u8 = 0;
-    /// Rubber running track.
-    pub const TRACK: u8 = 1;
-    /// Lawn.
-    pub const GRASS: u8 = 2;
-    /// Paved sidewalk.
-    pub const SIDEWALK: u8 = 3;
-    /// Compacted dirt path.
-    pub const DIRT: u8 = 4;
-    /// Normalised resistance values, indexed by category id.
-    pub const NORMALISED: [f32; 5] = [0.45, 0.10, 0.70, 0.30, 0.85];
-}
+/// Resistance of each surface category, indexed by id, in [`surface`] order.
+///
+/// The generator paints grass, asphalt, paving, track and gravel; the categories it never
+/// paints repeat the worst-case resistance so a stray id can never come out cheaper than
+/// dirt.
+const PALETTE: [f32; surface::COUNT] = [
+    0.45, // asphalt
+    0.30, // paving
+    0.10, // track
+    0.85, // gravel
+    0.85, // ground
+    0.70, // grass
+    0.85, // steps
+    1.00, // water
+    1.00, // building
+];
 
 /// Feature channel indices of the synthetic map.
 pub mod feature {
@@ -289,11 +291,11 @@ pub fn rasterise(spec: &SyntheticMapSpec) -> SyntheticLayers {
             let on_cross = (cx - spec.width_m * 0.5).abs() <= road_width * 0.5
                 || (cy - spec.height_m * 0.5).abs() <= road_width * 0.5;
             if on_ring || on_cross {
-                layers.surface[index] = surface::ROAD as f32;
+                layers.surface[index] = surface::ASPHALT as f32;
                 layers.traffic[index] = 0.9;
                 layers.lighting[index] = 0.8;
             } else if ring_distance(cx, cy, &ring) <= road_width * 0.5 + 4.0 {
-                layers.surface[index] = surface::SIDEWALK as f32;
+                layers.surface[index] = surface::PAVING as f32;
                 layers.traffic[index] = 0.25;
                 layers.lighting[index] = 0.75;
             }
@@ -347,7 +349,7 @@ pub fn rasterise(spec: &SyntheticMapSpec) -> SyntheticLayers {
                 if rect.contains(cx, cy) {
                     let index = layers.index(x, y);
                     layers.forbidden[index] = 1.0;
-                    layers.surface[index] = surface::SIDEWALK as f32;
+                    layers.surface[index] = surface::PAVING as f32;
                     layers.traffic[index] = 0.1;
                     layers.lighting[index] = 0.9;
                 }
@@ -385,7 +387,7 @@ pub fn rasterise(spec: &SyntheticMapSpec) -> SyntheticLayers {
         let touched = line_cells(&layers, (ax, ay), (bx, by), 1.5);
         for index in touched {
             if layers.surface[index] == surface::GRASS as f32 {
-                layers.surface[index] = surface::DIRT as f32;
+                layers.surface[index] = surface::GRAVEL as f32;
             }
         }
     }
@@ -489,7 +491,7 @@ pub fn feature_schema() -> FeatureSchema {
                 bias: 0.0,
                 norm_min: 0.0,
                 norm_max: 1.0,
-                palette: surface::NORMALISED.to_vec(),
+                palette: PALETTE.to_vec(),
             },
             FeatureDim {
                 name: "traffic".into(),

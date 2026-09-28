@@ -1,20 +1,17 @@
 /*
- * Water flowing in a pipe.
+ * Chevrons travelling along a route.
  *
- * A route is a *direction*, and the notation for direction is something that moves. The first
- * attempt drew a single white marker, which read as a slider on a rail: a mechanical object
- * travelling a line. Water in a pipe reads the way a route should — the whole line is filled, and
- * the movement comes from a train of *slugs* sliding through it, each of them a slightly different
- * length so the eye reads fluid rather than a conveyor.
+ * A route is a *direction*, and the notation for direction is something that moves. The
+ * route itself is the band drawn by `lines.ts`; this file adds the movement — a train of
+ * hollow arrows sliding along the band, every one of them pointing the way the run goes.
  *
- * Why this is geometry rather than a material effect: a dash pattern belongs to the shader
- * (`dashOffset`), and on a multi-segment path it drew its dashes over part of the path and stopped —
- * which read as "the route only goes to the first waypoint". Geometry placed from the path's own arc
- * length covers the whole line, and its speed is a number in metres per second that can be stated.
+ * The arrows are placed from the path's own arc length rather than from a dash pattern.
+ * A dash pattern belongs to the shader (`dashOffset`) and stopped partway along a
+ * multi-segment path, which read as "the route only reaches the first waypoint".
  *
- * The slugs are rebuilt each frame as short ribbons along the path, because they have to follow the
- * route's *shape*: a straight stub placed at a tangent lifts off the ground on a bend, and a slug
- * that leaves the pipe it belongs to is worse than no slug at all.
+ * They are geometry rather than sprites: a billboard that faces the camera cannot say
+ * which way a route runs, and a chevron drawn flat at a tangent lifts off the ground on a
+ * bend, so its own points are interpolated from the route's.
  */
 import { Color3 } from '@babylonjs/core/Maths/math.color'
 import { CreateGreasedLine } from '@babylonjs/core/Meshes/Builders/greasedLineBuilder'
@@ -24,39 +21,36 @@ import { arcTable, pointAtArc, type ArcTable } from './flow'
 import type { WorldPoint } from './overlayGeometry'
 import type { MapScene } from './scene'
 
-/** Points a slug's ribbon is built from; enough to follow a curve, few enough to rebuild per frame. */
-const SLUG_POINTS = 6
+/**
+ * Half-angle of a chevron's wing, radians.
+ *
+ * The angle a wing makes with the direction of travel: a smaller value is a longer,
+ * sharper arrow, a larger one a blunter V.
+ */
+const WING_ANGLE = 0.62
 
-/** How much a slug's length breathes over time, as a fraction. */
-const BREATH = 0.22
-
-/** Style of the water running through a route. */
+/** Style of the arrows running along a route. */
 export interface PathFlowStyle {
-  /** How many slugs are in the pipe at once. */
-  slugs: number
-  /** Nominal length of one slug, metres. */
-  lengthM: number
-  /** How fast the water moves, metres per second. */
-  speed: number
-  /** Colour of the water, `#rrggbb`. */
-  colour: string
-  /**
-   * Width of a slug, metres.
-   *
-   * Narrower than the water it runs inside: a slug as wide as its pipe is the pipe, and the water
-   * stops reading as something moving *through* something else.
-   */
+  /** Distance from one chevron to the next, metres. */
+  spacingM: number
+  /** Length of a chevron's wing, metres. */
+  sizeM: number
+  /** Width of the stroke a chevron is drawn with, metres. */
   widthM: number
-  /** Height above the path it runs on, metres. */
+  /** How fast the arrows travel, metres per second. */
+  speed: number
+  /** Arrow colour, `#rrggbb`. */
+  colour: string
+  /** Height above the route they run on, metres. */
   liftM: number
 }
 
 /**
- * The water in one route.
+ * The arrows running along one route.
  *
- * The path's points are in world metres and already carry the ground's height, so a slug's own
- * height is interpolated from them: the water stays inside the pipe whatever the terrain does
- * underneath it.
+ * The route's points are world metres that already carry the ground's height, so an
+ * arrow's own height is interpolated from them: the train stays on the route whatever the
+ * terrain does underneath it.
  */
 export class PathFlow {
   private readonly mapScene: MapScene
@@ -65,7 +59,6 @@ export class PathFlow {
   private readonly style: PathFlowStyle
   private mesh: AbstractMesh | null = null
   private arc = 0
-  private time = 0
 
   constructor(mapScene: MapScene, points: readonly WorldPoint[], style: PathFlowStyle) {
     this.mapScene = mapScene
@@ -75,14 +68,13 @@ export class PathFlow {
     this.write()
   }
 
-  /** Moves the water along the pipe by `dt` seconds. */
+  /** Moves the arrows along the route by `dt` seconds. */
   advance(dt: number): void {
     this.arc += this.style.speed * dt
-    this.time += dt
     this.write()
   }
 
-  /** Removes the water. */
+  /** Removes the arrows. */
   dispose(): void {
     if (this.mesh !== null) {
       this.mapScene.untrackHeightMesh(this.mesh)
@@ -92,40 +84,34 @@ export class PathFlow {
   }
 
   /**
-   * Rebuilds the train of slugs.
+   * Rebuilds the train of chevrons.
    *
-   * One mesh holding every slug: a family of short ribbons is one draw call, and the length of each
-   * slug is geometry rather than a material setting, so a single mesh can hold slugs of different
-   * lengths — which is what keeps the flow from looking like a conveyor belt.
+   * One mesh holds every chevron, so the whole train is one draw call. The phase is kept
+   * below a single spacing: the train then re-enters at the start as it leaves the end,
+   * which reads as a continuous stream rather than as arrows falling off a cliff.
    */
   private write(): void {
+    const spacing = Math.max(1, this.style.spacingM)
+    const length = this.table.lengthM
+    if (length <= 0) {
+      return
+    }
+    const phase = ((this.arc % spacing) + spacing) % spacing
+    const count = Math.floor((length - phase) / spacing)
     const paths: number[][] = []
-    const spacing = this.style.lengthM * 2
-    for (let index = 0; index < Math.max(1, this.style.slugs); index += 1) {
-      // Evenly spaced through the pipe, each breathing at its own phase.
-      const breath = 1 + Math.sin(this.time * 1.6 + index * 1.7) * BREATH
-      const head = this.arc + index * spacing
-      const length = this.style.lengthM * breath
-      const path: number[] = []
-      for (let step = 0; step <= SLUG_POINTS; step += 1) {
-        const sample = pointAtArc(this.table, head - (length * step) / SLUG_POINTS)
-        if (sample === null) {
-          continue
-        }
-        const from = this.heights[sample.index] ?? 0
-        const to = this.heights[sample.index + 1] ?? from
-        path.push(sample.at.x, from + (to - from) * sample.t + this.style.liftM, sample.at.y)
+    for (let index = 0; index <= count; index += 1) {
+      const sample = pointAtArc(this.table, phase + index * spacing)
+      if (sample === null) {
+        continue
       }
-      if (path.length >= 6) {
-        paths.push(path)
-      }
+      paths.push(this.chevron(sample.at.x, sample.at.y, sample.headingRad, sample.index, sample.t))
     }
     if (paths.length === 0) {
       return
     }
     this.mesh?.dispose()
     this.mesh = CreateGreasedLine(
-      'route-water',
+      'route-arrows',
       { points: paths },
       {
         width: this.style.widthM,
@@ -139,8 +125,32 @@ export class PathFlow {
     this.mesh.renderingGroupId = 3
     if (this.mesh.material !== null) {
       this.mesh.material.alpha = 0.95
-      this.mesh.material.zOffset = -9
+      this.mesh.material.zOffset = -10
     }
     this.mapScene.trackHeightMesh(this.mesh)
+  }
+
+  /** One chevron: two wings swept back from an apex that leads along the route. */
+  private chevron(x: number, y: number, heading: number, index: number, t: number): number[] {
+    const from = this.heights[index] ?? 0
+    const to = this.heights[index + 1] ?? from
+    const height = from + (to - from) * t + this.style.liftM
+    const forwardX = Math.cos(heading)
+    const forwardY = Math.sin(heading)
+    const backX = x - forwardX * this.style.sizeM * Math.cos(WING_ANGLE)
+    const backY = y - forwardY * this.style.sizeM * Math.cos(WING_ANGLE)
+    const sideX = -forwardY * this.style.sizeM * Math.sin(WING_ANGLE)
+    const sideY = forwardX * this.style.sizeM * Math.sin(WING_ANGLE)
+    return [
+      backX + sideX,
+      height,
+      backY + sideY,
+      x,
+      height,
+      y,
+      backX - sideX,
+      height,
+      backY - sideY,
+    ]
   }
 }

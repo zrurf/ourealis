@@ -52,42 +52,53 @@ export {
   type WorldPoint,
 } from './overlayGeometry'
 
-/** Colours of the overlay families, drawn over the terrain in the series palette. */
-const OVERLAY_COLORS: Readonly<Record<OverlayKind, readonly [number, number, number]>> = {
-  // Saturated annotation colours: the surface itself is neutral, so a family is
-  // identified by its colour alone rather than by being darker than a green ramp.
-  regions: [0.87, 0.42, 0.12],
-  connectors: [0.55, 0.28, 0.75],
-  skeleton: [0.38, 0.4, 0.44],
-  prm: [0.05, 0.48, 0.55],
-  // The direction field is drawn by its own class (`render/directionArrows.ts`); this colour
-  // is the one a marker or a legend entry for the family uses.
-  direction: [0.16, 0.45, 0.72],
+/** How one family is drawn: a colour, a line weight, an opacity and a marker size. */
+export interface OverlayStyle {
+  /** Line colour, linear RGB in `[0, 1]` because it becomes a `Color3` unchanged. */
+  colour: readonly [number, number, number]
+  /** Width of the family's lines, metres. */
+  widthM: number
+  /** Opacity, `[0, 1]`. */
+  alpha: number
+  /** Radius of the family's markers, metres; absent when the family draws none. */
+  markerM?: number
 }
 
-/** Width of each family's lines, metres. */
-const OVERLAY_WIDTH_M: Readonly<Record<OverlayKind, number>> = {
-  regions: 0.8,
-  connectors: 1.0,
-  skeleton: 0.3,
-  prm: 0.28,
-  direction: 0.6,
+/**
+ * The drawing of every family, in one table.
+ *
+ * One table rather than three parallel records, because the values are only meaningful
+ * together: an annotation is legible when its colour, its weight and its opacity agree on
+ * how important it is, and separate records let them drift apart.
+ *
+ * The hierarchy is deliberate. Regions and connectors are *content* — they say where a
+ * section is — so they are wide enough to read at a glance. The skeleton and the roadmap
+ * are *scaffolding*: they explain how the map was built, so they stay thin and faint, and
+ * a reader who has not asked about them is not shown them.
+ */
+const OVERLAY_STYLE: Readonly<Record<OverlayKind, OverlayStyle>> = {
+  regions: { colour: [0.78, 0.51, 0.16], widthM: 1.2, alpha: 0.95 },
+  connectors: { colour: [0.48, 0.36, 0.72], widthM: 1.0, alpha: 0.9, markerM: 1.4 },
+  skeleton: { colour: [0.38, 0.4, 0.44], widthM: 0.25, alpha: 0.35 },
+  prm: { colour: [0.05, 0.45, 0.52], widthM: 0.25, alpha: 0.4, markerM: 0.9 },
+  // The direction field is drawn by its own class (`render/directionArrows.ts`); this style
+  // is the one a legend entry for the family uses.
+  direction: { colour: [0.16, 0.45, 0.72], widthM: 0.6, alpha: 0.85 },
 }
 
-/** Opacity of each family: annotations, not obstacles. */
-const OVERLAY_ALPHA: Readonly<Record<OverlayKind, number>> = {
-  regions: 0.95,
-  connectors: 0.9,
-  skeleton: 0.45,
-  prm: 0.5,
-  direction: 0.85,
+/** Size of a connector endpoint disc when a family declares no marker size, metres. */
+const DEFAULT_MARKER_M = 1.4
+
+/** The drawing of one family, for a caller that annotates it — a legend, a control. */
+export function overlayStyle(kind: OverlayKind): OverlayStyle {
+  return OVERLAY_STYLE[kind]
 }
 
-/** Size of a connector endpoint disc, metres. */
-const CONNECTOR_DISC_M = 1.4
-
-/** Radius of a roadmap node dot, metres. */
-const PRM_NODE_M = 0.9
+/** A family's line colour as CSS, for the 2D legend beside the canvas. */
+export function overlayColourCss(kind: OverlayKind): string {
+  const [r, g, b] = OVERLAY_STYLE[kind].colour
+  return `rgb(${Math.round(r * 255)} ${Math.round(g * 255)} ${Math.round(b * 255)})`
+}
 
 /** Every overlay family of one map, keyed by kind. */
 export class OverlaySet {
@@ -127,7 +138,7 @@ export class OverlaySet {
         node.position[2] + OVERLAY_LIFT,
         node.position[1],
       ])
-    this.replace('prm', prmSegments(nodes, edges), markers, PRM_NODE_M)
+    this.replace('prm', prmSegments(nodes, edges), markers, OVERLAY_STYLE.prm.markerM)
   }
 
   /** Shows or hides one family; the geometry stays loaded. */
@@ -164,7 +175,7 @@ export class OverlaySet {
     kind: OverlayKind,
     lines: WorldPoint[][],
     markers: WorldPoint[],
-    markerRadius = CONNECTOR_DISC_M,
+    markerRadius?: number,
   ): void {
     for (const mesh of this.parts.get(kind) ?? []) {
       // The mesh carried its own colour, so its material goes with it; the shared disc
@@ -194,7 +205,7 @@ export class OverlaySet {
       `overlay:${kind}`,
       { points: lines.map((line) => line.flat()) },
       {
-        width: OVERLAY_WIDTH_M[kind],
+        width: OVERLAY_STYLE[kind].widthM,
         color: this.colourOf(kind),
         // Scene units, not pixels: the annotation is a metre-wide band on the ground,
         // which is the whole point of drawing it as a ribbon rather than as a line.
@@ -213,7 +224,7 @@ export class OverlaySet {
       // offset large enough to draw a *buried* line through the surface was what made
       // every annotation look painted on the underside of the terrain.
       mesh.material.zOffset = -1
-      mesh.material.alpha = OVERLAY_ALPHA[kind]
+      mesh.material.alpha = OVERLAY_STYLE[kind].alpha
     }
     // Registered with the height exaggeration so the annotation scales with the ground
     // it describes; a family drawn at the map's own metres would sink into a stretched
@@ -222,9 +233,9 @@ export class OverlaySet {
     return mesh
   }
 
-  /** Colour of one family, from the series palette. */
+  /** Colour of one family. */
   private colourOf(kind: OverlayKind): Color3 {
-    const [r, g, b] = OVERLAY_COLORS[kind]
+    const [r, g, b] = OVERLAY_STYLE[kind].colour
     return new Color3(r, g, b)
   }
 
@@ -235,7 +246,7 @@ export class OverlaySet {
    * metre and a half proud of the surface and, at a campus scale, read as a bigger
    * object than the buildings it was marking.
    */
-  private marker(kind: OverlayKind, point: WorldPoint, radius = CONNECTOR_DISC_M): AbstractMesh {
+  private marker(kind: OverlayKind, point: WorldPoint, radius = DEFAULT_MARKER_M): AbstractMesh {
     const disc = CreateDisc(`overlay:${kind}:marker`, { radius, tessellation: 16 }, this.scene)
     disc.rotation.x = Math.PI / 2
     disc.position = new Vector3(point[0], point[1], point[2])
@@ -252,14 +263,14 @@ export class OverlaySet {
     if (existing !== undefined) {
       return existing
     }
-    const [r, g, b] = OVERLAY_COLORS[kind]
+    const [r, g, b] = OVERLAY_STYLE[kind].colour
     const material = new StandardMaterial(`overlayMaterial:${kind}`, this.scene)
     const color = new Color3(r, g, b)
     material.emissiveColor = color
     material.diffuseColor = color
     material.specularColor = new Color3(0, 0, 0)
     material.disableLighting = true
-    material.alpha = OVERLAY_ALPHA[kind]
+    material.alpha = OVERLAY_STYLE[kind].alpha
     material.zOffset = -1
     this.materials.set(kind, material)
     return material

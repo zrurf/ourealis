@@ -1,16 +1,16 @@
 <script setup lang="ts">
 /*
- * OMF inspector: the structure tree the service reports, the edits it accepts, and
- * a patch applied to the same image.
+ * OMF structure panel: the structure tree the service reports, the edits it accepts,
+ * and a patch applied to the same image.
  *
- * Every parse happens in the service (doc §10.4), so this page never reads the
+ * Every parse happens in the service (doc §10.4), so this panel never reads the
  * format itself: it uploads bytes, renders the tree that comes back, and writes
- * edits as the JSON the edit endpoint takes. The one thing the page owes the user
+ * edits as the JSON the edit endpoint takes. The one thing the panel owes the user
  * is honesty about what a patch can express — the hint under the edit form says so,
  * because a refused edit comes back as `unsupported` with the reason rather than
  * being approximated.
  */
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   Alert as TAlert,
@@ -312,39 +312,22 @@ function clear(): void {
   pasted.value = ''
   notifications.push({ kind: 'info', message: t('omf.source.cleared') })
 }
-
-onBeforeUnmount(() => {
-  // The image stays in the store: the studio reads it from there.
-})
 </script>
 
 <template>
-  <section class="mx-auto max-w-7xl px-8 py-8" data-testid="omf-inspector">
-    <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <h1 class="font-semibold text-ink">{{ t('views.omf.title') }}</h1>
-        <TTag v-if="omf.structure !== null" size="small" variant="light" theme="success">
-          {{
-            t('omf.source.loaded', {
-              name: omf.fileName ?? t('omf.source.unnamed'),
-              size: formatBytes(omf.sourceSize),
-            })
-          }}
-        </TTag>
-      </div>
-      <div class="flex items-center gap-2">
-        <TButton variant="outline" :disabled="omf.sourceBytes === null" @click="download()">
-          {{
-            omf.editedBytes === null ? t('omf.download.original') : t('omf.download.editedFallback')
-          }}
-        </TButton>
-        <TButton variant="outline" :disabled="omf.sourceBytes === null" @click="clear()">
-          {{ t('omf.source.clear') }}
-        </TButton>
-      </div>
+  <div class="flex flex-col gap-6" data-testid="omf-inspector">
+    <div class="flex items-center justify-end gap-2">
+      <TButton variant="outline" :disabled="omf.sourceBytes === null" @click="download()">
+        {{
+          omf.editedBytes === null ? t('omf.download.original') : t('omf.download.editedFallback')
+        }}
+      </TButton>
+      <TButton variant="outline" :disabled="omf.sourceBytes === null" @click="clear()">
+        {{ t('omf.source.clear') }}
+      </TButton>
     </div>
 
-    <TCard class="mt-6" :title="t('omf.source.title')" size="small">
+    <TCard :title="t('omf.source.title')" size="small">
       <div class="grid grid-cols-3 gap-6">
         <div>
           <TButton
@@ -399,7 +382,7 @@ onBeforeUnmount(() => {
     </TCard>
 
     <template v-if="omf.structure !== null">
-      <div class="mt-6 grid grid-cols-3 gap-6">
+      <div class="grid grid-cols-3 gap-6">
         <TCard :title="t('omf.inspector.header')" size="small">
           <dl class="flex flex-col gap-1 text-sm">
             <div v-for="row in headerTable" :key="row.key" class="flex justify-between gap-3">
@@ -442,7 +425,7 @@ onBeforeUnmount(() => {
         </TCard>
       </div>
 
-      <div class="mt-6 grid grid-cols-2 gap-6">
+      <div class="grid grid-cols-2 gap-6">
         <TCard :title="t('omf.inspector.metadata')" size="small">
           <TTable
             :data="omf.structure.metadata"
@@ -514,7 +497,7 @@ onBeforeUnmount(() => {
         </TCard>
       </div>
 
-      <TCard class="mt-6" :title="t('omf.inspector.skeleton')" size="small">
+      <TCard :title="t('omf.inspector.skeleton')" size="small">
         <div class="flex items-center gap-6 text-sm">
           <span class="text-muted">
             {{ t('omf.inspector.skeletonNodes') }}:
@@ -547,7 +530,7 @@ onBeforeUnmount(() => {
         </div>
       </TCard>
 
-      <TCard class="mt-6" :title="t('omf.inspector.layers')" size="small">
+      <TCard :title="t('omf.inspector.layers')" size="small">
         <TTable
           :data="layerRows"
           :columns="[
@@ -573,7 +556,7 @@ onBeforeUnmount(() => {
         </p>
       </TCard>
 
-      <TCard class="mt-6" :title="t('omf.inspector.directory')" size="small">
+      <TCard :title="t('omf.inspector.directory')" size="small">
         <p class="text-sm text-muted">
           {{ t('omf.inspector.directoryTotal', { count: omf.structure.directory.length }) }}
         </p>
@@ -594,7 +577,7 @@ onBeforeUnmount(() => {
         />
       </TCard>
 
-      <TCard class="mt-6" :title="t('omf.edit.title')" size="small">
+      <TCard :title="t('omf.edit.title')" size="small">
         <p class="text-sm text-muted">{{ t('omf.edit.stored') }}</p>
         <p class="mt-1 text-sm text-muted">{{ t('omf.edit.unsupported') }}</p>
 
@@ -729,5 +712,5 @@ onBeforeUnmount(() => {
         </TAlert>
       </TCard>
     </template>
-  </section>
+  </div>
 </template>

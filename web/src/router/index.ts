@@ -6,37 +6,12 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
  * with the views that use them.
  */
 const routes: RouteRecordRaw[] = [
-  { path: '/', name: 'dashboard', component: () => import('@/views/DashboardView.vue') },
+  { path: '/', redirect: '/maps' },
   { path: '/maps', name: 'map-list', component: () => import('@/views/MapListView.vue') },
   { path: '/maps/:id', name: 'map-viewer', component: () => import('@/views/MapViewerView.vue') },
-  {
-    path: '/maps/:id/studio',
-    name: 'map-studio',
-    component: () => import('@/views/MapStudioView.vue'),
-  },
   { path: '/run', name: 'run', component: () => import('@/views/RunView.vue') },
-  {
-    path: '/simulations/:id',
-    name: 'simulation',
-    component: () => import('@/views/SimulationView.vue'),
-  },
-  {
-    path: '/simulations/:id/trajectory',
-    name: 'trajectory',
-    component: () => import('@/views/TrajectoryView.vue'),
-  },
-  {
-    path: '/simulations/:id/sensors',
-    name: 'sensor',
-    component: () => import('@/views/SensorView.vue'),
-  },
-  {
-    path: '/simulations/:id/audit',
-    name: 'audit',
-    component: () => import('@/views/AuditView.vue'),
-  },
-  { path: '/batch', name: 'batch', component: () => import('@/views/BatchView.vue') },
-  { path: '/omf', name: 'omf-inspector', component: () => import('@/views/OmfInspectorView.vue') },
+  { path: '/runs', name: 'runs', component: () => import('@/views/SimulationView.vue') },
+  { path: '/runs/:id', name: 'simulation', component: () => import('@/views/SimulationView.vue') },
   { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
   {
     path: '/:pathMatch(.*)*',

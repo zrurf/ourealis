@@ -1,0 +1,19 @@
+[package]
+name = "ourealis-geo-import"
+description = "Builds OMF maps from public terrain and OpenStreetMap data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ourealis-map-format.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tiff.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+tracing-subscriber.workspace = true

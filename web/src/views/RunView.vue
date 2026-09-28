@@ -22,9 +22,10 @@ import { useRoute, useRouter } from 'vue-router'
 import { Button as TButton, Tag as TTag } from 'tdesign-vue-next'
 import { isApiError } from '@/api/errors'
 import type { ChunkRef } from '@/api/maps'
-import { channelRange } from '@/api/types'
-import { LAYER_ELEVATION, chunkKey, selectLevel } from '@/types/map'
+import { channelRange, type Vec2 } from '@/api/types'
+import { LAYER_ELEVATION, chunkKey, drapeSourceLevel, flagColour, selectLevel } from '@/types/map'
 import { SERIES_PALETTE } from '@/types/colormap'
+import type { RoutePreview } from '@/types/result'
 import { engineFromQuery, probeEngine } from '@/render/engine'
 import { updateDebug } from '@/render/scene'
 import { renderHost, type SceneLease } from '@/render/host'
@@ -37,14 +38,18 @@ import {
   overlayAvailability as familiesAvailable,
   syncOverlays,
 } from '@/render/overlaySync'
-import { buildChunkMesh, chunkGrid } from '@/render/terrainMesh'
+import { buildChunkMesh, chunkGrid, type ChunkMeshData } from '@/render/terrainMesh'
 import { createCellSampler } from '@/render/cellSampler'
+import { LayerOverlay } from '@/render/layers'
+import { drapedMesh, layerTextureData, texelsPerCell } from '@/render/layerTexture'
+import { featureDimensions, layerSurfacePlan } from '@/render/surfaces'
 import { RouteHandles, type HandleRole, type HandleSpec } from '@/render/handles'
 import { pickGround } from '@/render/picking'
 import { createSurfaceSampler, elevationAt } from '@/render/inspect'
 import { drapePath, terracedSampler } from '@/render/drape'
 import { attachGroundPan, metresPerPixelAt } from '@/render/pan'
-import { PathSet } from '@/render/lines'
+import { PathSet, type PathStyle } from '@/render/lines'
+import type { WorldPoint } from '@/render/overlayGeometry'
 import { surfaceKey as buildSurfaceKey, surfaceStyle } from '@/render/surfaceStyle'
 import ScaleBar from '@/components/map/ScaleBar.vue'
 import ViewportControls from '@/components/map/ViewportControls.vue'
@@ -52,6 +57,7 @@ import StageTabs from '@/components/run/StageTabs.vue'
 import StagePanel from '@/components/run/StagePanel.vue'
 import PlanPanel from '@/components/run/PlanPanel.vue'
 import MapMenu from '@/components/run/MapMenu.vue'
+import BatchPanel from '@/components/run/BatchPanel.vue'
 import {
   buildSimulationRequest,
   pointToVec,
@@ -71,6 +77,12 @@ const TARGET_METRES_PER_PIXEL = 2
 /** Height a drawn route is lifted above the ground, metres. */
 const ROUTE_LIFT_M = 0.4
 
+/** Height the ground-material drape is lifted above the terrain, metres. */
+const DRAPE_LIFT_M = 0.05
+
+/** Drapes built before the frame loop is yielded to, so a whole-map drape does not stall. */
+const DRAPE_BATCH = 16
+
 /** Milliseconds a pointer move may be coalesced while dragging a handle. */
 const DRAG_THROTTLE_MS = 40
 
@@ -89,14 +101,22 @@ const maps = useMapsStore()
 const workspace = useWorkspaceStore()
 const simulations = useSimulationsStore()
 const notifications = useNotificationsStore()
-const viewer = useViewerStore()
 const theme = useThemeStore()
+const viewer = useViewerStore()
 
 /** Container the shared canvas is moved into. */
 const host = ref<HTMLDivElement | null>(null)
 const status = ref<'idle' | 'loading' | 'ready' | 'failed'>('idle')
 const failure = ref<string | null>(null)
 const submitting = ref(false)
+/** Which half of the page is open: the single-run workspace or the batch sweep. */
+const mode = ref<'single' | 'batch'>('single')
+
+/** The two halves of the page, with the catalog key of each label. */
+const MODES: ReadonlyArray<{ id: 'single' | 'batch'; labelKey: string }> = [
+  { id: 'single', labelKey: 'run.mode.single' },
+  { id: 'batch', labelKey: 'run.mode.batch' },
+]
 const scaleBarMetres = ref(100)
 const groundResolution = ref(1)
 /** Extent of the map on screen, so a click on the background places nothing. */
@@ -107,6 +127,7 @@ const surfaceRange = ref<{ min: number; max: number } | null>(null)
 let scene: MapScene | null = null
 let lease: SceneLease | null = null
 let terrain: TerrainLayer | null = null
+let drapes: LayerOverlay | null = null
 let overlays: OverlaySet | null = null
 let arrows: DirectionArrows | null = null
 let handles: RouteHandles | null = null
@@ -121,6 +142,21 @@ let lastDragCheckMs = 0
 let pointerFrom: { x: number; y: number; button: number } | null = null
 /** Chunk keys of the loaded surface, so a rebuild does not re-read the service. */
 const terrainChunks = new Set<string>()
+/** Last ground sampler built by {@link surfaceOf}, with the key it was built for. */
+let surfaceSamplerCache: {
+  key: string
+  sampler: (x: number, y: number) => number | null
+} | null = null
+/** Surface geometry per chunk, so the material drape can reuse its own terrain. */
+const terrainData = new Map<string, ChunkMeshData>()
+/**
+ * Token of the newest drape pass.
+ *
+ * A rebuild starts a new pass while the previous one may still be reading its layer; the
+ * old pass would then paint the surface from a chunk cache it captured before those reads,
+ * leaving the drape empty. The token makes a superseded pass stop instead.
+ */
+let drapeGeneration = 0
 /** Overlay families the workspace has already read for this map. */
 const overlayLoaded = createOverlaySync()
 
@@ -204,13 +240,14 @@ const routePoints = computed<Array<{ x: number; y: number }>>(() => {
   return points
 })
 
-/** Colours of the route pipe: the wall, the bore, the water and the crest moving through it. */
-const PIPE_COLOURS = {
-  wall: '#22303c',
-  bore: '#3d6c99',
-  water: '#79c4ee',
-  crest: '#eef8ff',
+/** Colours of the route line: the casing under it, the band, and the arrows inside it. */
+const ROUTE_COLOURS = {
+  light: { casing: '#1a5bbd', band: '#2f80ed', arrow: '#f2f8ff' },
+  dark: { casing: '#173f7a', band: '#4a9eff', arrow: '#eaf4ff' },
 } as const
+
+/** Colour of the draft line joining the handles, before any plan arrives. */
+const DRAFT_COLOUR = '#8a8f98'
 
 /** Palette colour of the candidate at an index, so a row matches its line. */
 function candidateColour(index: number): string {
@@ -218,79 +255,68 @@ function candidateColour(index: number): string {
 }
 
 /**
- * Draws the route: the planned candidates, the smoothed path, and the draft line.
+ * Draws the route: the planner's own choice when the reader looks at another one, the
+ * route line itself, and the draft line joining the handles.
  *
- * All of them are draped on the terrain. A line at a constant height was the reason a
- * route preview was invisible: the surface is 12–23 m up on a campus map, so a line at
- * 1.2 m spent its life inside the hill. The planner's own candidates are drawn because the
- * panel chooses among them — a table of numbers beside a map that shows none of them
- * cannot be compared at a glance.
+ * Everything is draped on the terrain. A line at a constant height was the reason a route
+ * preview was invisible: the surface is 12–23 m up on a campus map, so a line at 1.2 m
+ * spent its life inside the hill.
  */
 function drawRoute(): void {
   const painter = paths
-  const draft = routePoints.value
-  const preview = workspace.plan.preview
   if (painter === null) {
     return
   }
+  const preview = workspace.plan.preview
   const surface = surfaceOf()
-  const styles = []
-  // Everything else first, the chosen one last: the highlight is a band *above* its neighbours,
-  // and drawing order is how that is expressed.
-  for (const [index, candidate] of (preview?.candidates ?? []).entries()) {
-    const inspected = index === workspace.plan.inspected
-    if (!inspected && index !== workspace.plan.chosen) {
-      continue
+  const colours = theme.isDark ? ROUTE_COLOURS.dark : ROUTE_COLOURS.light
+  const styles: PathStyle[] = []
+
+  // The planner's own choice, dim, and only while the reader is looking at another one:
+  // the comparison is the whole reason to draw it.
+  if (preview !== null) {
+    for (const [legIndex, leg] of preview.legs.entries()) {
+      const chosen = leg.chosen
+      if (chosen === (workspace.plan.inspected[legIndex] ?? 0)) {
+        continue
+      }
+      const candidate = leg.candidates[chosen]
+      if (candidate === undefined) {
+        continue
+      }
+      styles.push({
+        points: drapePath(candidate.points, surface, ROUTE_LIFT_M),
+        colour: candidateColour(chosen),
+        widthM: 1.6,
+        alpha: 0.5,
+        zOffset: -4,
+      })
     }
-    if (inspected) {
-      continue
-    }
-    styles.push({
-      points: drapePath(candidate.points, surface, ROUTE_LIFT_M),
-      colour: candidateColour(index),
-      widthM: 2,
-      alpha: 0.5,
-      zOffset: -4,
-    })
   }
-  const smoothed = preview?.path ?? []
-  if (smoothed.length > 1 && workspace.plan.inspected !== workspace.plan.chosen) {
-    styles.push({
-      points: drapePath(smoothed, surface, ROUTE_LIFT_M * 1.2),
-      colour: SERIES_PALETTE[0] ?? '#3f7d4e',
-      widthM: 1.6,
-      alpha: 0.85,
-      zOffset: -5,
-    })
-  }
-  // The selected candidate is a *pipe with water in it*: an outer wall, a bore and the water
-  // inside, with a train of slugs sliding through. Three nested bands of decreasing width say
-  // "pipe" without a shader, and the slugs say which way the water runs — which is the one thing a
-  // static line cannot say about a route.
-  const chosen = preview?.candidates[workspace.plan.inspected]
-  if (chosen !== undefined) {
-    const points = drapePath(chosen.points, surface, ROUTE_LIFT_M * 1.4)
+
+  // The route itself: one blue band with a train of arrows running through it. A casing
+  // sits under the band, because a flat blue on a white model reads as a painted stripe
+  // rather than as a line laid on the ground.
+  const line = routeLine(preview, surface)
+  if (line.length > 1) {
     styles.push(
-      { points, colour: PIPE_COLOURS.wall, widthM: 6.4, alpha: 0.95, zOffset: -6 },
-      { points, colour: PIPE_COLOURS.bore, widthM: 4.6, alpha: 0.92, zOffset: -7 },
-      { points, colour: PIPE_COLOURS.water, widthM: 3.4, alpha: 0.85, zOffset: -8 },
+      { points: line, colour: colours.casing, widthM: 5.6, alpha: 0.9, zOffset: -6 },
       {
-        // The crest inside the water: four slugs of about 24 m sliding through at 10 m/s. They are
-        // narrower than the water they run in, which is what makes the pipe read as a pipe rather
-        // than as a striped band.
-        points,
-        colour: PIPE_COLOURS.crest,
-        widthM: 2.1,
-        alpha: 0.95,
-        zOffset: -9,
-        flow: { slugs: 4, lengthM: 24, widthM: 2.1, speed: 10, colour: PIPE_COLOURS.crest },
+        points: line,
+        colour: colours.band,
+        widthM: 4.2,
+        alpha: 0.96,
+        zOffset: -7,
+        flow: { spacingM: 18, sizeM: 2.6, widthM: 1.3, speed: 12, colour: colours.arrow },
       },
     )
   }
+
+  const draft = routePoints.value
   if (draft.length > 1) {
     styles.push({
       points: drapePath(draft, surface, ROUTE_LIFT_M),
-      colour: SERIES_PALETTE[0] ?? '#3f7d4e',
+      colour: DRAFT_COLOUR,
       widthM: 0.6,
       alpha: 0.7,
       zOffset: -3,
@@ -300,22 +326,65 @@ function drawRoute(): void {
 }
 
 /**
+ * Points of the route on screen: the inspected alternatives when the reader has picked
+ * some, and the planned path otherwise.
+ *
+ * The planned path is the whole route, already joined across the legs and smoothed, so it
+ * is what a preview draws by default. An inspected set is joined here leg by leg, because
+ * one leg's candidates only describe that leg.
+ */
+function routeLine(
+  preview: RoutePreview | null,
+  surface: (x: number, y: number) => number | null,
+): WorldPoint[] {
+  if (preview === null) {
+    return []
+  }
+  const chosen = workspace.chosenCandidates
+  const inspected = workspace.inspectedCandidates
+  if (!inspected.some((candidate, index) => candidate !== chosen[index])) {
+    return drapePath(preview.path, surface, ROUTE_LIFT_M * 1.2)
+  }
+  const points: Vec2[] = []
+  for (const candidate of inspected) {
+    if (candidate === null) {
+      continue
+    }
+    points.push(...candidate.points.slice(points.length === 0 ? 0 : 1))
+  }
+  return drapePath(points, surface, ROUTE_LIFT_M * 1.2)
+}
+
+/**
  * Ground elevation lookup for the workspace.
  *
- * Rebuilt per call rather than cached: a draw happens after a route edit, and the sampler
- * is cheap to build and answers thousands of points once built.
+ * Cached on everything it closes over: a route draw asks for thousands of points in one
+ * pass, and the camera asks for one point every frame. Rebuilding the sampler walks the
+ * level's chunk list, which neither of them should pay for twice for the same surface.
  */
 function surfaceOf(): (x: number, y: number) => number | null {
   const id = mapId.value
   const grid = id === null ? null : maps.gridOf(id, LAYER_ELEVATION)
-  const cells = chunkSize()
   if (grid === null || id === null) {
     return () => null
   }
-  return terracedSampler(
-    createSurfaceSampler(maps.chunks, grid, cells, viewerLevel(), maps.originOf(id)),
-    surfaceStyle(styleInput()).terraceM ?? 0,
+  const terrace = surfaceStyle(styleInput()).terraceM ?? 0
+  const level = viewerLevel()
+  // The store replaces its chunk map on every load rather than adding to the map a sampler
+  // holds, and the camera reads a height every frame, so a sampler built while the surface was
+  // still streaming kept a map the arriving chunks never entered: every point read back as
+  // `null` and the drape fell to the map's base plane. Counting the chunks invalidates that
+  // sampler on each arrival.
+  const key = `${id}:${level}:${terrace}:${maps.loadedChunkCount}`
+  if (surfaceSamplerCache !== null && surfaceSamplerCache.key === key) {
+    return surfaceSamplerCache.sampler
+  }
+  const sampler = terracedSampler(
+    createSurfaceSampler(maps.chunks, grid, chunkSize(), level, maps.originOf(id)),
+    terrace,
   )
+  surfaceSamplerCache = { key, sampler }
+  return sampler
 }
 
 /** Frames the map and loads the surface for a map. */
@@ -378,18 +447,35 @@ function rebuildSurface(): void {
     level,
     layerId: LAYER_ELEVATION,
   })
+  // Second channel of the elevation layer: `null` on a map built without a building mask, in
+  // which case the surface simply keeps the ramp.
+  const building = createCellSampler({
+    chunks: maps.chunks,
+    grid,
+    chunkSize: cells,
+    level,
+    layerId: LAYER_ELEVATION,
+    channel: 1,
+  })
   const style = surfaceStyle(styleInput())
   current.clear()
+  terrainData.clear()
   for (const key of terrainChunks) {
     if (maps.chunkOf(key) === null) {
       continue
     }
     const chunkId = Number(key.split('/')[2])
-    current.setChunk(
-      key,
-      buildChunkMesh(chunkGrid(grid, cells, level, chunkId, origin), sample, style),
-    )
+    const data = buildChunkMesh(chunkGrid(grid, cells, level, chunkId, origin), sample, {
+      ...style,
+      building,
+    })
+    terrainData.set(key, data)
+    current.setChunk(key, data)
   }
+  // The drape rides on the surface's own vertices, so it is rebuilt with the surface it
+  // covers rather than kept across a geometry change.
+  drapes?.clear()
+  void streamDrapes()
   drawRoute()
 }
 
@@ -397,7 +483,6 @@ function rebuildSurface(): void {
 function styleInput() {
   return {
     range: surfaceRange.value,
-    dark: theme.isDark,
     terraceM: viewer.terraceStepM,
     sunAzimuthDeg: viewer.sunAzimuthDeg,
   }
@@ -421,11 +506,7 @@ async function applyOverlays(): Promise<void> {
     surface: () => surfaceOf(),
     chunks: () => maps.chunks,
     gridOf: (layerId) => (mapId.value === null ? null : maps.gridOf(mapId.value, layerId)),
-    ensureGrid: async (layerId) => {
-      if (mapId.value !== null && maps.gridOf(mapId.value, layerId) === null) {
-        await maps.loadGrid(mapId.value, layerId)
-      }
-    },
+    ensureGrid,
     refsInArea: (layerId, level, area) =>
       mapId.value === null
         ? []
@@ -441,6 +522,125 @@ async function applyOverlays(): Promise<void> {
 /** Cells per chunk side of the open map. */
 function chunkSize(): number {
   return mapId.value === null ? 0 : (maps.metadataOf(mapId.value)?.summary.chunk_size ?? 0)
+}
+
+/** Reads a layer's chunk grid once, so a later pass finds it cached. */
+async function ensureGrid(layerId: number): Promise<void> {
+  const id = mapId.value
+  if (id !== null && maps.gridOf(id, layerId) === null) {
+    await maps.loadGrid(id, layerId)
+  }
+}
+
+/** Resolves on the next animation frame, so the renderer draws between drape batches. */
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()))
+}
+
+/**
+ * The map's ground-material layer: the one the feature schema names `surface_type`.
+ *
+ * A map that carries no such dimension has no materials to paint, and the workspace then
+ * draws the bare surface — which is the honest result, rather than a guess at which layer
+ * the reader meant.
+ */
+function surfaceLayerId(): number | null {
+  const info = mapId.value === null ? null : maps.metadataOf(mapId.value)
+  if (info === null) {
+    return null
+  }
+  return featureDimensions(info.feature_schema).find((entry) => entry.name === 'surface_type')
+    ?.layerId ?? null
+}
+
+/** How one layer's cells are textured, from the map's own feature schema. */
+function surfacePlanFor(layerId: number) {
+  const info = mapId.value === null ? null : maps.metadataOf(mapId.value)
+  const kind = info?.layers.find((layer) => layer.layer_id === layerId)?.kind ?? 'raster'
+  return layerSurfacePlan(layerId, kind, featureDimensions(info?.feature_schema ?? null))
+}
+
+/**
+ * Paints the map's ground materials over the surface.
+ *
+ * The workspace has no layer switches — it plans a route rather than reading a field — so the
+ * one layer it always drapes is the map's own `surface_type`: a route is judged against what
+ * the ground is made of, and without the drape the map is a bare grey sheet.
+ *
+ * The drape covers every terrain chunk this view has built, not only the part in shot: the
+ * surface is rebuilt whenever a style parameter changes, and a drape that covered only the
+ * visible part would come and go as the camera moved. The batches yield to the frame loop so
+ * that building them does not stall the renderer.
+ */
+async function streamDrapes(): Promise<void> {
+  const manager = drapes
+  const id = mapId.value
+  const layerId = surfaceLayerId()
+  const elevationGrid = id === null ? null : maps.gridOf(id, LAYER_ELEVATION)
+  if (manager === null || id === null || layerId === null || elevationGrid === null) {
+    return
+  }
+  const generation = ++drapeGeneration
+  const live = (): boolean => generation === drapeGeneration && !disposed
+  await ensureGrid(layerId)
+  if (!live()) {
+    return
+  }
+  const layerGrid = maps.gridOf(id, layerId)
+  const level = viewerLevel()
+  const sourceLevel = layerGrid === null ? null : drapeSourceLevel(layerGrid, level)
+  if (layerGrid === null || sourceLevel === null) {
+    return
+  }
+  // The layer stores its cells at its own level, which is not necessarily the level the
+  // surface is drawn at; they are read at the level this drape samples from.
+  const refs: ChunkRef[] = (layerGrid.chunks[sourceLevel] ?? []).map((chunkId) => ({
+    mapId: id,
+    layerId,
+    level: sourceLevel,
+    chunkId,
+  }))
+  await maps.loadChunks(refs, { concurrency: 4 })
+  if (!live()) {
+    return
+  }
+  const cells = chunkSize()
+  const origin = maps.originOf(id)
+  const sample = createCellSampler({
+    chunks: maps.chunks,
+    grid: layerGrid,
+    chunkSize: cells,
+    level,
+    layerId,
+    sourceLevel,
+  })
+  const plan = surfacePlanFor(layerId)
+  let built = 0
+  for (const [key, mesh] of terrainData) {
+    if (!live()) {
+      return
+    }
+    manager.setChunk(
+      `${layerId}:${level}:${key}`,
+      layerTextureData(
+        chunkGrid(elevationGrid, cells, level, Number(key.split('/')[2]), origin),
+        sample,
+        {
+          mapping: 'material',
+          emptyAlpha: 0,
+          flag: flagColour(layerId),
+          surface: plan,
+          texelsPerCell: texelsPerCell(plan),
+        },
+      ),
+      drapedMesh(mesh, DRAPE_LIFT_M),
+    )
+    built += 1
+    if (built % DRAPE_BATCH === 0) {
+      // oxlint-disable-next-line no-await-in-loop
+      await nextFrame()
+    }
+  }
 }
 
 /** Applies the camera half of the viewport parameters to the live camera. */
@@ -497,24 +697,33 @@ async function startScene(): Promise<void> {
     return
   }
   const probe = await probeEngine({ forced: engineFromQuery() })
+  if (disposed || mode.value !== 'single') {
+    return
+  }
   if (probe.backend === null) {
     failure.value = t('map.viewer.engineFailed')
     status.value = 'failed'
     return
   }
   const borrowing = await renderHost().acquire(container, probe.backend)
-  if (disposed) {
+  if (disposed || mode.value !== 'single') {
+    // The workspace went away while the engine was starting: giving the lease straight
+    // back parks the canvas rather than leaving a render loop on a canvas nobody sees.
     borrowing.release()
     return
   }
   lease = borrowing
   scene = borrowing.scene
   terrain = new TerrainLayer(scene.scene, scene)
+  drapes = new LayerOverlay(scene.scene, scene)
   overlays = new OverlaySet(scene)
   arrows = new DirectionArrows(scene)
   handles = new RouteHandles(scene.scene, scene)
   paths = new PathSet(scene)
   updateDebug({ engine: probe.backend, mapId: mapId.value, frames: 0, loaded: false, error: null })
+  // The camera target rides the ground, so a close view does not sink under a campus that
+  // stands hundreds of metres above the map's zero plane.
+  scene.setGroundHeight((x, z) => surfaceOf()(x, z))
 
   // Which gesture a pointer sequence is: dragging the handle it started on, or a click
   // on the ground that places the next point.
@@ -558,9 +767,9 @@ async function startScene(): Promise<void> {
     pointerFrom = null
     if (dragging !== null) {
       dragging = null
-      // The route-wide check resumes with the plan, which the release schedules.
+      // The route-wide point check resumes now that the drag is over.
       workspace.setDragging(false)
-      workspace.schedulePlan()
+      workspace.scheduleCheck()
       return
     }
     if (current === null || from === null) {
@@ -920,6 +1129,14 @@ watch(
   },
 )
 
+/** Redraws the route line when the appearance change moves its colours. */
+watch(
+  () => theme.isDark,
+  () => {
+    drawRoute()
+  },
+)
+
 /** Brings the overlays in line when a switch flips. */
 watch(
   () => ({ ...viewer.overlays }),
@@ -951,120 +1168,173 @@ watch(
   () => applyViewport(),
 )
 
-onBeforeUnmount(() => {
-  disposed = true
+/** Tears the workspace down and returns the shared canvas to the host. */
+function stopScene(): void {
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('pointerdown', onMenuDismiss)
   detachPan?.()
   detachPan = null
+  dragging = null
   paths?.dispose()
+  paths = null
   handles?.dispose()
+  handles = null
   overlays?.dispose()
+  overlays = null
   arrows?.dispose()
+  arrows = null
+  drapes?.dispose()
+  drapes = null
+  // A drape pass still reading its layer must not resume onto the overlay just disposed.
+  drapeGeneration += 1
   terrain?.dispose()
+  terrain = null
   lease?.release()
   lease = null
   scene = null
   terrainChunks.clear()
+  terrainData.clear()
   maps.clearChunks()
   updateDebug({ mapId: null, loaded: false, error: null })
+}
+
+onBeforeUnmount(() => {
+  disposed = true
+  stopScene()
+})
+
+/** Builds the scene while the workspace is open, and tears it down when the sweep is. */
+watch(mode, async (value) => {
+  if (value === 'single') {
+    await nextTick()
+    await startScene()
+  } else {
+    stopScene()
+  }
 })
 </script>
 
 <template>
-  <section class="flex h-[calc(100vh-3.5rem)] min-h-0" data-testid="run-workspace">
-    <div class="flex min-w-0 flex-1 flex-col">
-      <div class="relative flex min-h-0 flex-1 flex-col">
-        <div
-          ref="host"
-          class="block h-full w-full focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand"
-          style="touch-action: none"
-          tabindex="0"
-          :aria-label="t('run.canvasLabel')"
-          data-testid="map-canvas"
-          @contextmenu.prevent="openMenu($event)"
-        />
-        <MapMenu
-          v-if="menu !== null"
-          :at="{ x: menu.x, y: menu.y }"
-          :handle="
-            menu.handle === null ? null : { role: menu.handle.role, index: menu.handle.index }
-          "
-          :has-start="pointToVec(workspace.draft.start) !== null"
-          :has-goal="pointToVec(workspace.draft.goal) !== null"
-          @close="menu = null"
-          @place="menuPlace"
-          @semantics="menuSemantics"
-        />
-        <p class="sr-only" aria-live="polite" data-testid="handle-selection">
-          {{ selectionText }}
-        </p>
-        <p v-if="status === 'loading'" class="absolute left-4 top-4 text-sm text-muted">
-          {{ t('common.loading') }}
-        </p>
-        <span v-else-if="status === 'ready'" class="sr-only" data-testid="run-ready">
-          {{ t('run.ready') }}
-        </span>
-        <p v-if="failure !== null" class="absolute left-4 top-4 text-sm text-danger">
-          {{ failure }}
-        </p>
-
-        <!-- The same viewport rail the preview carries, because it is the same engine and the
-             same surface: floating over the corner of the canvas, out of the map's way. -->
-        <div class="pointer-events-none absolute left-3 top-12">
-          <ViewportControls
-            :range="surfaceRange"
-            :overlays="overlayAvailability"
-            @recentre="recentre()"
-          />
-        </div>
-
-        <div class="pointer-events-none absolute bottom-4 left-4">
-          <ScaleBar :metres="scaleBarMetres" :metres-per-pixel="groundResolution" />
-        </div>
-      </div>
+  <section class="flex h-[calc(100vh-3.5rem)] min-h-0 flex-col" data-testid="run-workspace">
+    <div
+      class="flex items-center gap-2 border-b border-line px-4 py-1.5"
+      role="tablist"
+      :aria-label="t('views.run.title')"
+    >
+      <button
+        v-for="entry in MODES"
+        :key="entry.id"
+        type="button"
+        role="tab"
+        class="rounded-control px-2 py-1 text-sm transition-colors"
+        :class="mode === entry.id ? 'bg-surface font-medium text-ink' : 'text-muted hover:text-ink'"
+        :aria-selected="mode === entry.id"
+        :data-testid="`run-mode-${entry.id}`"
+        @click="mode = entry.id"
+      >
+        {{ t(entry.labelKey) }}
+      </button>
     </div>
 
-    <aside
-      class="@container flex w-[26rem] shrink-0 flex-col gap-4 overflow-y-auto border-l border-line bg-surface px-4 py-4"
-    >
-      <header class="flex items-center justify-between gap-2">
-        <h1 class="font-semibold text-ink">{{ t('views.run.title') }}</h1>
-        <div class="flex items-center gap-2">
-          <TTag size="small" variant="light">{{ t(`run.mode.${workspace.mode}`) }}</TTag>
+    <div v-if="mode === 'single'" class="flex min-h-0 flex-1">
+      <div class="flex min-w-0 flex-1 flex-col">
+        <div class="relative flex min-h-0 flex-1 flex-col">
+          <div
+            ref="host"
+            class="block h-full w-full focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand"
+            style="touch-action: none"
+            tabindex="0"
+            :aria-label="t('run.canvasLabel')"
+            data-testid="map-canvas"
+            @contextmenu.prevent="openMenu($event)"
+          />
+          <MapMenu
+            v-if="menu !== null"
+            :at="{ x: menu.x, y: menu.y }"
+            :handle="
+              menu.handle === null ? null : { role: menu.handle.role, index: menu.handle.index }
+            "
+            :has-start="pointToVec(workspace.draft.start) !== null"
+            :has-goal="pointToVec(workspace.draft.goal) !== null"
+            @close="menu = null"
+            @place="menuPlace"
+            @semantics="menuSemantics"
+          />
+          <p class="sr-only" aria-live="polite" data-testid="handle-selection">
+            {{ selectionText }}
+          </p>
+          <p v-if="status === 'loading'" class="absolute left-4 top-4 text-sm text-muted">
+            {{ t('common.loading') }}
+          </p>
+          <span v-else-if="status === 'ready'" class="sr-only" data-testid="run-ready">
+            {{ t('run.ready') }}
+          </span>
+          <p v-if="failure !== null" class="absolute left-4 top-4 text-sm text-danger">
+            {{ failure }}
+          </p>
+
+          <!-- The same viewport rail the preview carries, because it is the same engine and the
+             same surface: floating over the corner of the canvas, out of the map's way. -->
+          <div class="pointer-events-none absolute left-3 top-12">
+            <ViewportControls
+              :range="surfaceRange"
+              :overlays="overlayAvailability"
+              @recentre="recentre()"
+            />
+          </div>
+
+          <div class="pointer-events-none absolute bottom-4 left-4">
+            <ScaleBar :metres="scaleBarMetres" :metres-per-pixel="groundResolution" />
+          </div>
+        </div>
+      </div>
+
+      <aside
+        class="@container flex w-[26rem] shrink-0 flex-col gap-4 overflow-y-auto border-l border-line bg-surface px-4 py-4"
+      >
+        <header class="flex items-center justify-between gap-2">
+          <h1 class="font-semibold text-ink">{{ t('views.run.title') }}</h1>
+          <div class="flex items-center gap-2">
+            <TTag size="small" variant="light">{{ t(`run.mode.${workspace.mode}`) }}</TTag>
+            <TButton
+              size="small"
+              variant="text"
+              data-testid="mode-toggle"
+              @click="workspace.setMode(workspace.mode === 'simple' ? 'expert' : 'simple')"
+            >
+              {{ workspace.mode === 'simple' ? t('run.mode.expert') : t('run.mode.simple') }}
+            </TButton>
+          </div>
+        </header>
+
+        <!-- The stages are the panel's tab bar: one row where a left column used to say the
+           same five words and take a fifth of the map's width to do it. -->
+        <StageTabs />
+
+        <StagePanel />
+
+        <PlanPanel v-if="workspace.stage === 'route'" />
+
+        <div class="mt-auto flex items-center gap-2 pt-2">
           <TButton
-            size="small"
-            variant="text"
-            data-testid="mode-toggle"
-            @click="workspace.setMode(workspace.mode === 'simple' ? 'expert' : 'simple')"
+            theme="primary"
+            :loading="submitting"
+            :disabled="!workspace.runnable"
+            data-testid="run-submit"
+            @click="submit()"
           >
-            {{ workspace.mode === 'simple' ? t('run.mode.expert') : t('run.mode.simple') }}
+            {{ t('run.submit') }}
+          </TButton>
+          <TButton variant="outline" data-testid="run-reset" @click="workspace.reset()">
+            {{ t('common.refresh') }}
           </TButton>
         </div>
-      </header>
+      </aside>
+    </div>
 
-      <!-- The stages are the panel's tab bar: one row where a left column used to say the
-           same five words and take a fifth of the map's width to do it. -->
-      <StageTabs />
-
-      <StagePanel />
-
-      <PlanPanel v-if="workspace.stage === 'route'" />
-
-      <div class="mt-auto flex items-center gap-2 pt-2">
-        <TButton
-          theme="primary"
-          :loading="submitting"
-          :disabled="!workspace.runnable"
-          data-testid="run-submit"
-          @click="submit()"
-        >
-          {{ t('run.submit') }}
-        </TButton>
-        <TButton variant="outline" data-testid="run-reset" @click="workspace.reset()">
-          {{ t('common.refresh') }}
-        </TButton>
-      </div>
-    </aside>
+    <div v-else class="mx-auto w-full max-w-7xl flex-1 overflow-y-auto px-8 py-8">
+      <h1 class="font-semibold text-ink">{{ t('views.run.title') }}</h1>
+      <BatchPanel class="mt-6" />
+    </div>
   </section>
 </template>

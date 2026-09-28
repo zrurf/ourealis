@@ -25,7 +25,7 @@ test.describe('store monkey', () => {
     const theme = useThemeStore()
     const locale = useLocaleStore()
     const random = mulberry32(0x5eed_1234)
-    const dashboardTitles = new Set<string>()
+    const navTitles = new Set<string>()
 
     for (let step = 0; step < 500; step += 1) {
       const action = random()
@@ -45,13 +45,13 @@ test.describe('store monkey', () => {
       expect(SUPPORTED_LOCALES).toContain(locale.locale)
       expect(i18n.global.locale.value).toBe(locale.locale)
 
-      const title = i18n.global.t('nav.dashboard')
+      const title = i18n.global.t('nav.maps')
       expect(title.trim()).not.toBe('')
-      dashboardTitles.add(title)
+      navTitles.add(title)
     }
 
     // Both catalogs answered over the run, which means the locale switch reached the composer.
-    expect(dashboardTitles.size).toBe(2)
+    expect(navTitles.size).toBe(2)
   })
 
   test('language options follow the active locale', async () => {

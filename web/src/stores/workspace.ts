@@ -6,10 +6,16 @@
  * plan away. So there is one draft here, and every stage of the workspace edits it —
  * a route built with the pointer is the same object the runner submits.
  *
- * Planning is automatic: as soon as the draft has a route, a preview is requested,
- * debounced and cancellable, and its candidate set is kept until the route changes.
- * The alternative — a button per planning stage — made the user choose between two
- * internals ("preview" and "plan") rather than between two outcomes.
+ * Planning is a button, not a side effect of editing. A route search is the expensive
+ * thing this workspace does, and a reader who is still moving points does not want one
+ * per keystroke; asking for a plan is therefore an explicit act, and an edit only
+ * invalidates the answer on screen. What *is* automatic is the point check: whether the
+ * map accepts each end of the route is a cheap query, and a route point sitting on a wall
+ * should say so whether or not anyone has pressed the button.
+ *
+ * The two halves of planning are keyed separately. The candidate search is keyed on the
+ * route's shape, the smoothed path and its speed limits on the shape *and* the smoothing
+ * setting, and the profile is only asked for once the plan has been requested.
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
@@ -17,7 +23,7 @@ import { useMapsStore } from '@/stores/maps'
 import { isApiError } from '@/api/errors'
 import { planRoute, previewRoutes } from '@/api/routes'
 import { checkFeasibility } from '@/api/maps'
-import type { RoutePreview } from '@/types/result'
+import type { RoutePreview, RoutePreviewCandidate } from '@/types/result'
 import {
   buildSimulationRequest,
   defaultFormState,
@@ -45,16 +51,21 @@ export interface PlanState {
   durationMs: number | null
   /** The candidate set of the current route, or `null` while there is none. */
   preview: RoutePreview | null
-  /** Index the service chose by its own Logit draw; the run takes this one. */
-  chosen: number
   /**
-   * Index the user is looking at.
+   * Index the service chose for each leg; the run takes these.
+   *
+   * One entry per leg: a route with waypoints is planned leg by leg, and each leg draws
+   * its own Logit sample.
+   */
+  chosen: number[]
+  /**
+   * Index the user is looking at, per leg.
    *
    * Separate from `chosen` on purpose: the service decides which candidate a run takes
    * from the route and the seed, so a reader who wants a different path changes those,
    * not a row in a table. Selecting a row only changes what is drawn.
    */
-  inspected: number
+  inspected: number[]
   /** Failure of the last attempt, already translated. */
   error: string | null
   /** Whether the last answer included the smoothed path and its speed limits. */
@@ -71,8 +82,11 @@ export interface PointVerdict {
   distanceM: number | null
 }
 
-/** Milliseconds a route change is coalesced before it is planned. */
-const PLAN_DEBOUNCE_MS = 250
+/** Milliseconds a route change is coalesced before its points are re-checked. */
+const CHECK_DEBOUNCE_MS = 250
+
+/** Milliseconds of quiet after a plan before its speed profile is asked for. */
+const PROFILE_IDLE_MS = 1_200
 
 /** Local storage key of the interface mode. */
 const MODE_KEY = 'ourealis.mode'
@@ -111,8 +125,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     busy: false,
     durationMs: null,
     preview: null,
-    chosen: 0,
-    inspected: 0,
+    chosen: [],
+    inspected: [],
     error: null,
     withProfile: false,
   })
@@ -135,7 +149,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
    */
   const dragging = ref(false)
 
-  let planTimer: ReturnType<typeof setTimeout> | null = null
+  let checkTimer: ReturnType<typeof setTimeout> | null = null
+  let profileTimer: ReturnType<typeof setTimeout> | null = null
   let planGeneration = 0
 
   /** Validation issues of the draft as it stands. */
@@ -172,8 +187,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     routePoints.value.filter((point) => pointChecks.value[point.key]?.legal === false),
   )
 
-  /** A hash of everything the plan depends on, so a redundant replan is skipped. */
-  const planKey = computed(() =>
+  /**
+   * A hash of everything the route's shape depends on.
+   *
+   * The person parameters are in it because they weight the graph the candidates are
+   * searched on, so they can move the route. The smoothing setting is not: it acts after
+   * the search and belongs to {@link profileKey}.
+   */
+  const geometryKey = computed(() =>
     JSON.stringify([
       mapId.value,
       draft.value.mode,
@@ -185,27 +206,45 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       draft.value.checkpoints,
       draft.value.preset,
       draft.value.overrides,
-      draft.value.smooth,
     ]),
   )
-  let plannedKey = ''
 
-  /** The candidate the planner would take, or `null` while there is none. */
-  const chosenCandidate = computed(() => {
+  /**
+   * A hash of everything the smoothed path and its speed limits depend on.
+   *
+   * A superset of {@link geometryKey}: the profile is derived from the route, so a new
+   * route always needs a new profile.
+   */
+  const profileKey = computed(() => JSON.stringify([geometryKey.value, draft.value.smooth]))
+
+  /** The geometry an answer on screen was computed for. */
+  let plannedKey = ''
+  /** The profile an answer on screen carries, or `''` while it carries none. */
+  let profiledKey = ''
+
+  /** The candidate the planner would take on each leg. */
+  const chosenCandidates = computed<(RoutePreviewCandidate | null)[]>(() => {
     const preview = plan.value.preview
     if (preview === null) {
-      return null
+      return []
     }
-    return preview.candidates[plan.value.chosen] ?? preview.candidates[0] ?? null
+    return preview.legs.map(
+      (leg, legIndex) =>
+        leg.candidates[plan.value.chosen[legIndex] ?? 0] ?? leg.candidates[0] ?? null,
+    )
   })
 
-  /** The candidate the reader is looking at. */
-  const inspectedCandidate = computed(() => {
+  /** The candidate the reader is looking at, per leg. */
+  const inspectedCandidates = computed<(RoutePreviewCandidate | null)[]>(() => {
     const preview = plan.value.preview
     if (preview === null) {
-      return null
+      return []
     }
-    return preview.candidates[plan.value.inspected] ?? chosenCandidate.value
+    const chosen = chosenCandidates.value
+    return preview.legs.map(
+      (leg, legIndex) =>
+        leg.candidates[plan.value.inspected[legIndex] ?? 0] ?? chosen[legIndex] ?? null,
+    )
   })
 
   /** What the summary strip shows. */
@@ -219,7 +258,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       straightLineM: preview.straight_line_m,
       pathRatio: preview.straight_line_m > 0 ? preview.length_m / preview.straight_line_m : 1,
       durationS: durationOf(preview),
-      candidates: preview.candidates.length,
+      candidates: preview.legs.reduce((total, leg) => total + leg.candidates.length, 0),
     }
   })
 
@@ -236,7 +275,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   /** Replaces the draft, e.g. from a form component's two-way binding. */
   function setDraft(next: SimulationFormState): void {
     draft.value = next
-    schedulePlan()
+    scheduleCheck()
   }
 
   /** Applies a patch to the draft. */
@@ -345,7 +384,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     recipe.value = id
     draft.value = next.state
     stage.value = 'route'
-    schedulePlan()
+    scheduleCheck()
   }
 
   /** Switches between the two levels of detail, remembering the choice. */
@@ -363,37 +402,46 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       busy: false,
       durationMs: null,
       preview: null,
-      chosen: 0,
-      inspected: 0,
+      chosen: [],
+      inspected: [],
       error: null,
       withProfile: false,
     }
     plannedKey = ''
+    profiledKey = ''
   }
 
-  /** Cancels any planning in flight and clears the debounce. */
+  /** Cancels any planning in flight and clears both debounces. */
   function cancelPlan(): void {
-    if (planTimer !== null) {
-      clearTimeout(planTimer)
-      planTimer = null
+    if (checkTimer !== null) {
+      clearTimeout(checkTimer)
+      checkTimer = null
+    }
+    if (profileTimer !== null) {
+      clearTimeout(profileTimer)
+      profileTimer = null
     }
     // Bumping the generation makes any answer still in flight a no-op.
     planGeneration += 1
     plan.value = { ...plan.value, busy: false }
   }
 
-  /** Schedules a plan of the current draft, coalescing a burst of edits. */
-  function schedulePlan(): void {
-    if (planTimer !== null) {
-      clearTimeout(planTimer)
+  /** Schedules a point check of the current draft, coalescing a burst of edits. */
+  function scheduleCheck(): void {
+    if (checkTimer !== null) {
+      clearTimeout(checkTimer)
     }
-    planTimer = setTimeout(() => {
-      planTimer = null
+    // A profile still waiting to be asked for describes the route being replaced.
+    if (profileTimer !== null) {
+      clearTimeout(profileTimer)
+      profileTimer = null
+    }
+    checkTimer = setTimeout(() => {
+      checkTimer = null
       if (!dragging.value) {
         void checkRoutePoints()
       }
-      void planNow()
-    }, PLAN_DEBOUNCE_MS)
+    }, CHECK_DEBOUNCE_MS)
   }
 
   /**
@@ -475,27 +523,32 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   /**
    * Plans the draft, replacing the previous answer.
    *
+   * This is the workspace's plan action and it is only ever called for the button, so a
+   * reader who is still editing pays for one search per press rather than one per edit.
    * A draft with no complete route clears the answer instead of failing: an empty form
    * is not an error, and the previous route's candidates would be a lie about what is
    * on screen.
    */
   async function planNow(): Promise<void> {
-    const key = planKey.value
+    const key = geometryKey.value
     const routeIssue = validateForm(draft.value).some((issue) => issue.field !== 'name')
     if (routeIssue || mapId.value === null) {
       plan.value = {
         busy: false,
         durationMs: null,
         preview: null,
-        chosen: 0,
-        inspected: 0,
+        chosen: [],
+        inspected: [],
         error: null,
         withProfile: false,
       }
       plannedKey = ''
+      profiledKey = ''
       return
     }
     if (key === plannedKey && plan.value.preview !== null) {
+      // The shape is on screen already; only a profile-level setting can still be owed.
+      scheduleProfile()
       return
     }
     const generation = ++planGeneration
@@ -509,16 +562,17 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         return
       }
       plannedKey = key
+      const chosen = preview.legs.map((leg) => leg.chosen)
       plan.value = {
         busy: false,
         durationMs: preview.planning_ms,
         preview,
-        chosen: preview.chosen,
-        inspected: preview.chosen,
+        chosen,
+        inspected: [...chosen],
         error: null,
         withProfile: false,
       }
-      void loadProfile(generation)
+      scheduleProfile()
     } catch (error) {
       if (generation !== planGeneration) {
         return
@@ -527,13 +581,32 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         busy: false,
         durationMs: null,
         preview: null,
-        chosen: 0,
-        inspected: 0,
+        chosen: [],
+        inspected: [],
         error: isApiError(error) ? error.message : String(error),
         withProfile: false,
       }
       plannedKey = ''
+      profiledKey = ''
     }
+  }
+
+  /**
+   * Asks for the speed profile once the plan has settled.
+   *
+   * The profile is the second half of one press of the plan button, not a second button:
+   * the candidate search answers first and the route is drawn, then the smoothed path and
+   * its speed limits follow. Waiting for a moment of quiet means an immediate second press
+   * takes the pending request with it instead of leaving two profiles in flight.
+   */
+  function scheduleProfile(): void {
+    if (profileTimer !== null) {
+      clearTimeout(profileTimer)
+    }
+    profileTimer = setTimeout(() => {
+      profileTimer = null
+      void loadProfile(planGeneration)
+    }, PROFILE_IDLE_MS)
   }
 
   /**
@@ -543,12 +616,17 @@ export const useWorkspaceStore = defineStore('workspace', () => {
    * candidate search, and the map is usable — the route is drawn — while it runs.
    */
   async function loadProfile(generation: number): Promise<void> {
+    const key = profileKey.value
+    if (key === profiledKey || plan.value.preview === null) {
+      return
+    }
     try {
       const request = buildSimulationRequest(draft.value)
       const planned = await planRoute(request)
       if (generation !== planGeneration) {
         return
       }
+      profiledKey = key
       const preview = plan.value.preview
       plan.value = {
         ...plan.value,
@@ -561,9 +639,16 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
   }
 
-  /** Changes which candidate is drawn; the planner's own choice is untouched. */
-  function inspectCandidate(index: number): void {
-    plan.value = { ...plan.value, inspected: index }
+  /**
+   * Changes which candidate a leg draws; the planner's own choice is untouched.
+   *
+   * Per leg rather than per route: the candidate tables belong to the legs, and a reader
+   * comparing two alternatives of one leg should not change the other legs' lines.
+   */
+  function inspectCandidate(legIndex: number, candidateIndex: number): void {
+    const inspected = [...plan.value.inspected]
+    inspected[legIndex] = candidateIndex
+    plan.value = { ...plan.value, inspected }
   }
 
   /** Arms the pointer to place one field, or disarms it when given the same one. */
@@ -593,9 +678,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     issues,
     runnable,
     mapId,
-    planKey,
-    chosenCandidate,
-    inspectedCandidate,
+    geometryKey,
+    profileKey,
+    chosenCandidates,
+    inspectedCandidates,
     pointChecks,
     routePoints,
     illegalPoints,
@@ -616,7 +702,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     setMode,
     reset,
     cancelPlan,
-    schedulePlan,
+    scheduleCheck,
     planNow,
     inspectCandidate,
     arm,

@@ -3,16 +3,15 @@
  * Sensors: the recorded channels, the GNSS error cloud, the map-plane track, a
  * spectrum and the exports.
  *
- * The page reads the pages the store cached and never the network twice: the
+ * The panel reads the pages the store cached and never the network twice: the
  * charts draw a downsampled view of a channel while the export asks the service
  * for the file, so a 200 Hz inertial stream neither blocks the render nor has to
  * fit in a chart. The spectrum is computed in the browser from the accelerometer
  * channel — the service's own spectral summary lives in the metrics report and is
- * rendered by the audit page.
+ * rendered by the audit panel.
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRoute, useRouter } from 'vue-router'
 import {
   Alert as TAlert,
   Button as TButton,
@@ -41,9 +40,9 @@ type Channel = (typeof CHANNELS)[number]
 /** Samples a spectrum is computed from. */
 const SPECTRUM_SAMPLES = 2_048
 
+const props = defineProps<{ jobId: string }>()
+
 const { t, locale } = useI18n({ useScope: 'global' })
-const route = useRoute()
-const router = useRouter()
 const simulations = useSimulationsStore()
 const notifications = useNotificationsStore()
 
@@ -56,7 +55,7 @@ const status = ref<'idle' | 'loading' | 'ready' | 'failed'>('idle')
 const failure = ref<string | null>(null)
 const exporting = ref<ExportFormat | null>(null)
 
-const jobId = computed(() => String(route.params.id ?? ''))
+const jobId = computed(() => props.jobId)
 
 /** Channel options of the picker. */
 const channelOptions = computed(() =>
@@ -222,7 +221,7 @@ function errorPoints(): Array<{ east: number; north: number }> {
   const out: Array<{ east: number; north: number }> = []
   // Both series ascend in time, so one cursor walks the timeline across all fixes
   // instead of rescanning it per fix. The fix list is short but the timeline runs at
-  // the inertial rate, and the per-fix scan over it dominated this page's render.
+  // the inertial rate, and the per-fix scan over it dominated this panel's render.
   let cursor = 0
   const distanceAt = (index: number, time_s: number): number =>
     Math.abs((timeline[index]?.time_s ?? 0) - time_s)
@@ -263,7 +262,7 @@ function sampleRate(): number {
  *
  * A direct transform over a window is enough here: the window is a couple of
  * thousand samples, the result only feeds a chart, and a dependency-free
- * implementation keeps the sensor page independent of the Rust side's own FFT.
+ * implementation keeps the sensor panel independent of the Rust side's own FFT.
  */
 function periodogram(
   values: readonly number[],
@@ -299,7 +298,7 @@ async function load(): Promise<void> {
   truth.value = await simulations.loadAllTruth()
   // The accelerometer channel feeds the spectrum panel and the GNSS channel feeds the
   // error card and the track chart. Both are read whatever channel the picker shows,
-  // because those panels are always on the page.
+  // because those panels are always on the screen.
   accelSamples.value = await simulations.loadAllSensor('accel')
   gnssSamples.value = await simulations.loadAllSensor('gnss')
   samples.value = await selectChannel(channel.value)
@@ -361,33 +360,23 @@ onMounted(() => {
 </script>
 
 <template>
-  <section class="mx-auto max-w-7xl px-8 py-8" data-testid="sensor-view">
-    <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <h1 class="font-semibold text-ink">{{ t('views.sensor.title') }}</h1>
-        <span class="font-mono text-xs text-muted">{{ jobId }}</span>
-      </div>
-      <div class="flex items-center gap-3">
-        <span class="text-sm text-muted">{{ t('simulation.sensors.exportHint') }}</span>
-        <TButton
-          v-for="format in ['json', 'csv', 'geojson'] as ExportFormat[]"
-          :key="format"
-          variant="outline"
-          :loading="exporting === format"
-          :data-testid="`export-${format}`"
-          @click="exportAs(format)"
-        >
-          {{ t(`simulation.export.${format}`) }}
-        </TButton>
-        <TButton variant="outline" @click="router.push(`/simulations/${jobId}`)">
-          {{ t('common.back') }}
-        </TButton>
-      </div>
+  <div class="flex flex-col gap-6" data-testid="sensor-view">
+    <div class="flex items-center justify-end gap-3">
+      <span class="text-sm text-muted">{{ t('simulation.sensors.exportHint') }}</span>
+      <TButton
+        v-for="format in ['json', 'csv', 'geojson'] as ExportFormat[]"
+        :key="format"
+        variant="outline"
+        :loading="exporting === format"
+        :data-testid="`export-${format}`"
+        @click="exportAs(format)"
+      >
+        {{ t(`simulation.export.${format}`) }}
+      </TButton>
     </div>
 
     <TAlert
       v-if="failure !== null"
-      class="mt-4"
       theme="error"
       :message="t('simulation.sensors.loadFailed')"
       data-testid="sensor-error"
@@ -397,11 +386,11 @@ onMounted(() => {
         <span class="ml-2">{{ failure }}</span>
       </p>
     </TAlert>
-    <p v-else-if="status === 'loading'" class="mt-4 text-sm text-muted">
+    <p v-else-if="status === 'loading'" class="text-sm text-muted">
       {{ t('common.loading') }}
     </p>
 
-    <div class="mt-4 flex items-center gap-4">
+    <div class="flex items-center gap-4">
       <span class="text-sm text-muted">{{ t('simulation.sensors.channel') }}</span>
       <TRadioGroup
         variant="default-filled"
@@ -415,7 +404,7 @@ onMounted(() => {
       </span>
     </div>
 
-    <TCard class="mt-4" size="small">
+    <TCard size="small">
       <TAlert
         v-if="samples.length === 0"
         theme="info"
@@ -425,7 +414,7 @@ onMounted(() => {
       <EChart v-else :option="channelSeries" :height="280" data-testid="channel-chart" />
     </TCard>
 
-    <div class="mt-6 grid grid-cols-2 gap-6">
+    <div class="grid grid-cols-2 gap-6">
       <TCard :title="t('simulation.sensors.gnssErrorCloud')" size="small">
         <EChart :option="errorOption" :height="280" data-testid="gnss-error-chart" />
         <dl class="mt-2 flex flex-col gap-1 text-sm">
@@ -472,5 +461,5 @@ onMounted(() => {
         </p>
       </TCard>
     </div>
-  </section>
+  </div>
 </template>

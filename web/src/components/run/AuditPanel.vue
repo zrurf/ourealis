@@ -2,16 +2,15 @@
 /*
  * Audit: the run's own metrics report, and the same metrics against another run.
  *
- * Every number on this page comes from the service's `MetricsReport`
+ * Every number on this panel comes from the service's `MetricsReport`
  * (`crates/core/src/eval/mod.rs`) or from the two-sample comparison endpoint; the
- * page computes nothing that the report already carries, and labels each value
+ * panel computes nothing that the report already carries, and labels each value
  * with the unit the report uses. The two histograms are the exception and are
  * built from the truth timeline, which is why they are titled as distributions of
  * the samples rather than as report fields.
  */
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRoute, useRouter } from 'vue-router'
 import {
   Alert as TAlert,
   Button as TButton,
@@ -43,9 +42,9 @@ import {
 /** Speed below which a sample belongs to a start or stop ramp, m/s. */
 const RUNNING_SPEED_THRESHOLD = 0.5
 
+const props = defineProps<{ jobId: string }>()
+
 const { t, locale } = useI18n({ useScope: 'global' })
-const route = useRoute()
-const router = useRouter()
 const simulations = useSimulationsStore()
 
 const truth = ref<TruthSample[]>([])
@@ -53,7 +52,7 @@ const status = ref<'idle' | 'loading' | 'ready' | 'failed'>('idle')
 const failure = ref<string | null>(null)
 const compareWith = ref<string | null>(null)
 
-const jobId = computed(() => String(route.params.id ?? ''))
+const jobId = computed(() => props.jobId)
 
 /** The report of the shown run, or `null` when it carries none. */
 const report = computed(() => reportOf(simulations.currentSummary))
@@ -313,44 +312,27 @@ onMounted(() => {
 </script>
 
 <template>
-  <section class="mx-auto max-w-7xl px-8 py-8" data-testid="audit-view">
-    <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <h1 class="font-semibold text-ink">{{ t('views.audit.title') }}</h1>
-        <span class="font-mono text-xs text-muted">{{ jobId }}</span>
-        <!--
-          No plausibility badge: the service reports measured quantities and never
-          decides whether a run is plausible, so a badge here could only assert
-          something nothing evaluated. The report below is the evidence.
-        -->
-      </div>
-      <TButton variant="outline" @click="router.push(`/simulations/${jobId}`)">
-        {{ t('common.back') }}
-      </TButton>
-    </div>
-
+  <div class="flex flex-col gap-6" data-testid="audit-view">
     <TAlert
       v-if="failure !== null"
-      class="mt-4"
       theme="error"
       :message="t('simulation.audit.loadFailed')"
       data-testid="audit-error"
     >
       <p class="text-sm text-muted">{{ failure }}</p>
     </TAlert>
-    <p v-else-if="status === 'loading'" class="mt-4 text-sm text-muted">
+    <p v-else-if="status === 'loading'" class="text-sm text-muted">
       {{ t('common.loading') }}
     </p>
     <TAlert
       v-else-if="report === null"
-      class="mt-4"
       theme="info"
       :message="t('simulation.audit.noReport')"
       data-testid="audit-empty"
     />
 
     <template v-if="report !== null">
-      <div class="mt-6 grid grid-cols-3 gap-6">
+      <div class="grid grid-cols-3 gap-6">
         <TCard :title="t('simulation.audit.primary')" size="small">
           <TTable
             :data="primaryRows"
@@ -391,7 +373,7 @@ onMounted(() => {
         </TCard>
       </div>
 
-      <div class="mt-6 grid grid-cols-2 gap-6">
+      <div class="grid grid-cols-2 gap-6">
         <TCard :title="t('simulation.audit.speedDistribution')" size="small">
           <EChart :option="speedHistogram" :height="240" data-testid="audit-speed-histogram" />
         </TCard>
@@ -413,7 +395,7 @@ onMounted(() => {
         </TCard>
       </div>
 
-      <div class="mt-6 grid grid-cols-3 gap-6">
+      <div class="grid grid-cols-3 gap-6">
         <TCard :title="t('simulation.audit.accelSpectrum')" size="small">
           <TTable
             :data="accelSpectrumRows"
@@ -456,7 +438,7 @@ onMounted(() => {
         </TCard>
       </div>
 
-      <TCard class="mt-6" :title="t('simulation.audit.gnss')" size="small">
+      <TCard :title="t('simulation.audit.gnss')" size="small">
         <p v-if="gnssRows.length === 0" class="text-sm text-muted">
           {{ t('simulation.audit.noReport') }}
         </p>
@@ -476,7 +458,7 @@ onMounted(() => {
         </div>
       </TCard>
 
-      <TCard class="mt-6" :title="t('simulation.audit.compare')" size="small">
+      <TCard :title="t('simulation.audit.compare')" size="small">
         <p class="text-sm text-muted">{{ t('simulation.audit.compareHint') }}</p>
         <div class="mt-3 flex items-end gap-3">
           <label class="w-80">
@@ -555,5 +537,5 @@ onMounted(() => {
         </template>
       </TCard>
     </template>
-  </section>
+  </div>
 </template>

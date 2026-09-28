@@ -26,7 +26,7 @@ import { useThemeStore } from '@/stores/theme'
 import { useSystemStore } from '@/stores/system'
 import { useSimulationsStore } from '@/stores/simulations'
 
-const { t } = useI18n({ useScope: 'global' })
+const { t, locale } = useI18n({ useScope: 'global' })
 const localeStore = useLocaleStore()
 const themeStore = useThemeStore()
 const system = useSystemStore()
@@ -36,6 +36,64 @@ const config = ref<Record<string, unknown> | null>(null)
 const configStatus = ref<'idle' | 'loading' | 'ready' | 'failed'>('idle')
 const configError = ref<string | null>(null)
 const copied = ref(false)
+
+/** Facade switches the service reported. */
+const facades = computed(() => [
+  { key: 'rpc', enabled: system.info?.rpc_enabled ?? false, labelKey: 'dashboard.facadeRpc' },
+  { key: 'http', enabled: system.info?.http_enabled ?? false, labelKey: 'dashboard.facadeHttp' },
+  { key: 'web', enabled: system.info?.web_enabled ?? false, labelKey: 'dashboard.facadeWeb' },
+])
+
+/** Facts the service card lists as key/value rows. */
+const facts = computed(() => {
+  const info = system.info
+  if (info === null) {
+    return []
+  }
+  return [
+    { key: 'version', labelKey: 'dashboard.fieldVersion', value: info.version },
+    { key: 'workspace', labelKey: 'dashboard.fieldWorkspace', value: info.workspace_version },
+    { key: 'core', labelKey: 'dashboard.fieldCore', value: info.core_version },
+    { key: 'mapFormat', labelKey: 'dashboard.fieldMapFormat', value: info.map_format_version },
+    {
+      key: 'api',
+      labelKey: 'dashboard.fieldApi',
+      value: `${info.api_version} (${info.api_prefix})`,
+    },
+    { key: 'build', labelKey: 'dashboard.fieldBuild', value: formatTimestamp(info.build_time) },
+    { key: 'backend', labelKey: 'dashboard.fieldBackend', value: info.backend },
+    { key: 'threads', labelKey: 'dashboard.fieldThreads', value: String(info.worker_threads) },
+    { key: 'storage', labelKey: 'dashboard.fieldStorage', value: info.storage_mode },
+    { key: 'assets', labelKey: 'dashboard.fieldAssets', value: assetsText() },
+    { key: 'presets', labelKey: 'dashboard.fieldPresets', value: info.presets.join(', ') || '—' },
+    { key: 'maps', labelKey: 'dashboard.fieldMaps', value: String(info.maps) },
+    {
+      key: 'inflight',
+      labelKey: 'dashboard.fieldInFlight',
+      value: String(info.simulations_in_flight),
+    },
+  ]
+})
+
+/** Formats a timestamp in the interface locale. */
+function formatTimestamp(value: string): string {
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString(locale.value)
+}
+
+/** Embedded-asset line, which tells a developer whether the bundle is real. */
+function assetsText(): string {
+  const info = system.info
+  if (info === null) {
+    return '—'
+  }
+  const size = new Intl.NumberFormat(locale.value, { maximumFractionDigits: 0 }).format(
+    info.web_asset_bytes / 1024,
+  )
+  return info.web_assets_built
+    ? `${info.web_asset_files} files, ${size} KiB`
+    : t('dashboard.assetsPlaceholder')
+}
 
 /** Language options the catalogs cover. */
 const localeOptions = computed(() =>
@@ -190,6 +248,43 @@ onMounted(() => {
           {{ t('settings.copied') }}
         </span>
       </div>
+
+      <TAlert
+        v-if="system.status === 'failed'"
+        class="mt-3"
+        theme="error"
+        :message="t('dashboard.systemFailed')"
+        data-testid="settings-health-error"
+      >
+        <p class="text-sm text-muted">
+          <TTag size="small" variant="light">{{ t('error.fromService') }}</TTag>
+          <span class="ml-2">{{ system.error }}</span>
+        </p>
+      </TAlert>
+
+      <ul
+        v-if="system.info !== null"
+        class="mt-3 flex flex-col gap-2"
+        data-testid="settings-facades"
+      >
+        <li v-for="facade in facades" :key="facade.key" class="flex items-center justify-between">
+          <span class="text-sm text-ink">{{ t(facade.labelKey) }}</span>
+          <TTag size="small" variant="light" :theme="facade.enabled ? 'success' : 'default'">
+            {{ facade.enabled ? t('dashboard.enabled') : t('dashboard.disabled') }}
+          </TTag>
+        </li>
+      </ul>
+
+      <dl
+        v-if="facts.length > 0"
+        class="mt-3 grid grid-cols-2 gap-x-6 gap-y-1 text-sm"
+        data-testid="settings-facts"
+      >
+        <div v-for="fact in facts" :key="fact.key" class="flex justify-between gap-3">
+          <dt class="text-muted">{{ t(fact.labelKey) }}</dt>
+          <dd class="text-right font-mono text-xs text-ink">{{ fact.value }}</dd>
+        </div>
+      </dl>
 
       <TAlert
         v-if="configStatus === 'failed'"

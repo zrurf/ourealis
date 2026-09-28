@@ -7,14 +7,19 @@
  * one, a warning colour for a set cell of a mask. It reports the range of the loaded
  * cells and says so, because a legend that reported whole-map statistics beside a
  * one-screenful surface would be wrong in a way nobody could see.
+ *
+ * The vector families are listed the same way, with the colour and the weight they are
+ * drawn in, because a ribbon on the ground is a colour a reader has to be able to name.
  */
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import type { LegendEntry, LegendModel } from '@/render/legend'
+import type { LegendEntry, LegendFamily, LegendModel } from '@/render/legend'
 
 const props = defineProps<{
   /** The legend to draw. */
   model: LegendModel
+  /** Vector families currently drawn, or empty when none are switched on. */
+  families?: LegendFamily[]
   /** Localised name of a layer. */
   labelFor: (layerId: number, name: string) => string
   /** Localised unit of a layer's values, when the view has one. */
@@ -89,6 +94,30 @@ const entries = computed(() => props.model.entries)
         }}
       </p>
     </div>
+
+    <!-- The vector families: a band of the family's own colour and weight, so a reader can
+         match a line on the ground to its name without counting colours. -->
+    <template v-if="(families ?? []).length > 0">
+      <p class="mt-1 text-[0.6875rem] font-medium uppercase text-muted">
+        {{ $t('map.legend.overlays') }}
+      </p>
+      <div
+        v-for="family in families"
+        :key="family.kind"
+        class="flex items-center gap-2"
+        :data-testid="`legend-family-${family.kind}`"
+      >
+        <span
+          class="inline-block w-5 shrink-0 rounded-full"
+          :style="{
+            background: family.colour,
+            height: `${Math.min(4, Math.max(2, family.widthM))}px`,
+          }"
+          aria-hidden="true"
+        />
+        <span class="truncate text-[0.6875rem] text-muted">{{ $t(family.labelKey) }}</span>
+      </div>
+    </template>
 
     <p v-if="model.hidden > 0" class="text-[0.6875rem] text-muted">
       {{ $t('map.legend.more', { count: model.hidden }) }}

@@ -18,20 +18,25 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> costs: array<f32>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let index = gid.x;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
     let total = params.cells * params.modes;
-    if (index >= total) {
-        return;
-    }
+    // A whole map is millions of cells and a dispatch is capped at 65535 workgroups
+    // per dimension, so the grid is walked in strides: the dispatch is clamped and
+    // each invocation advances by the width of the whole dispatch until the field is
+    // covered. A field that fits within the cap therefore still runs one iteration.
+    let stride = groups.x * 64u;
+    for (var index = gid.x; index < total; index = index + stride) {
+        let cell = index / params.modes;
+        let mode = index % params.modes;
+        let feature_base = cell * params.dims;
 
-    let cell = index / params.modes;
-    let mode = index % params.modes;
-    let feature_base = cell * params.dims;
-
-    var sum = params.c0;
-    for (var dim = 0u; dim < params.dims; dim = dim + 1u) {
-        sum = sum + features[feature_base + dim] * weights[dim * params.modes + mode];
+        var sum = params.c0;
+        for (var dim = 0u; dim < params.dims; dim = dim + 1u) {
+            sum = sum + features[feature_base + dim] * weights[dim * params.modes + mode];
+        }
+        costs[index] = sum;
     }
-    costs[index] = sum;
 }

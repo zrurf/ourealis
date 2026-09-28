@@ -6,6 +6,8 @@
 //! the region annotations. Planning, motion and sensing all operate on this
 //! type, so a map is opened exactly once per run.
 
+use std::mem::size_of;
+
 use glam::DVec2;
 
 use ourealis_map_format::tlv::value::{MapInfo, SlopeModel, WeightPrior};
@@ -16,6 +18,26 @@ use crate::field::{CostField, CostModelParams, CostWeights, FeatureField, HardMa
 use crate::graph::{CoarseGrid, CoarseOptions, ConnectorSet, PrmParams, PrmRoadmap};
 use crate::math::LocalFrame;
 use crate::terrain::{DistanceField, Grid2D, Terrain};
+
+/// Bytes one cell of the dense layers occupies.
+///
+/// Counted high on purpose: the cost field's direction values are charged even on a map
+/// without a direction channel, because the estimate exists to bound a cache rather than
+/// to report an exact figure.
+const CELL_BYTES: usize = size_of::<f64>()  // elevation
+    + size_of::<bool>()                      // hard mask
+    + size_of::<f64>()                       // distance transform
+    + size_of::<u8>()                        // distance gradient
+    + size_of::<f32>()                       // cost
+    + size_of::<bool>()                      // cost's own forbidden mask
+    + size_of::<f32>(); // cost's direction values
+
+/// Bytes one roadmap node or coarse block adds, including the edges it carries.
+const NODE_BYTES: usize = 64;
+
+/// Flat allowance for the blocks that are neither per-cell nor per-node: the candidate
+/// path library, the region annotations and the map's own metadata.
+const GRAPH_BYTES: usize = 1 << 20;
 
 /// Map contents prepared for simulation.
 #[derive(Debug, Clone)]
@@ -170,6 +192,24 @@ impl Environment {
             slope_model,
             weight_prior,
         })
+    }
+
+    /// Rough size of the loaded fields, in bytes.
+    ///
+    /// A cache that keeps loaded environments needs a size to bound them by, and walking
+    /// every block a map may carry would cost more than the answer is worth. So the dense
+    /// layers are counted from their element types, the graph structures per node, and the
+    /// rest is covered by [`GRAPH_BYTES`]. See [`CELL_BYTES`] for what "rough" means here.
+    pub fn estimated_bytes(&self) -> usize {
+        let cells = self.grid.len();
+        let features: usize = self
+            .features
+            .channels()
+            .iter()
+            .map(|channel| channel.values.len())
+            .sum();
+        let nodes = self.prm.as_ref().map_or(0, |roadmap| roadmap.len()) + self.coarse.len();
+        cells * CELL_BYTES + features * size_of::<f32>() + nodes * NODE_BYTES + GRAPH_BYTES
     }
 
     /// Builds an environment from explicit parts, used by tests.

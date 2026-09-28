@@ -26,7 +26,9 @@ test('the workspace draws a route, plans it and starts the run', async ({ page, 
   await page.waitForTimeout(400)
   await page.mouse.click(cx + 90, cy + 90)
   await page.waitForTimeout(600)
-  // The plan arrives on its own: no button, and the summary is the service's numbers.
+  // The plan is asked for rather than assumed: the button is what starts a search, and
+  // the summary is the service's numbers.
+  await page.getByTestId('plan-run').click()
   await expect(page.getByTestId('plan-summary')).toBeVisible({ timeout: 90_000 })
   await expect(page.getByTestId('summary-length')).not.toHaveText('0 m')
   await expect(page.getByTestId('plan-status')).toContainText('planned in')
@@ -39,13 +41,15 @@ test('the workspace draws a route, plans it and starts the run', async ({ page, 
   for (let press = 0; press < 12; press += 1) {
     await page.keyboard.press('ArrowUp')
   }
+  // An edit only invalidates the answer on screen; planning it again is another press.
+  await page.getByTestId('plan-run').click()
   await expect
     .poll(async () => page.getByTestId('summary-length').innerText(), { timeout: 30_000 })
     .not.toBe(lengthBefore)
 
   // The candidate table is the planner's own answer, and its choice is marked.
-  await expect(page.getByTestId('candidate-0')).toBeVisible()
-  await expect(page.getByTestId('candidate-0')).toContainText('chosen')
+  await expect(page.getByTestId('candidate-0-0')).toBeVisible()
+  await expect(page.getByTestId('candidate-0-0')).toContainText('chosen')
 
   // A stage other than the route keeps the same draft: the runner's preset is the one
   // the recipe set, which is what "one draft" means in practice.

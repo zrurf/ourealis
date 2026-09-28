@@ -34,16 +34,24 @@ export interface SurfaceMaterial {
 /**
  * Surface classes of a `surface_type` dimension, in the order the format numbers them.
  *
- * The order is the map format's own (`map-format`'s `surface` module: road, track, grass,
- * sidewalk, dirt), and the colours are the ones a reader already associates with them —
- * asphalt grey, track brown, lawn green, paving, bare earth.
+ * The order is the ids of `map-format`'s `surface` module — asphalt, paving, track, gravel,
+ * ground, grass, steps, water, building — and the table has to stay exactly that long and in
+ * that order, because a cell stores an id and this is the only place that turns it back into
+ * a material. The colours are the ones a reader already associates with each surface: grey
+ * asphalt, terracotta rubber, lawn green, blue water. A building is the exception: it is
+ * drawn as the near-white of a navigation model, because its walls come from the elevation
+ * grid and a printed texture on a raised block reads as decoration rather than as a building.
  */
 export const SURFACE_MATERIALS: readonly SurfaceMaterial[] = [
-  { labelKey: 'map.surface.road', colour: [74, 76, 80], pattern: 'asphalt' },
-  { labelKey: 'map.surface.track', colour: [124, 92, 60], pattern: 'gravel' },
+  { labelKey: 'map.surface.asphalt', colour: [74, 76, 80], pattern: 'asphalt' },
+  { labelKey: 'map.surface.paving', colour: [168, 166, 158], pattern: 'gravel' },
+  { labelKey: 'map.surface.track', colour: [156, 84, 70], pattern: 'gravel' },
+  { labelKey: 'map.surface.gravel', colour: [146, 122, 88], pattern: 'gravel' },
+  { labelKey: 'map.surface.ground', colour: [132, 108, 76], pattern: 'flat' },
   { labelKey: 'map.surface.grass', colour: [108, 142, 78], pattern: 'grass' },
-  { labelKey: 'map.surface.sidewalk', colour: [168, 166, 158], pattern: 'gravel' },
-  { labelKey: 'map.surface.dirt', colour: [146, 122, 88], pattern: 'gravel' },
+  { labelKey: 'map.surface.steps', colour: [186, 176, 152], pattern: 'flat' },
+  { labelKey: 'map.surface.water', colour: [62, 118, 152], pattern: 'water' },
+  { labelKey: 'map.surface.building', colour: [242, 242, 242], pattern: 'flat' },
 ]
 
 /** One dimension of the map's feature schema, as far as the viewer reads it. */

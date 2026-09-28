@@ -4,9 +4,10 @@
  *
  * The lane needs a running service; without one it fails by default, naming the
  * command that starts it, and skips only when OUREALIS_ALLOW_SKIP=1 is set (see
- * `tests/support/service.ts`). The run itself is created through the UI — the form
- * is the thing under test — and only the waiting is done through the API, because
- * a poll from the test does not depend on the page staying open.
+ * `tests/support/service.ts`). The run is submitted over the API, because the form
+ * has its own lane (`run.spec.ts`) and what is under test here is the result page;
+ * the waiting is done through the API too, because a poll from the test does not
+ * depend on the page staying open.
  *
  * Run it against a service with:
  *   OUREALIS_SERVICE_URL=http://127.0.0.1:8080 pnpm test:e2e
@@ -21,8 +22,8 @@ const service = serviceGate()
 /** Identifier of the run the flow produced, shared by the later tests. */
 let jobId = ''
 
-/** Name of the map the lane created, which the run is submitted against. */
-let mapName = ''
+/** Identifier of the map the lane created, which the run is submitted against. */
+let mapId = ''
 
 /** Coordinates that fit inside both synthetic map presets, metres. */
 const START = { x: 20, y: 20 }
@@ -40,41 +41,45 @@ test.describe('simulation flow', () => {
     // another lane left in the library; it is also the smallest map there is. The
     // run names it explicitly, because a request without a map is only accepted
     // while the library holds exactly one.
-    mapName = `e2e simulation ${Date.now()}`
-    await buildSyntheticMap(request, { preset: 'compact', seed: 0x0ddb1a5e }, mapName)
+    const name = `e2e simulation ${Date.now()}`
+    mapId = await buildSyntheticMap(request, { preset: 'compact', seed: 0x0ddb1a5e }, name)
   })
 
-  test('a run submitted through the form reaches its result page', async ({ page }) => {
+  test('a submitted run reaches its result page', async ({ page }) => {
     service.skipUnlessAvailable()
     test.setTimeout(180_000)
+    test.skip(mapId === '', 'no map was built for the run')
 
     const problems: string[] = []
     page.on('pageerror', (error) => problems.push(error.message))
     await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
 
-    await page.goto('/simulations/new')
-    await expect(page.locator('h1')).toHaveText('Run parameters')
-
-    await page.getByTestId('form-name').locator('input').fill(`e2e run ${Date.now()}`)
-    // The form preselects a map, because the service refuses a request that names
-    // none while the library holds several; the run below is against the map this
-    // lane created only when the library was empty, so the assertion is only that
-    // a map is named.
-    const mapInput = page.getByTestId('route-map').locator('input')
-    await expect(mapInput).not.toHaveValue('')
-    expect(mapName).not.toBe('')
-    await fillNumber(page, 'start-x', START.x)
-    await fillNumber(page, 'start-y', START.y)
-    await fillNumber(page, 'goal-x', GOAL.x)
-    await fillNumber(page, 'goal-y', GOAL.y)
-    await page.getByTestId('form-submit').click()
-
-    // The reply routes the page at the new job; its identifier is the contract the
-    // rest of the lane works from. `new` is the submission route itself, so the
-    // wait is for the path to name a job rather than merely to exist.
-    await expect.poll(() => jobIdFrom(page), { timeout: 30_000 }).not.toBe('new')
-    jobId = await jobIdFrom(page)
+    // The run is submitted over the API rather than through the workspace form: the
+    // form has its own lane (`run.spec.ts`), and what this lane is about is the
+    // result page — the live panel, the summary and the three detail tabs.
+    const reply = await page.request.post('/api/v1/simulations', {
+      data: {
+        name: `e2e run ${Date.now()}`,
+        map: { kind: 'id', id: mapId },
+        route: {
+          mode: 'standard',
+          start: { x: START.x, y: START.y },
+          goal: { x: GOAL.x, y: GOAL.y },
+          waypoints: [],
+        },
+        person: { preset: 'moderate', overrides: { target_speed: 3.4 } },
+        seed: 4242,
+        individual: 0,
+        settings: { with_metrics: true, sensors: {} },
+      },
+    })
+    expect(reply.ok(), 'the service must accept the run').toBe(true)
+    jobId = ((await reply.json()) as { id: string }).id
     expect(jobId).not.toBe('')
+
+    await page.goto(`/runs/${jobId}`)
+    await expect(page.locator('h1')).toHaveText('Run detail')
+    expect(jobIdFrom(page)).toBe(jobId)
 
     await expect(page.getByTestId('job-state')).toBeVisible()
     await expect(page.getByTestId('elapsed')).toBeVisible()
@@ -102,13 +107,15 @@ test.describe('simulation flow', () => {
     expect(problems).toEqual([])
   })
 
-  test('the trajectory page draws the timeline and the synchronised charts', async ({ page }) => {
+  test('the trajectory tab draws the timeline and the synchronised charts', async ({ page }) => {
     service.skipUnlessAvailable()
     test.skip(jobId === '', 'no run was submitted')
 
     await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
-    await page.goto(`/simulations/${jobId}/trajectory`)
-    await expect(page.locator('h1')).toHaveText('Trajectory')
+    // The detail tabs live in the URL query, so a deep link opens the same one.
+    await page.goto(`/runs/${jobId}?tab=trajectory`)
+    await expect(page.locator('h1')).toHaveText('Run detail')
+    await expect(page.getByTestId('trajectory-view')).toBeVisible()
 
     await expect(page.getByTestId('timeline')).toBeVisible()
     await expect(page.getByTestId('playback-controls')).toBeVisible()
@@ -145,14 +152,15 @@ test.describe('simulation flow', () => {
       .not.toBe(scrubbed)
   })
 
-  test('the sensor page plots a channel and exports the run', async ({ page }) => {
+  test('the sensors tab plots a channel and exports the run', async ({ page }) => {
     service.skipUnlessAvailable()
     test.skip(jobId === '', 'no run was submitted')
     test.setTimeout(120_000)
 
     await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
-    await page.goto(`/simulations/${jobId}/sensors`)
-    await expect(page.locator('h1')).toHaveText('Sensors')
+    await page.goto(`/runs/${jobId}?tab=sensors`)
+    await expect(page.locator('h1')).toHaveText('Run detail')
+    await expect(page.getByTestId('sensor-view')).toBeVisible()
 
     await expect(page.getByTestId('channel-chart').locator('canvas')).toBeVisible()
     await expect(page.getByTestId('gnss-error-chart').locator('canvas')).toBeVisible()
@@ -164,7 +172,7 @@ test.describe('simulation flow', () => {
     expect(file.suggestedFilename()).toContain('.json')
   })
 
-  test('the audit page renders the metrics report and compares against a second run', async ({
+  test('the audit tab renders the metrics report and compares against a second run', async ({
     page,
   }) => {
     service.skipUnlessAvailable()
@@ -172,8 +180,9 @@ test.describe('simulation flow', () => {
     test.setTimeout(300_000)
 
     await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
-    await page.goto(`/simulations/${jobId}/audit`)
-    await expect(page.locator('h1')).toHaveText('Audit')
+    await page.goto(`/runs/${jobId}?tab=audit`)
+    await expect(page.locator('h1')).toHaveText('Run detail')
+    await expect(page.getByTestId('audit-view')).toBeVisible()
 
     await expect(page.getByTestId('audit-primary').locator('tbody tr').first()).toBeVisible()
     await expect(page.getByTestId('audit-speed-histogram').locator('canvas')).toBeVisible()
@@ -202,15 +211,19 @@ test.describe('simulation flow', () => {
     service.skipUnlessAvailable()
     test.setTimeout(120_000)
 
-    const mapId = await firstMapId(page)
-    test.skip(mapId === null, 'the library holds no map to inspect')
+    const target = await firstMapId(page)
+    test.skip(target === null, 'the library holds no map to inspect')
     const image = await page.request
-      .get(`/api/v1/maps/${mapId}/image`)
+      .get(`/api/v1/maps/${target}/image`)
       .then((response) => response.body())
 
     await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
-    await page.goto('/omf')
-    await expect(page.locator('h1')).toHaveText('OMF inspector')
+    // The inspector is the map library's drawer, so the lane opens it the way a
+    // reader does: from the library header.
+    await page.goto('/maps')
+    await expect(page.locator('h1')).toHaveText('Maps')
+    await page.getByTestId('map-inspect').click()
+    await expect(page.getByTestId('omf-inspector')).toBeVisible()
 
     await page.getByTestId('omf-file').setInputFiles({
       name: 'library.omf',
@@ -243,17 +256,12 @@ test.describe('simulation flow', () => {
     page.on('pageerror', (error) => problems.push(error.message))
     await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
 
-    const mapId = await firstMapId(page)
     const pages: Array<{ path: string; heading: string }> = [
-      { path: '/', heading: 'Overview' },
+      { path: '/maps', heading: 'Maps' },
       { path: '/run', heading: 'Run workspace' },
-      { path: '/batch', heading: 'Batch runs' },
-      { path: '/omf', heading: 'OMF inspector' },
+      { path: '/runs', heading: 'Run history' },
       { path: '/settings', heading: 'Settings' },
     ]
-    if (mapId !== null) {
-      pages.push({ path: `/maps/${mapId}/studio`, heading: 'Map studio' })
-    }
     for (const entry of pages) {
       // Pages are opened one after another so a failure names the page it happened
       // on; each is a full navigation, so the loop is also the isolation.
@@ -269,12 +277,17 @@ test.describe('simulation flow', () => {
     service.skipUnlessAvailable()
     test.setTimeout(180_000)
 
-    const mapId = await firstMapId(page)
-    test.skip(mapId === null, 'the library holds no map to draw on')
+    const target = await firstMapId(page)
+    test.skip(target === null, 'the library holds no map to draw on')
 
     await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
-    await page.goto(`/maps/${mapId}/studio`)
-    await expect(page.locator('h1')).toHaveText('Map studio')
+    // The studio is the library's other drawer, opened from the row of the map the
+    // lane draws on.
+    await page.goto('/maps')
+    const row = page.locator('[data-testid="map-table"] tbody tr').first()
+    await expect(row).toBeVisible({ timeout: 30_000 })
+    await row.getByTestId('map-edit').click()
+    await expect(page.getByTestId('map-studio')).toBeVisible()
 
     const engine = await debugEngine(page)
     test.skip(engine === null, 'the studio needs a renderer backend for its surface')
@@ -309,20 +322,38 @@ test.describe('simulation flow', () => {
     service.skipUnlessAvailable()
 
     await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
-    await page.goto('/simulations/does-not-exist')
+    await page.goto('/runs/does-not-exist')
     await expect(page.getByTestId('simulation-view')).toBeVisible()
     await expect(page.getByTestId('job-state')).toHaveCount(0)
+    await expect(page.getByTestId('job-missing')).toBeVisible()
   })
 })
 
-/** The renderer backend the studio reported, or null when it could not start. */
+/**
+ * The renderer backend the studio reported, or null when it did not start.
+ *
+ * The studio probes for a backend as its drawer opens, so the state is polled rather
+ * than read once; a machine without a renderer never reports one, and the caller
+ * skips instead of failing.
+ */
 async function debugEngine(page: Page): Promise<string | null> {
-  return page.evaluate(() => {
-    const state = (globalThis as unknown as Record<string, { engine?: string | null } | undefined>)[
-      '__ourealis_debug'
-    ]
-    return state?.engine ?? null
-  })
+  const handle = await page
+    .waitForFunction(
+      () => {
+        const state = (
+          globalThis as unknown as Record<string, { engine?: string | null } | undefined>
+        )['__ourealis_debug']
+        return state?.engine ?? null
+      },
+      undefined,
+      { timeout: 30_000 },
+    )
+    .catch(() => null)
+  if (handle === null) {
+    return null
+  }
+  const engine = (await handle.jsonValue()) as unknown
+  return typeof engine === 'string' ? engine : null
 }
 
 /**
@@ -338,8 +369,8 @@ async function secondFinishedRun(page: Page): Promise<{ id: string; name: string
   if (candidate !== undefined) {
     return candidate
   }
-  const mapId = await firstMapId(page)
-  if (mapId === null) {
+  const target = await firstMapId(page)
+  if (target === null) {
     return null
   }
   const name = `e2e comparison ${Date.now()}`
@@ -348,7 +379,7 @@ async function secondFinishedRun(page: Page): Promise<{ id: string; name: string
       failOnStatusCode: false,
       data: {
         name,
-        map: { kind: 'id', id: mapId },
+        map: { kind: 'id', id: target },
         route: {
           mode: 'standard',
           start: { x: START.x, y: START.y },
@@ -419,15 +450,8 @@ async function firstMapId(page: Page): Promise<string | null> {
 
 /** Reads the job identifier out of the current path. */
 function jobIdFrom(page: Page): string {
-  const match = /\/simulations\/([^/?]+)/.exec(page.url())
+  const match = /\/runs\/([^/?]+)/.exec(page.url())
   return match?.[1] ?? ''
-}
-
-/** Fills one number input of the form. */
-async function fillNumber(page: Page, testId: string, value: number): Promise<void> {
-  const input = page.getByTestId(testId).locator('input')
-  await input.fill(String(value))
-  await input.blur()
 }
 
 /** Waits until the service reports the job in a terminal state. */

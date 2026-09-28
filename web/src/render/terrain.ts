@@ -8,18 +8,31 @@
  *
  * Both meshes of a chunk register with the scene's height exaggeration, so a change to the
  * vertical scale moves the surface and its slab together.
+ *
+ * The layer also owns the *ramp*: the geometry carries a normalised elevation and a shading
+ * factor, and the colour buffer is derived from them here. A light/dark switch therefore
+ * re-uploads one colour buffer per mesh instead of rebuilding the map, and it reaches every
+ * chunk already drawn, including the ones that arrived after the switch.
  */
+import { VertexBuffer } from '@babylonjs/core/Buffers/buffer'
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
 import { Color3 } from '@babylonjs/core/Maths/math.color'
 import { Mesh } from '@babylonjs/core/Meshes/mesh'
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData'
 import type { Scene } from '@babylonjs/core/scene'
+import { TERRAIN_RAMP, TERRAIN_RAMP_DARK, type Rgb } from '@/types/colormap'
 import { GRAIN_COMPENSATION, grainTexture } from './grain'
 import type { MapScene } from './scene'
+import { terrainColours } from './shading'
 import type { ChunkMeshData, MeshData } from './terrainMesh'
 
 export type { ChunkMeshData, ChunkMeshOptions, MeshData } from './terrainMesh'
 export { buildChunkMesh, chunkEdges, elevationRange, heightFieldNormals } from './terrainMesh'
+
+/** The ramp an appearance draws the surface with. */
+export function rampFor(dark: boolean): readonly Rgb[] {
+  return dark ? TERRAIN_RAMP_DARK : TERRAIN_RAMP
+}
 
 /** The elevation surface of one map, one mesh per loaded chunk plus its slab. */
 export class TerrainLayer {
@@ -29,10 +42,18 @@ export class TerrainLayer {
   private readonly slabMaterial: StandardMaterial
   private readonly meshes = new Map<string, Mesh>()
   private readonly slabs = new Map<string, Mesh>()
+  /** Vertex data of every mesh drawn, so a ramp change can recolour without the geometry. */
+  private readonly meshData = new Map<Mesh, MeshData>()
+  private ramp: readonly Rgb[]
+  private readonly unbindAppearance: () => void
 
   constructor(scene: Scene, mapScene: MapScene) {
     this.scene = scene
     this.mapScene = mapScene
+    this.ramp = rampFor(mapScene.isDark)
+    this.unbindAppearance = mapScene.onAppearance((dark) => {
+      this.setRamp(rampFor(dark))
+    })
     this.material = new StandardMaterial('terrainMaterial', scene)
     this.material.specularColor = new Color3(0, 0, 0)
     // The grain is a near-white noise whose mean is below white, so the albedo is scaled up
@@ -56,6 +77,20 @@ export class TerrainLayer {
     )
     this.slabMaterial.diffuseTexture = grainTexture(scene)
     this.slabMaterial.backFaceCulling = false
+  }
+
+  /** Sets the ramp the surface is coloured with; only the colour buffers are rewritten. */
+  setRamp(ramp: readonly Rgb[]): void {
+    if (ramp === this.ramp) {
+      return
+    }
+    this.ramp = ramp
+    for (const [mesh, data] of this.meshData) {
+      mesh.updateVerticesData(
+        VertexBuffer.ColorKind,
+        terrainColours(data.rampInput, ramp, data.building),
+      )
+    }
   }
 
   /** Adds or replaces the mesh of one chunk and the slab it carries. */
@@ -99,6 +134,7 @@ export class TerrainLayer {
 
   /** Disposes the meshes and the materials. */
   dispose(): void {
+    this.unbindAppearance()
     this.clear()
     this.material.dispose()
     this.slabMaterial.dispose()
@@ -111,10 +147,13 @@ export class TerrainLayer {
     vertexData.positions = data.positions
     vertexData.indices = data.indices
     vertexData.normals = data.normals
-    vertexData.colors = data.colors
+    vertexData.colors = terrainColours(data.rampInput, this.ramp, data.building)
     vertexData.uvs = data.uvs
-    vertexData.applyToMesh(mesh, false)
+    // Updatable: a light/dark switch rewrites the colour buffer in place rather than
+    // rebuilding a mesh whose geometry did not change.
+    vertexData.applyToMesh(mesh, true)
     mesh.material = material
+    this.meshData.set(mesh, data)
     this.mapScene.trackHeightMesh(mesh)
     return mesh
   }
@@ -126,6 +165,7 @@ export class TerrainLayer {
         continue
       }
       this.mapScene.untrackHeightMesh(mesh)
+      this.meshData.delete(mesh)
       mesh.dispose()
     }
     this.meshes.delete(key)

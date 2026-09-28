@@ -24,6 +24,7 @@ import {
 import AppIcon from '@/components/layout/AppIcon.vue'
 import ViewportSlider from '@/components/map/ViewportSlider.vue'
 import { autoTerraceStep } from '@/render/shading'
+import { OVERLAY_LABEL_KEYS } from '@/render/legend'
 import { useViewerStore } from '@/stores/viewer'
 import TTooltip from '@/components/common/AppTooltip.vue'
 
@@ -79,11 +80,11 @@ const summaries = computed<Record<GroupId, string>>(() => ({
 const overlayFamilies = computed(() =>
   (
     [
-      { id: 'regions', labelKey: 'map.viewer.overlayRegions' },
-      { id: 'connectors', labelKey: 'map.viewer.overlayConnectors' },
-      { id: 'skeleton', labelKey: 'map.viewer.overlaySkeleton' },
-      { id: 'prm', labelKey: 'map.viewer.overlayPrm' },
-      { id: 'direction', labelKey: 'map.viewport.arrows' },
+      { id: 'regions', labelKey: OVERLAY_LABEL_KEYS.regions },
+      { id: 'connectors', labelKey: OVERLAY_LABEL_KEYS.connectors },
+      { id: 'skeleton', labelKey: OVERLAY_LABEL_KEYS.skeleton },
+      { id: 'prm', labelKey: OVERLAY_LABEL_KEYS.prm },
+      { id: 'direction', labelKey: OVERLAY_LABEL_KEYS.direction },
     ] as const
   ).map((family) => ({
     id: family.id,

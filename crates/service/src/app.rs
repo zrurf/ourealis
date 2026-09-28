@@ -9,6 +9,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ourealis_core::sim::EnvironmentCache;
+
 use crate::api::dto::PageQuery;
 use crate::api::{API_PREFIX, API_VERSION};
 use crate::config::Config;
@@ -81,6 +83,7 @@ impl AppState {
             max_concurrent: config.simulation.max_concurrent,
             queue_capacity: config.simulation.queue_capacity,
             with_metrics: config.simulation.with_metrics,
+            environments: EnvironmentCache::default(),
         });
         let runner = Arc::new(TaskRunner::new(context, Arc::clone(&tasks)));
         Ok(Arc::new(Self {

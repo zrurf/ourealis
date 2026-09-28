@@ -11,6 +11,12 @@
  */
 export default {
   simulation: {
+    tabs: {
+      overview: 'Overview',
+      trajectory: 'Trajectory',
+      sensors: 'Sensors',
+      audit: 'Audit',
+    },
     job: {
       queued: 'Queued',
       running: 'Running',
@@ -388,14 +394,14 @@ export default {
       frequency: 'Chosen-path frequency',
       frequencyHint:
         'Derived from a planning preview per individual, which draws the same Logit choice as the run.',
-      candidate: 'Candidate {index}',
+      candidate: 'Route option {index}',
       share: 'share',
       applied: 'Share of individuals',
       runs: 'Per-run results',
       columnIndividual: 'Individual',
       columnState: 'State',
       columnSeed: 'Seed',
-      columnChosen: 'Chosen path',
+      columnChosen: 'Planned option',
       columnPathRatio: 'Path ratio',
       columnMeanSpeed: 'Mean speed (m/s)',
       columnStepFrequency: 'Step frequency (Hz)',
@@ -454,11 +460,6 @@ export default {
     fieldMaps: 'Maps in the library',
     fieldInFlight: 'Runs in flight',
     recentJobs: 'Recent runs',
-    mapsBody: 'Import, generate and preview maps.',
-    routesBody: 'Plan a route and compare its candidates before running it.',
-    batchBody: 'Sweep a population over one route.',
-    omfBody: 'Inspect, edit and patch an OMF image.',
-    settingsBody: 'Language, appearance, units and the effective service configuration.',
   },
   settings: {
     interface: 'Interface',

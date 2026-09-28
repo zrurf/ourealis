@@ -40,6 +40,14 @@ const collapsed = ref(readStored(COLLAPSE_KEY) === '1')
 
 watch(collapsed, (value) => writeStored(COLLAPSE_KEY, value ? '1' : '0'))
 
+/**
+ * Whether the raw values are unfolded.
+ *
+ * The panel always answers what a cell *is*; the cell grid indices, the chunk
+ * bookkeeping and the storage values are only interesting to a reader checking the file.
+ */
+const advanced = ref(false)
+
 /** Number in the interface locale. */
 function number(value: number, digits = 2): string {
   return new Intl.NumberFormat(locale.value, { maximumFractionDigits: digits }).format(value)
@@ -133,67 +141,24 @@ const summary = computed(() => {
             <dt class="text-muted">{{ t('map.inspector.elevation') }}</dt>
             <dd class="font-mono text-ink">{{ elevationText }}</dd>
           </div>
-          <div class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.cell') }}</dt>
-            <dd class="font-mono text-ink">
-              {{ report.cell.i }}, {{ report.cell.j }} @ {{ number(report.level.cellSizeM) }} m
-            </dd>
-          </div>
-          <div class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.level') }}</dt>
-            <dd class="font-mono text-ink">{{ report.level.level }}</dd>
-          </div>
-          <div class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.chunk') }}</dt>
-            <dd class="font-mono text-ink" data-testid="inspector-chunk">
-              {{ report.chunk.id === null ? '—' : `0x${report.chunk.id.toString(16)}` }}
-            </dd>
-          </div>
-          <div class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.chunkGrid') }}</dt>
-            <dd class="font-mono text-ink">{{ report.chunk.ix }}, {{ report.chunk.iy }}</dd>
-          </div>
-          <div class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.localCell') }}</dt>
-            <dd class="font-mono text-ink">
-              {{ report.chunk.local.x }}, {{ report.chunk.local.y }}
-            </dd>
-          </div>
-          <div v-if="report.chunk.shape !== null" class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.chunkShape') }}</dt>
-            <dd class="font-mono text-ink">
-              {{ report.chunk.shape.width }}×{{ report.chunk.shape.height }}×{{
-                report.chunk.shape.channels
-              }}
-            </dd>
-          </div>
-          <div v-if="report.chunk.inMap !== null" class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.chunkInMap') }}</dt>
-            <dd class="font-mono text-ink">
-              {{ report.chunk.inMap.width }}×{{ report.chunk.inMap.height }}
-            </dd>
-          </div>
-          <div class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.cellExtent') }}</dt>
-            <dd class="font-mono text-ink">
-              {{ number(report.cellBounds.min_x, 1) }}, {{ number(report.cellBounds.min_y, 1) }} →
-              {{ number(report.cellBounds.max_x, 1) }}, {{ number(report.cellBounds.max_y, 1) }}
-            </dd>
-          </div>
-          <div class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.levelDims') }}</dt>
-            <dd class="font-mono text-ink">
-              {{ report.levelDims.width }}×{{ report.levelDims.height }}
-            </dd>
-          </div>
-          <div class="flex justify-between gap-3">
-            <dt class="text-muted">{{ t('map.inspector.inMap') }}</dt>
-            <dd class="text-ink">{{ report.inMap ? t('common.yes') : t('common.no') }}</dd>
-          </div>
         </dl>
 
         <div class="flex flex-col gap-2">
-          <h3 class="text-xs font-medium uppercase text-muted">{{ t('map.inspector.layers') }}</h3>
+          <div class="flex items-center justify-between gap-2">
+            <h3 class="text-xs font-medium uppercase text-muted">
+              {{ t('map.inspector.layers') }}
+            </h3>
+            <TButton
+              size="small"
+              variant="text"
+              :aria-expanded="advanced"
+              :aria-label="advanced ? t('map.inspector.collapse') : t('map.inspector.expand')"
+              data-testid="inspector-advanced"
+              @click="advanced = !advanced"
+            >
+              {{ advanced ? t('map.inspector.collapse') : t('map.inspector.expand') }}
+            </TButton>
+          </div>
           <div
             v-for="layer in loaded"
             :key="layer.layerId"
@@ -220,6 +185,100 @@ const summary = computed(() => {
                 · {{ layer.kind }} · {{ t('map.inspector.channels', { count: layer.channels }) }}
               </span>
             </p>
+            <p v-if="layer.direction !== undefined" class="text-xs text-muted">
+              {{
+                t('map.inspector.direction', {
+                  angle: number(layer.direction.angleDeg, 0),
+                  strength: layer.direction.strength,
+                })
+              }}
+            </p>
+            <p
+              v-if="layer.blocked !== undefined"
+              class="text-xs"
+              :class="layer.blocked ? 'text-danger' : 'text-muted'"
+            >
+              {{ layer.blocked ? t('map.inspector.forbidden') : t('map.inspector.passable') }}
+            </p>
+          </div>
+
+          <p v-if="unavailable.length > 0" class="text-xs text-muted">
+            {{ t('map.inspector.unavailable', { count: unavailable.length }) }}
+          </p>
+        </div>
+
+        <div v-if="advanced" class="flex flex-col gap-2">
+          <h3 class="text-xs font-medium uppercase text-muted">
+            {{ t('map.inspector.advanced') }}
+          </h3>
+          <dl class="flex flex-col gap-1 text-sm">
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.cell') }}</dt>
+              <dd class="font-mono text-ink">
+                {{ report.cell.i }}, {{ report.cell.j }} @ {{ number(report.level.cellSizeM) }} m
+              </dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.level') }}</dt>
+              <dd class="font-mono text-ink">{{ report.level.level }}</dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.chunk') }}</dt>
+              <dd class="font-mono text-ink" data-testid="inspector-chunk">
+                {{ report.chunk.id === null ? '—' : `0x${report.chunk.id.toString(16)}` }}
+              </dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.chunkGrid') }}</dt>
+              <dd class="font-mono text-ink">{{ report.chunk.ix }}, {{ report.chunk.iy }}</dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.localCell') }}</dt>
+              <dd class="font-mono text-ink">
+                {{ report.chunk.local.x }}, {{ report.chunk.local.y }}
+              </dd>
+            </div>
+            <div v-if="report.chunk.shape !== null" class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.chunkShape') }}</dt>
+              <dd class="font-mono text-ink">
+                {{ report.chunk.shape.width }}×{{ report.chunk.shape.height }}×{{
+                  report.chunk.shape.channels
+                }}
+              </dd>
+            </div>
+            <div v-if="report.chunk.inMap !== null" class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.chunkInMap') }}</dt>
+              <dd class="font-mono text-ink">
+                {{ report.chunk.inMap.width }}×{{ report.chunk.inMap.height }}
+              </dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.cellExtent') }}</dt>
+              <dd class="font-mono text-ink">
+                {{ number(report.cellBounds.min_x, 1) }}, {{ number(report.cellBounds.min_y, 1) }} →
+                {{ number(report.cellBounds.max_x, 1) }}, {{ number(report.cellBounds.max_y, 1) }}
+              </dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.levelDims') }}</dt>
+              <dd class="font-mono text-ink">
+                {{ report.levelDims.width }}×{{ report.levelDims.height }}
+              </dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">{{ t('map.inspector.inMap') }}</dt>
+              <dd class="text-ink">{{ report.inMap ? t('common.yes') : t('common.no') }}</dd>
+            </div>
+          </dl>
+
+          <div
+            v-for="layer in loaded"
+            :key="layer.layerId"
+            class="flex flex-col gap-0.5 border-b border-line pb-1 last:border-b-0"
+          >
+            <span class="truncate text-xs text-muted">{{
+              layerLabel(layer.layerId, layer.name)
+            }}</span>
             <p class="font-mono text-xs text-muted">
               <span v-for="(value, index) in layer.values" :key="index" class="mr-2">
                 {{ t('map.inspector.channel', { index }) }}
@@ -241,26 +300,7 @@ const summary = computed(() => {
                 })
               }}
             </p>
-            <p v-if="layer.direction !== undefined" class="text-xs text-muted">
-              {{
-                t('map.inspector.direction', {
-                  angle: number(layer.direction.angleDeg, 0),
-                  strength: layer.direction.strength,
-                })
-              }}
-            </p>
-            <p
-              v-if="layer.blocked !== undefined"
-              class="text-xs"
-              :class="layer.blocked ? 'text-danger' : 'text-muted'"
-            >
-              {{ layer.blocked ? t('map.inspector.forbidden') : t('map.inspector.passable') }}
-            </p>
           </div>
-
-          <p v-if="unavailable.length > 0" class="text-xs text-muted">
-            {{ t('map.inspector.unavailable', { count: unavailable.length }) }}
-          </p>
         </div>
       </template>
     </div>

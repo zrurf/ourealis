@@ -1,9 +1,9 @@
 <script setup lang="ts">
 /*
- * Map studio: region outlines and connectors drawn on the map's ground plane and
- * written back into an OMF image.
+ * Map studio panel: region outlines and cross-layer links drawn on the map's ground
+ * plane and written back into an OMF image.
  *
- * Two honest limits shape this page, both set by the API rather than by the UI:
+ * Two honest limits shape this panel, both set by the API rather than by the UI:
  * the edit script the service accepts carries a map information record, region
  * features with their outlines, connectors and raw metadata records — a hard
  * forbidden mask or a vector road is not expressible as a patch, so the studio
@@ -13,7 +13,6 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRoute, useRouter } from 'vue-router'
 import {
   Alert as TAlert,
   Button as TButton,
@@ -47,6 +46,7 @@ import type { MapScene } from '@/render/scene'
 import { TerrainLayer } from '@/render/terrain'
 import { buildChunkMesh, chunkGrid } from '@/render/terrainMesh'
 import { createCellSampler } from '@/render/cellSampler'
+import { createSurfaceSampler } from '@/render/inspect'
 import { surfaceStyle } from '@/render/surfaceStyle'
 import { pickGround } from '@/render/picking'
 import { useMapsStore } from '@/stores/maps'
@@ -67,15 +67,18 @@ const REGION_TAGS: ReadonlyArray<{ value: number; labelKey: string }> = [
   { value: 5, labelKey: 'omf.studio.kindMagnetic' },
 ]
 
+const props = defineProps<{
+  /** Map the panel draws on, from the library row that opened it. */
+  mapId: string
+}>()
+
 const { t, locale } = useI18n({ useScope: 'global' })
-const route = useRoute()
-const router = useRouter()
 const maps = useMapsStore()
 const notifications = useNotificationsStore()
 const omf = useOmfStore()
 
 const canvas = ref<HTMLCanvasElement | null>(null)
-const mapId = ref<string | null>(null)
+const mapId = ref(props.mapId)
 const tool = ref<'regions' | 'connectors'>('regions')
 const tagId = ref(0)
 const draftPoints = ref<Vec2[]>([])
@@ -102,23 +105,6 @@ let disposed = false
 
 /** Whether an image is available to edit. */
 const hasBase = computed(() => omf.sourceBytes !== null)
-
-/** Identifier from the path: `/maps/:id/studio` names the map the studio edits. */
-const routeId = computed(() => String(route.params.id ?? ''))
-
-/**
- * Map the studio works on: the route's id when the library holds it.
- *
- * An absent or unknown id falls back to the first map, which is what the studio
- * offered before the route carried an id.
- */
-function mapIdFromRoute(): string | null {
-  const wanted = routeId.value
-  if (wanted !== '' && maps.summaries.some((map) => map.id === wanted)) {
-    return wanted
-  }
-  return maps.summaries[0]?.id ?? null
-}
 
 /** Rows of the drawn-region list. */
 const regionRows = computed(() =>
@@ -156,7 +142,7 @@ function tagLabel(value: number): string {
 /** Loads the selected map's elevation surface. */
 async function loadSurface(): Promise<void> {
   const id = mapId.value
-  if (id === null || id === '') {
+  if (id === '') {
     return
   }
   status.value = 'loading'
@@ -183,6 +169,15 @@ async function loadSurface(): Promise<void> {
         level,
         layerId: LAYER_ELEVATION,
       })
+      // Second channel of the elevation layer; `null` when the map carries no building mask.
+      const building = createCellSampler({
+        chunks: maps.chunks,
+        grid,
+        chunkSize: info.summary.chunk_size,
+        level,
+        layerId: LAYER_ELEVATION,
+        channel: 1,
+      })
       for (const chunkRef of refs) {
         const key = chunkKey(chunkRef.layerId, chunkRef.level, chunkRef.chunkId)
         if (maps.chunkOf(key) === null) {
@@ -196,10 +191,20 @@ async function loadSurface(): Promise<void> {
             // The studio draws on the map rather than reading it, so its surface stays
             // smooth: terracing would move the ground under a region the reader is
             // placing without telling them anything they are there to see.
-            surfaceStyle({ range: null, dark: false, terraceM: 0, sunAzimuthDeg: 315 }),
+            { ...surfaceStyle({ range: null, terraceM: 0, sunAzimuthDeg: 315 }), building },
           ),
         )
       }
+      // The camera target rides the ground: the studio frames a campus that stands hundreds
+      // of metres above the map's zero plane, and a close view would otherwise sink under it.
+      const ground = createSurfaceSampler(
+        maps.chunks,
+        grid,
+        info.summary.chunk_size,
+        level,
+        maps.originOf(id),
+      )
+      scene?.setGroundHeight((x, z) => ground(x, z))
     }
     await loadExistingRegions()
     status.value = 'ready'
@@ -212,7 +217,7 @@ async function loadSurface(): Promise<void> {
 /** Draws the outlines the service reports for the loaded map. */
 async function loadExistingRegions(): Promise<void> {
   const id = mapId.value
-  if (id === null || scene === null) {
+  if (id === '' || scene === null) {
     return
   }
   try {
@@ -447,7 +452,7 @@ function removeConnector(index: number): void {
  */
 async function useLibraryImage(): Promise<void> {
   const id = mapId.value
-  if (id === null || id === '') {
+  if (id === '') {
     return
   }
   try {
@@ -496,12 +501,12 @@ async function exportImage(): Promise<void> {
 }
 
 /**
- * Loads the surface of the selected map; the only place a scene is built.
+ * Discards the current scene and loads the surface of the selected map.
  *
- * The dropdown and the route both write `mapId`, so this watcher is the single
- * load path and a mount starts exactly one engine.
+ * The dropdown, the prop and the mount all funnel into `mapId`, so this is the single
+ * load path and each change starts exactly one engine.
  */
-watch(mapId, async () => {
+async function reload(): Promise<void> {
   cancelDraft()
   regionDrafts.value = []
   connectorDrafts.value = []
@@ -513,11 +518,16 @@ watch(mapId, async () => {
   existingMesh = null
   disposeDraftMaterial()
   await loadSurface()
-})
+}
 
-watch(routeId, () => {
-  mapId.value = mapIdFromRoute()
-})
+watch(mapId, reload)
+
+watch(
+  () => props.mapId,
+  (next) => {
+    mapId.value = next
+  },
+)
 
 watch(tool, () => {
   cancelDraft()
@@ -525,7 +535,8 @@ watch(tool, () => {
 
 onMounted(async () => {
   await maps.loadMaps()
-  mapId.value = mapIdFromRoute()
+  // `mapId` starts at its prop value, so the watcher does not fire for the first map.
+  await reload()
 })
 
 onBeforeUnmount(() => {
@@ -548,41 +559,32 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="mx-auto max-w-7xl px-8 py-8" data-testid="map-studio">
-    <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <h1 class="font-semibold text-ink">{{ t('views.mapStudio.title') }}</h1>
-        <TTag v-if="baseName !== null" size="small" variant="light" theme="success">
-          {{ t('omf.studio.baseReady', { size: omf.sourceSize + ' B' }) }}
-        </TTag>
-      </div>
-      <div class="flex items-center gap-2">
-        <TButton
-          variant="outline"
-          :disabled="mapId === null"
-          data-testid="studio-base"
-          @click="useLibraryImage()"
-        >
-          {{ t('omf.studio.downloadBase') }}
-        </TButton>
-        <TButton
-          theme="primary"
-          :loading="exporting"
-          :disabled="!hasBase"
-          data-testid="studio-export"
-          @click="exportImage()"
-        >
-          {{ exporting ? t('omf.studio.exporting') : t('omf.studio.export') }}
-        </TButton>
-        <TButton variant="outline" @click="router.push('/omf')">
-          {{ t('views.omf.title') }}
-        </TButton>
-      </div>
+  <div class="flex flex-col gap-6" data-testid="map-studio">
+    <div class="flex items-center justify-end gap-2">
+      <TTag v-if="baseName !== null" size="small" variant="light" theme="success">
+        {{ t('omf.studio.baseReady', { size: omf.sourceSize + ' B' }) }}
+      </TTag>
+      <TButton
+        variant="outline"
+        :disabled="mapId === ''"
+        data-testid="studio-base"
+        @click="useLibraryImage()"
+      >
+        {{ t('omf.studio.downloadBase') }}
+      </TButton>
+      <TButton
+        theme="primary"
+        :loading="exporting"
+        :disabled="!hasBase"
+        data-testid="studio-export"
+        @click="exportImage()"
+      >
+        {{ exporting ? t('omf.studio.exporting') : t('omf.studio.export') }}
+      </TButton>
     </div>
 
     <TAlert
       v-if="failure !== null"
-      class="mt-4"
       theme="error"
       :message="t('omf.studio.surfaceFailed')"
       data-testid="studio-error"
@@ -593,7 +595,7 @@ onBeforeUnmount(() => {
       </p>
     </TAlert>
 
-    <div class="mt-4 grid grid-cols-3 gap-6">
+    <div class="grid grid-cols-3 gap-6">
       <div class="col-span-2">
         <div class="relative h-[30rem] rounded-card border border-line bg-surface">
           <div ref="canvas" class="block h-full w-full" data-testid="studio-canvas" />
@@ -615,7 +617,7 @@ onBeforeUnmount(() => {
       <aside class="flex flex-col gap-4">
         <TCard :title="t('omf.studio.surface')" size="small">
           <TSelect
-            :value="mapId ?? ''"
+            :value="mapId"
             :options="maps.summaries.map((map) => ({ value: map.id, label: map.name }))"
             :disabled="maps.summaries.length === 0"
             :placeholder="t('omf.studio.chooseMap')"
@@ -714,7 +716,7 @@ onBeforeUnmount(() => {
       </aside>
     </div>
 
-    <div class="mt-6 grid grid-cols-2 gap-6">
+    <div class="grid grid-cols-2 gap-6">
       <TCard :title="t('omf.studio.regionsDrawn', { count: regionDrafts.length })" size="small">
         <p v-if="regionRows.length === 0" class="text-sm text-muted">
           {{ t('omf.studio.drawnEmpty') }}
@@ -769,7 +771,7 @@ onBeforeUnmount(() => {
       </TCard>
     </div>
 
-    <TCard class="mt-6" :title="t('omf.edit.title')" size="small">
+    <TCard :title="t('omf.edit.title')" size="small">
       <p class="text-sm text-muted">{{ t('omf.edit.unsupported') }}</p>
       <p class="mt-1 text-sm text-muted">{{ t('omf.edit.stored') }}</p>
       <TInput
@@ -779,5 +781,5 @@ onBeforeUnmount(() => {
         :placeholder="t('omf.studio.sourceImage')"
       />
     </TCard>
-  </section>
+  </div>
 </template>

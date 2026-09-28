@@ -27,16 +27,30 @@ export interface Histogram {
  * constant signal draws a single bar rather than an empty chart.
  */
 export function histogram(values: readonly number[], binCount = 30): Histogram {
-  const finite = values.filter((value) => Number.isFinite(value))
   const bins = Math.max(1, Math.trunc(binCount))
-  if (finite.length === 0) {
+  // The extent is folded rather than spread: `Math.min(...values)` passes one argument per
+  // sample, and a viewer that streamed a whole map holds far more of them than the engine
+  // accepts as arguments, which fails as a stack overflow instead of a histogram.
+  let min = Number.POSITIVE_INFINITY
+  let max = Number.NEGATIVE_INFINITY
+  let present = 0
+  for (const value of values) {
+    if (!Number.isFinite(value)) {
+      continue
+    }
+    present += 1
+    min = Math.min(min, value)
+    max = Math.max(max, value)
+  }
+  if (present === 0) {
     return { edges: [0], upperEdges: [0], counts: [0], width: 0 }
   }
-  const min = Math.min(...finite)
-  const max = Math.max(...finite)
   const width = max - min === 0 ? 1 : (max - min) / bins
   const counts = Array.from({ length: bins }, () => 0)
-  for (const value of finite) {
+  for (const value of values) {
+    if (!Number.isFinite(value)) {
+      continue
+    }
     const slot = Math.min(bins - 1, Math.floor((value - min) / width))
     counts[slot] = (counts[slot] ?? 0) + 1
   }

@@ -24,7 +24,7 @@
  * agreement between two neighbouring chunks. `render/terrain.ts` hands the arrays to
  * Babylon.
  */
-import { TERRAIN_RAMP } from '@/types/colormap'
+import { normalize } from '@/types/colormap'
 import {
   chunkBounds,
   inMapDims,
@@ -33,16 +33,15 @@ import {
   type PlaneOrigin,
 } from '@/types/map'
 import type { LayerGrid } from '@/api/types'
-import type { Rgb } from '@/types/colormap'
 import type { CellSampler } from './cellSampler'
 import {
+  SLAB_FLOOR_SHADE,
+  SLAB_WALL_SHADE,
   cavityShade,
   reliefShade,
-  slabColour,
   slopeAccent,
   sunDirection,
   terrace,
-  terrainColour,
 } from './shading'
 
 /** Vertex data of one mesh part, in world metres with the elevation in y. */
@@ -53,8 +52,26 @@ export interface MeshData {
   indices: Uint32Array
   /** Vertex normals. */
   normals: Float32Array
-  /** Vertex colours, `r, g, b, a` per vertex. */
-  colors: Float32Array
+  /**
+   * Per-vertex ramp inputs, `t, shade` per vertex.
+   *
+   * The surface colour is `ramp(t) * shade`, and neither term depends on the appearance,
+   * so the geometry survives a light/dark switch: the ramp is applied to this buffer
+   * afterwards, and an appearance change is an upload of the colour buffer alone. Baking
+   * the colour here instead would make every appearance change rebuild the map.
+   *
+   * `t` is the elevation normalised against the whole surface's range, so a chunk drawn
+   * on its own is not rescaled into a different range than its neighbours.
+   */
+  rampInput: Float32Array
+  /**
+   * Per-vertex building mask, `1` where a building stands on the cell and `0` elsewhere.
+   *
+   * Present only when the caller supplied a mask: a surface drawn from elevation alone has
+   * nothing to say about buildings. The colours read it to draw a footprint as the near-white
+   * block a navigation display shows, rather than tinting it with the elevation ramp.
+   */
+  building?: Float32Array
   /**
    * Texture coordinates in *world space*, one period per metre count.
    *
@@ -127,8 +144,6 @@ export interface ChunkGrid {
 
 /** Options of {@link buildChunkMesh}. */
 export interface ChunkMeshOptions {
-  /** Colour ramp for the elevation; the shared surface ramp applies by default. */
-  ramp?: readonly Rgb[]
   /**
    * Elevation range the ramp spans, metres.
    *
@@ -143,6 +158,13 @@ export interface ChunkMeshOptions {
   sun?: readonly [number, number, number]
   /** World height of the slab's underside, metres; the range minimum by default. */
   slabFloorY?: number
+  /**
+   * Reader of the building mask, one value per cell.
+   *
+   * The mask rides in the elevation layer's second channel: without it a building is drawn as
+   * ground at its roof height rather than as the block it is.
+   */
+  building?: CellSampler
 }
 
 /** Where one chunk's mesh stands, from the level's grid and the map's origin. */
@@ -231,13 +253,12 @@ export function buildChunkMesh(
   }
 
   const normals = heightFieldNormals(positions, columns, rows, cell)
-  const ramp = options.ramp ?? TERRAIN_RAMP
   const range = options.range ?? surfaceRange(heights)
   const sun = options.sun ?? sunDirection()
   // Shading is applied here rather than by the material: the ramp spans the surface, not
   // the chunk, so a chunk drawn on its own is not rescaled into a different range than its
   // neighbours.
-  const colors = new Float32Array(columns * rows * 4)
+  const rampInput = new Float32Array(columns * rows * 2)
   for (let row = 0; row < rows; row += 1) {
     for (let column = 0; column < columns; column += 1) {
       const vertex = row * columns + column
@@ -250,11 +271,8 @@ export function buildChunkMesh(
         reliefShade(normal, sun) *
         slopeAccent(normal[1]) *
         cavityShade(relativeDepth(heights, columns, rows, column, row, cell))
-      const colour = terrainColour(heights[vertex] ?? 0, shade, ramp, range)
-      colors[vertex * 4] = colour[0] / 255
-      colors[vertex * 4 + 1] = colour[1] / 255
-      colors[vertex * 4 + 2] = colour[2] / 255
-      colors[vertex * 4 + 3] = 1
+      rampInput[vertex * 2] = normalize(heights[vertex] ?? 0, range.min, range.max)
+      rampInput[vertex * 2 + 1] = shade
     }
   }
 
@@ -262,8 +280,10 @@ export function buildChunkMesh(
     positions,
     indices,
     normals,
-    colors,
+    rampInput,
     uvs,
+    building:
+      options.building === undefined ? undefined : buildingMask(spec, options.building),
     grid: { columns, rows },
     slab: buildSlab({
       minX: originX,
@@ -275,26 +295,53 @@ export function buildChunkMesh(
       edges,
       heights,
       floorY: options.slabFloorY ?? range.min,
-      ramp,
       range,
     }),
   }
 }
 
 /**
- * Height a mesh vertex takes, from the cell under it.
+ * The global cell a mesh vertex reads from.
  *
  * The grid carries one vertex per in-map cell plus, on an internal side, the neighbour's
  * first cell — that is the vertex the boundary quad needs, and reading the neighbour's own
  * cell is what makes the two chunks agree bit for bit. On the map's rim there is nothing
  * beyond to read, so the last cell repeats itself and the slab wall closes the model.
  */
-function cellHeight(spec: ChunkGrid, sample: CellSampler, column: number, row: number): number {
+function cellIndices(spec: ChunkGrid, column: number, row: number): { i: number; j: number } {
   const atRimEast = spec.edges.east && column === spec.columns - 1
   const atRimSouth = spec.edges.south && row === spec.rows - 1
-  const i = spec.firstI + (atRimEast ? column - 1 : column)
-  const j = spec.firstJ + (atRimSouth ? row - 1 : row)
+  return {
+    i: spec.firstI + (atRimEast ? column - 1 : column),
+    j: spec.firstJ + (atRimSouth ? row - 1 : row),
+  }
+}
+
+/** Height a mesh vertex takes, from the cell under it. */
+function cellHeight(spec: ChunkGrid, sample: CellSampler, column: number, row: number): number {
+  const { i, j } = cellIndices(spec, column, row)
   return sample(i, j) ?? 0
+}
+
+/**
+ * Per-vertex building occupancy over the mesh grid.
+ *
+ * A vertex counts as a building vertex when the mask under it is set. The threshold is a
+ * half rather than "greater than zero" because the mask is box-averaged up the LOD pyramid:
+ * a coarse level carries fractions, and a half is where a footprint is more present than not.
+ * A map whose elevation layer has no mask channel reads `null` throughout, which leaves the
+ * whole surface coloured by the ramp as before.
+ */
+function buildingMask(spec: ChunkGrid, sample: CellSampler): Float32Array {
+  const mask = new Float32Array(spec.columns * spec.rows)
+  for (let row = 0; row < spec.rows; row += 1) {
+    for (let column = 0; column < spec.columns; column += 1) {
+      const { i, j } = cellIndices(spec, column, row)
+      const value = sample(i, j)
+      mask[row * spec.columns + column] = value !== null && value >= 0.5 ? 1 : 0
+    }
+  }
+  return mask
 }
 
 /**
@@ -389,9 +436,7 @@ interface SlabInput {
   heights: Float32Array
   /** World y of the slab's underside. */
   floorY: number
-  /** Colour ramp of the surface. */
-  ramp: readonly Rgb[]
-  /** Elevation range the ramp spans. */
+  /** Elevation range the wall heights are normalised against. */
   range: { min: number; max: number }
 }
 
@@ -403,11 +448,11 @@ interface SlabInput {
  * since chunks tile the map their floors tile it too.
  */
 function buildSlab(input: SlabInput): MeshData {
-  const { inMapColumns, inMapRows, stride, cell, edges, heights, floorY, ramp, range } = input
+  const { inMapColumns, inMapRows, stride, cell, edges, heights, floorY, range } = input
   const positions: number[] = []
   const indices: number[] = []
   const normals: number[] = []
-  const colors: number[] = []
+  const rampInput: number[] = []
 
   const uvs: number[] = []
   const pushVertex = (
@@ -415,11 +460,12 @@ function buildSlab(input: SlabInput): MeshData {
     y: number,
     z: number,
     normal: [number, number, number],
-    colour: Rgb,
+    height: number,
+    shade: number,
   ): number => {
     positions.push(x, y, z)
     normals.push(normal[0], normal[1], normal[2])
-    colors.push(colour[0] / 255, colour[1] / 255, colour[2] / 255, 1)
+    rampInput.push(normalize(height, range.min, range.max), shade)
     uvs.push(x / GRAIN_PERIOD_M, z / GRAIN_PERIOD_M)
     return positions.length / 3 - 1
   }
@@ -431,8 +477,6 @@ function buildSlab(input: SlabInput): MeshData {
   const clampedRow = (row: number): number => Math.min(row, inMapRows - 1)
   const heightAt = (column: number, row: number): number =>
     heights[clampedRow(row) * stride + clampedColumn(column)] ?? 0
-  const colourAt = (column: number, row: number): Rgb =>
-    slabColour(terrainColour(heightAt(column, row), 1, ramp, range))
   const worldX = (column: number): number => input.minX + column * cell
   const worldZ = (row: number): number => input.minZ + row * cell
 
@@ -457,33 +501,39 @@ function buildSlab(input: SlabInput): MeshData {
   }
   for (const side of sides) {
     for (const [columnA, rowA, columnB, rowB] of side.pairs) {
+      // Both ends of a wall take the height of the surface above them, so a wall reads as
+      // the side of the block it belongs to rather than as a gradient of its own.
       const a = pushVertex(
         worldX(columnA),
         heightAt(columnA, rowA),
         worldZ(rowA),
         side.normal,
-        colourAt(columnA, rowA),
+        heightAt(columnA, rowA),
+        SLAB_WALL_SHADE,
       )
       const b = pushVertex(
         worldX(columnB),
         heightAt(columnB, rowB),
         worldZ(rowB),
         side.normal,
-        colourAt(columnB, rowB),
+        heightAt(columnB, rowB),
+        SLAB_WALL_SHADE,
       )
       const c = pushVertex(
         worldX(columnB),
         floorY,
         worldZ(rowB),
         side.normal,
-        colourAt(columnB, rowB),
+        heightAt(columnB, rowB),
+        SLAB_WALL_SHADE,
       )
       const d = pushVertex(
         worldX(columnA),
         floorY,
         worldZ(rowA),
         side.normal,
-        colourAt(columnA, rowA),
+        heightAt(columnA, rowA),
+        SLAB_WALL_SHADE,
       )
       indices.push(a, b, c, a, c, d)
     }
@@ -495,18 +545,25 @@ function buildSlab(input: SlabInput): MeshData {
   const spanX = inMapColumns * cell
   const spanZ = inMapRows * cell
   const floorNormal: [number, number, number] = [0, -1, 0]
-  const floorColour = slabColour(colourAt(0, 0), 0.6)
-  const floorA = pushVertex(minX, floorY, minZ, floorNormal, floorColour)
-  const floorB = pushVertex(minX + spanX, floorY, minZ, floorNormal, floorColour)
-  const floorC = pushVertex(minX + spanX, floorY, minZ + spanZ, floorNormal, floorColour)
-  const floorD = pushVertex(minX, floorY, minZ + spanZ, floorNormal, floorColour)
+  const floorHeight = heightAt(0, 0)
+  const floorA = pushVertex(minX, floorY, minZ, floorNormal, floorHeight, SLAB_FLOOR_SHADE)
+  const floorB = pushVertex(minX + spanX, floorY, minZ, floorNormal, floorHeight, SLAB_FLOOR_SHADE)
+  const floorC = pushVertex(
+    minX + spanX,
+    floorY,
+    minZ + spanZ,
+    floorNormal,
+    floorHeight,
+    SLAB_FLOOR_SHADE,
+  )
+  const floorD = pushVertex(minX, floorY, minZ + spanZ, floorNormal, floorHeight, SLAB_FLOOR_SHADE)
   indices.push(floorA, floorC, floorB, floorA, floorD, floorC)
 
   return {
     positions: new Float32Array(positions),
     indices: new Uint32Array(indices),
     normals: new Float32Array(normals),
-    colors: new Float32Array(colors),
+    rampInput: new Float32Array(rampInput),
     uvs: new Float32Array(uvs),
   }
 }

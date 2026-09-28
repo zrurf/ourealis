@@ -24,11 +24,9 @@ interface NavItem {
 }
 
 const NAV_ITEMS: readonly NavItem[] = [
-  { path: '/', labelKey: 'nav.dashboard', icon: 'dashboard' },
   { path: '/maps', labelKey: 'nav.maps', icon: 'maps' },
   { path: '/run', labelKey: 'nav.run', icon: 'run' },
-  { path: '/batch', labelKey: 'nav.batch', icon: 'batch' },
-  { path: '/omf', labelKey: 'nav.omf', icon: 'inspect' },
+  { path: '/runs', labelKey: 'nav.runs', icon: 'history' },
   { path: '/settings', labelKey: 'nav.settings', icon: 'settings' },
 ]
 

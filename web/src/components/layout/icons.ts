@@ -34,6 +34,7 @@ export type IconName =
   | 'dashboard'
   | 'maps'
   | 'run'
+  | 'history'
   | 'batch'
   | 'inspect'
   | 'settings'
@@ -91,6 +92,10 @@ export const ICONS: Readonly<Record<IconName, IconPath>> = {
   dashboard: { paths: ['M3 13h7V3H3z', 'M14 21h7V11h-7z', 'M3 21h7v-5H3z', 'M14 8h7V3h-7z'] },
   maps: { paths: ['M3 6.5 9 4l6 2.5L21 4v13.5L15 20l-6-2.5L3 20z', 'M9 4v13.5', 'M15 6.5V20'] },
   run: { paths: ['M13 3.5 6 13h4.5L9.5 20.5 17 11h-4.5z'] },
+  history: {
+    paths: ['M12 7v5l3.4 2'],
+    circles: [[12, 12, 8]],
+  },
   batch: { paths: ['M4 4h12v12H4z', 'M8 8h12v12H8z'] },
   inspect: {
     paths: ['M11 4.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13z', 'M15.6 15.6 20.5 20.5'],

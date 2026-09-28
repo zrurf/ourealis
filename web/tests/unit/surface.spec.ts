@@ -10,20 +10,28 @@
  */
 import { expect, test } from '@playwright/test'
 import {
+  BUILDING_COLOUR,
+  SHADE_RANGE,
+  SLAB_FLOOR_SHADE,
+  SLAB_WALL_SHADE,
   autoTerraceStep,
   cavityShade,
   reliefShade,
-  slabColour,
   slabThickness,
   slopeAccent,
   sunDirection,
   terrace,
-  terrainColour,
+  terrainColours,
 } from '../../src/render/shading'
 import { buildChunkMesh, chunkEdges, chunkGrid } from '../../src/render/terrainMesh'
 import { drapedMesh } from '../../src/render/layerTexture'
 import { createCellSampler } from '../../src/render/cellSampler'
-import { effectiveTerraceStep, slabFloorOf, surfaceStyle } from '../../src/render/surfaceStyle'
+import {
+  effectiveTerraceStep,
+  slabFloorOf,
+  surfaceKey,
+  surfaceStyle,
+} from '../../src/render/surfaceStyle'
 import { drapePath, gridPaths } from '../../src/render/drape'
 import { TERRAIN_RAMP, TERRAIN_RAMP_DARK } from '../../src/types/colormap'
 import { drapeSourceLevel, mortonEncodeChunk, type DecodedChunk } from '../../src/types/map'
@@ -148,19 +156,39 @@ test.describe('shading', () => {
     expect(slopeAccent(0.2)).toBeLessThan(1)
   })
 
-  test('a vertex colour stays inside its ramp, scaled by the shade', () => {
-    const range = { min: 0, max: 10 }
-    const dark = terrainColour(0, 0.5, TERRAIN_RAMP, range)
-    const light = terrainColour(10, 1, TERRAIN_RAMP, range)
-    expect(light[0]).toBeGreaterThan(dark[0])
-    expect(TERRAIN_RAMP[0]?.[0]).toBe(Math.min(...TERRAIN_RAMP.map((stop) => stop[0])))
+  test('a vertex colour is the ramp colour at its height, scaled by its shade', () => {
+    // Two vertices at the top of the range: the lit one keeps the ramp's colour, the one in
+    // shadow is exactly half of it. The same pair at the bottom of the range takes the ramp's
+    // first stop instead.
+    const litres = terrainColours(new Float32Array([1, 1, 1, 0.5, 0, 1]), TERRAIN_RAMP)
+    const last = TERRAIN_RAMP[TERRAIN_RAMP.length - 1] ?? [0, 0, 0]
+    expect(litres[0]).toBeCloseTo((last[0] ?? 0) / 255, 6)
+    expect(litres[4]).toBeCloseTo(((last[0] ?? 0) / 255) * 0.5, 6)
+    expect(litres[8]).toBeCloseTo((TERRAIN_RAMP[0]?.[0] ?? 0) / 255, 6)
+    expect(litres[3]).toBe(1)
   })
 
-  test('a slab face is darker than the surface it belongs to', () => {
-    const top = terrainColour(5, 1, TERRAIN_RAMP, { min: 0, max: 10 })
-    const slab = slabColour(top)
-    expect(slab[0]).toBeLessThanOrEqual(top[0])
-    expect(slab[1]).toBeLessThanOrEqual(top[1])
+  test('the same geometry takes either ramp, which is what makes a theme switch cheap', () => {
+    const input = new Float32Array([1, 1])
+    const light = terrainColours(input, TERRAIN_RAMP)
+    const dark = terrainColours(input, TERRAIN_RAMP_DARK)
+    expect(dark[0]).toBeLessThan(light[0] ?? 0)
+    expect(dark.length).toBe(light.length)
+  })
+
+  test('a building vertex takes the near-white block colour, not the ramp', () => {
+    // Two vertices at the same height and shade: the masked one is the block a navigation
+    // display draws, the other keeps the ramp. A masked vertex is deliberately unaffected by
+    // the ramp, which is the whole point — a footprint is a volume, not a height reading.
+    const input = new Float32Array([1, 1, 1, 1])
+    const plain = terrainColours(input, TERRAIN_RAMP)
+    const masked = terrainColours(input, TERRAIN_RAMP, new Float32Array([1, 0]))
+    expect(masked[0]).toBeCloseTo(BUILDING_COLOUR[0] / 255, 6)
+    expect(masked[0]).not.toBeCloseTo(plain[0] ?? 0, 6)
+    expect(masked[4]).toBeCloseTo(plain[4] ?? 0, 6)
+    // The shade still applies, so two faces of the same block stay distinguishable.
+    const shaded = terrainColours(new Float32Array([1, 0.5]), TERRAIN_RAMP, new Float32Array([1]))
+    expect(shaded[0]).toBeCloseTo((BUILDING_COLOUR[0] / 255) * 0.5, 6)
   })
 
   test('the automatic terrace step is a round number that fits the relief', () => {
@@ -275,6 +303,67 @@ test.describe('chunk meshes', () => {
     expect(slabThickness({ min: 3, max: 3 })).toBe(4)
     expect(slabThickness({ min: 0, max: 100 })).toBe(60)
   })
+
+  test('a chunk carries the shape of its surface, not its colour', () => {
+    const grid = gridOf([8, 4])
+    const sample = createCellSampler({
+      chunks: chunksOf(grid),
+      grid,
+      chunkSize: 4,
+      level: 0,
+      layerId: 1,
+    })
+    const mesh = buildChunkMesh(chunkGrid(grid, 4, 0, 0), sample, { range: { min: 10, max: 20 } })
+    const vertices = mesh.positions.length / 3
+    expect(mesh.rampInput).toHaveLength(vertices * 2)
+    for (let vertex = 0; vertex < vertices; vertex += 1) {
+      const t = mesh.rampInput[vertex * 2] ?? -1
+      const shade = mesh.rampInput[vertex * 2 + 1] ?? -1
+      // The height is normalised against the whole surface's range, so the ramp is
+      // comparable across chunks; the shade is the product of every lighting term, so it
+      // only has to stay positive and inside the range the relief term clamps to.
+      expect(t).toBeGreaterThanOrEqual(0)
+      expect(t).toBeLessThanOrEqual(1)
+      expect(shade).toBeGreaterThan(0)
+      expect(shade).toBeLessThanOrEqual(SHADE_RANGE[1])
+    }
+  })
+
+  test('a chunk carries the building mask when the caller supplies one, and nothing when not', () => {
+    const grid = gridOf([4, 4])
+    const spec = chunkGrid(grid, 4, 0, 0)
+    const plain = buildChunkMesh(spec, () => 7)
+    expect(plain.building).toBeUndefined()
+
+    const mesh = buildChunkMesh(spec, () => 7, { building: (i, j) => (i === 1 && j === 1 ? 1 : 0) })
+    expect(mesh.building).toHaveLength(mesh.positions.length / 3)
+    // One vertex is the building; every other cell of the chunk is bare ground.
+    const set = [...(mesh.building ?? [])].filter((value) => value === 1).length
+    expect(set).toBe(1)
+    // A mask that only carries fractions — an averaged coarse level — counts as a building
+    // from a half upwards, so a footprint survives the LOD pyramid.
+    const coarse = buildChunkMesh(spec, () => 7, { building: () => 0.5 })
+    expect([...(coarse.building ?? [])].every((value) => value === 1)).toBe(true)
+  })
+
+  test('the slab under a chunk is shaded below the surface it carries', () => {
+    const grid = gridOf([4, 4])
+    const mesh = buildChunkMesh(chunkGrid(grid, 4, 0, 0), () => 7, {
+      range: { min: 0, max: 10 },
+      slabFloorY: 0,
+    })
+    const shades = new Set<number>()
+    for (let vertex = 0; vertex < mesh.slab.rampInput.length / 2; vertex += 1) {
+      shades.add(mesh.slab.rampInput[vertex * 2 + 1] ?? 0)
+    }
+    // Two levels of shade and nothing else: the walls, and the floor beneath them.
+    const sorted = [...shades].toSorted((a, b) => a - b)
+    expect(sorted).toHaveLength(2)
+    expect(sorted[0]).toBeCloseTo(SLAB_FLOOR_SHADE, 5)
+    expect(sorted[1]).toBeCloseTo(SLAB_WALL_SHADE, 5)
+    expect(SLAB_FLOOR_SHADE).toBeLessThan(SLAB_WALL_SHADE)
+    expect(SLAB_WALL_SHADE).toBeLessThan(1)
+  })
 })
 
 test.describe('the drape of a layer', () => {
@@ -317,7 +406,6 @@ test.describe('the drape of a layer', () => {
 test.describe('surface style', () => {
   const base = {
     range: { min: 0, max: 10 },
-    dark: false,
     terraceM: null,
     sunAzimuthDeg: 315,
     origin: { x: 0, y: 0 },
@@ -334,9 +422,11 @@ test.describe('surface style', () => {
     expect(slabFloorOf({ ...base, range: null })).toBe(0)
   })
 
-  test('the dark appearance uses the dark ramp', () => {
-    expect(surfaceStyle(base).ramp).toBe(TERRAIN_RAMP)
-    expect(surfaceStyle({ ...base, dark: true }).ramp).toBe(TERRAIN_RAMP_DARK)
+  test('the style carries no appearance, so switching it rebuilds nothing', () => {
+    // The key is what a view watches to decide a rebuild. It holds the values that move
+    // vertices and nothing else, so a light/dark switch cannot appear in it.
+    expect(surfaceKey(base)).toBe(JSON.stringify([0, 10, 1, 315, null]))
+    expect('ramp' in surfaceStyle(base)).toBe(false)
   })
 })
 

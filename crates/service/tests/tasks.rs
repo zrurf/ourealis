@@ -151,8 +151,10 @@ async fn a_plan_is_a_ticket_whose_result_is_the_candidate_set() {
     // A plan carries the smoothed path and its speed limits, which is what makes it a
     // plan rather than a preview.
     let route = &result["route"];
+    let legs = route["legs"].as_array().expect("legs");
+    assert!(!legs.is_empty(), "a plan must carry at least one leg");
     assert!(
-        !route["candidates"]
+        !legs[0]["candidates"]
             .as_array()
             .expect("candidates")
             .is_empty()

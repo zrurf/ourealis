@@ -658,7 +658,9 @@ async fn the_route_preview_returns_candidates_without_running_motion() {
         "the ticket must carry the preview: {preview}"
     );
     let preview = preview["route"].clone();
-    let candidates = preview["candidates"].as_array().expect("candidates");
+    let legs = preview["legs"].as_array().expect("legs");
+    assert!(!legs.is_empty(), "at least one leg: {preview}");
+    let candidates = legs[0]["candidates"].as_array().expect("candidates");
     assert!(!candidates.is_empty(), "at least one candidate: {preview}");
     assert!(
         candidates[0]["points"]

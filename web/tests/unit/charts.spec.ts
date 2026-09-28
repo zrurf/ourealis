@@ -86,6 +86,17 @@ test.describe('histogram', () => {
     expect(histogram([], 4)).toEqual({ edges: [0], upperEdges: [0], counts: [0], width: 0 })
   })
 
+  test('bins a sample set larger than the engine argument limit', () => {
+    // The extent is folded rather than spread: a viewer that streamed a whole map holds
+    // more samples than `Math.min(...values)` can pass as arguments, and spreading them
+    // throws `RangeError: Maximum call stack size exceeded` instead of binning.
+    const values = Array.from({ length: 300_000 }, (_, index) => index % 1000)
+    const bins = histogram(values, 10)
+    expect(bins.counts.reduce((sum, count) => sum + count, 0)).toBe(values.length)
+    expect(bins.edges[0]).toBe(0)
+    expect(bins.width).toBeCloseTo(99.9, 5)
+  })
+
   test('the option labels the axis with the bin edges and can report density', () => {
     const option = histogramOption({ x: 'error (m)', y: 'count', values: [0, 1, 2, 3], bins: 2 })
     const axisData = field(field(option, 'xAxis'), 'data')

@@ -11,6 +11,7 @@
  */
 import { expect, test } from '@playwright/test'
 import { serviceGate } from '../support/service'
+import { buildSyntheticMap } from '../support/tasks'
 
 /** The debug hook `src/render/scene.ts` publishes; the viewer's only test surface. */
 interface DebugState {
@@ -110,7 +111,91 @@ test.describe('map viewer', () => {
     await expect.poll(async () => (await debugState(page))?.engine ?? null).toBe('webgl2')
     await expect(page.getByTestId('engine-chip')).toHaveText('WebGL2')
   })
+
+  test('the painted map follows the interface appearance', async ({ page, request }) => {
+    service.skipUnlessAvailable()
+
+    await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
+    // A compact fixture paints every cell, so its drape covers the terrain completely: what
+    // the canvas shows is the data's own colours, and nothing else can darken them.
+    const name = `e2e appearance ${Date.now()}`
+    const mapId = await buildSyntheticMap(
+      request,
+      { preset: 'compact', seed: 5, with_kpath_library: false },
+      name,
+    )
+    await page.setViewportSize({ width: 1400, height: 900 })
+    await page.goto(`/maps/${mapId}`)
+    await expect(page.locator('h1')).toHaveText('Map preview')
+    await expect.poll(async () => (await debugState(page))?.loaded ?? false).toBe(true)
+
+    const surface = page.getByTestId('layer-4096')
+    await expect(surface).toBeVisible()
+    await surface.click()
+    await expect(surface).toHaveClass(/t-is-checked/)
+    // The terrain off leaves the painted drape alone on the canvas: the sample then measures
+    // the data's own colours, and no ramp of the scene can stand in for them.
+    const elevation = page.getByTestId('layer-1')
+    await elevation.click()
+    await expect(elevation).not.toHaveClass(/t-is-checked/)
+    await page.waitForTimeout(1_500)
+
+    const light = await canvasChroma(page)
+
+    await page.getByRole('button', { name: 'Dark' }).click()
+    await expect(page.locator('html')).toHaveAttribute('theme-mode', 'dark')
+    await page.waitForTimeout(1_500)
+    const dark = await canvasChroma(page)
+
+    // The drape is painted, so it has colour to lose, and the switch visibly dimmed it
+    // rather than leaving the reader with the same picture under a dark frame.
+    expect(light).toBeGreaterThan(2)
+    expect(dark).toBeLessThan(light * 0.85)
+  })
 })
+
+/**
+ * Mean colourfulness of the middle of the map canvas, on a 0–255 scale.
+ *
+ * Saturation is what a painted layer carries and the terrain, its ramp and the page behind
+ * them do not, so a drop in it can only come from the drape the appearance is meant to
+ * reach. The canvas holds the live frame, which a test cannot read back once it has been
+ * presented, so the frame is copied into a 2D context first.
+ */
+async function canvasChroma(page: import('@playwright/test').Page): Promise<number> {
+  return page.evaluate(() => {
+    const canvas = document.querySelector<HTMLCanvasElement>('[data-testid="shared-canvas"]')
+    if (canvas === null || canvas.width === 0) {
+      return -1
+    }
+    const size = Math.round(Math.min(canvas.width, canvas.height) / 2)
+    const copy = document.createElement('canvas')
+    copy.width = size
+    copy.height = size
+    const context = copy.getContext('2d')
+    if (context === null) {
+      return -1
+    }
+    context.drawImage(
+      canvas,
+      Math.round((canvas.width - size) / 2),
+      Math.round((canvas.height - size) / 2),
+      size,
+      size,
+      0,
+      0,
+      size,
+      size,
+    )
+    const { data } = context.getImageData(0, 0, size, size)
+    let total = 0
+    for (let index = 0; index < data.length; index += 4) {
+      const channels = [data[index] ?? 0, data[index + 1] ?? 0, data[index + 2] ?? 0]
+      total += Math.max(...channels) - Math.min(...channels)
+    }
+    return total / (data.length / 4)
+  })
+}
 
 /** Reads the renderer's debug hook, or null before the viewer has written it. */
 async function debugState(page: import('@playwright/test').Page): Promise<DebugState | null> {

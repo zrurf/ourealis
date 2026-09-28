@@ -70,7 +70,10 @@ test('a two-individual sweep fills the table and both charts', async ({ page, re
   // The header lookup below compares against the English catalog, so the page is
   // opened in English whatever an earlier lane left behind.
   await page.addInitScript(() => globalThis.localStorage.setItem('ourealis.locale', 'en'))
-  await page.goto('/batch')
+  // The sweep is the batch mode of the run page; the mode is a local choice, so the
+  // lane opens the workspace and switches to it the way a reader does.
+  await page.goto('/run')
+  await page.getByTestId('run-mode-batch').click()
   await expect(page.getByTestId('batch-view')).toBeVisible()
 
   // Two individuals: the fan-out is exercised without a long run.

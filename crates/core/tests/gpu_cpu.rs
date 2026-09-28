@@ -74,6 +74,42 @@ fn cost_synthesis_matches_the_cpu_reference() {
 }
 
 #[test]
+fn a_cost_field_wider_than_the_dispatch_cap_is_covered() {
+    // A whole map's cost field runs to millions of cells while a dispatch is capped at
+    // 65535 workgroups per dimension — 4 194 240 invocations of 64. The kernel therefore
+    // walks its grid in strides, and this field sits just past that cap so both halves
+    // of the fix are exercised: an unclamped dispatch is rejected as a validation error,
+    // and a stride that stops short leaves the last cells unwritten.
+    let Some(gpu) = gpu_backend() else {
+        return;
+    };
+    let cpu = CpuBackend::new();
+
+    let cells = 4_200_000;
+    let features: Vec<f32> = (0..cells).map(|cell| (cell % 1024) as f32 * 0.001).collect();
+    let feature_tensor = FeatureTensor::new(cells, 1, features).expect("tensor");
+    let weights = WeightMatrix::from_vectors(&[vec![1.0]]).expect("weights");
+
+    let reference = cpu
+        .cost_field_batch(&feature_tensor, &weights, 0.5)
+        .expect("cpu");
+    let accelerated = gpu
+        .cost_field_batch(&feature_tensor, &weights, 0.5)
+        .expect("gpu");
+
+    assert_eq!(accelerated.cells, cells);
+    let mut worst = 0.0f32;
+    for (a, b) in reference.values.iter().zip(accelerated.values.iter()) {
+        worst = worst.max((a - b).abs());
+    }
+    assert!(
+        worst < 1e-4,
+        "GPU and CPU cost fields differ by {worst} past the dispatch cap, backend {}",
+        gpu.name()
+    );
+}
+
+#[test]
 fn noise_batches_are_bit_identical() {
     let Some(gpu) = gpu_backend() else {
         return;

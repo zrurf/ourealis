@@ -1,15 +1,19 @@
 <script setup lang="ts">
 /*
- * A run: one job's live state and its
- * result at `/simulations/<id>`.
+ * Runs: the history at `/runs` and one job's live state, result and detail tabs
+ * at `/runs/:id`.
  *
  * The live panel is built around what the service actually reports (doc §4.5):
  * a state, a stage, an elapsed time and a log — never a percentage, because the
  * simulator's run is a single call and `progress` stays null while it runs. The
  * elapsed timer here is therefore the progress indicator, advanced by an interval
  * and never allowed to overtake a value an event carried.
+ *
+ * The detail tabs are held in the URL query, so a reload and a deep link open the
+ * same one; only the selected tab is mounted, which disposes the 3D scene and the
+ * charts of the others.
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import {
@@ -20,31 +24,55 @@ import {
   Table as TTable,
   Tag as TTag,
 } from 'tdesign-vue-next'
-import { isTerminalState, type SimulationRequest } from '@/types/simulation'
-import { useMapsStore } from '@/stores/maps'
+import { isTerminalState } from '@/types/simulation'
 import { useNotificationsStore } from '@/stores/notifications'
 import { manifestOf, metricRows, reportOf, useSimulationsStore } from '@/stores/simulations'
-import SimulationForm from '@/components/forms/SimulationForm.vue'
+import TrajectoryPanel from '@/components/run/TrajectoryPanel.vue'
+import SensorPanel from '@/components/run/SensorPanel.vue'
+import AuditPanel from '@/components/run/AuditPanel.vue'
+
+/** Detail tabs, in order, with the catalog key of each label. */
+const TABS: ReadonlyArray<{
+  id: 'overview' | 'trajectory' | 'sensors' | 'audit'
+  labelKey: string
+}> = [
+  { id: 'overview', labelKey: 'simulation.tabs.overview' },
+  { id: 'trajectory', labelKey: 'simulation.tabs.trajectory' },
+  { id: 'sensors', labelKey: 'simulation.tabs.sensors' },
+  { id: 'audit', labelKey: 'simulation.tabs.audit' },
+]
+
+/** One detail tab of the run page. */
+type Tab = (typeof TABS)[number]['id']
 
 const { t, locale } = useI18n({ useScope: 'global' })
 const route = useRoute()
 const router = useRouter()
-const maps = useMapsStore()
 const notifications = useNotificationsStore()
 const simulations = useSimulationsStore()
 
-const submitting = ref(false)
 let timer: ReturnType<typeof setInterval> | null = null
 
-/** Identifier from the path; `new` means the submission form. */
+/** Identifier from the path; empty on `/runs`, which is the history list. */
 const jobId = computed(() => String(route.params.id ?? ''))
-const isNew = computed(() => jobId.value === 'new')
+
+/** True on the history list, where no single job is shown. */
+const isList = computed(() => jobId.value === '')
 
 /** The job being shown, when there is one. */
-const job = computed(() => (isNew.value ? null : simulations.current))
+const job = computed(() => (isList.value ? null : simulations.current))
 
 /** True once the shown job cannot change state again. */
 const finished = computed(() => job.value !== null && isTerminalState(job.value.state))
+
+/** Selected detail tab, read from the query; an unknown value falls back to overview. */
+const tab = computed<Tab>(() => {
+  const value = route.query.tab
+  if (typeof value === 'string' && TABS.some((entry) => entry.id === value)) {
+    return value as Tab
+  }
+  return 'overview'
+})
 
 /** Summary of the shown job, once read. */
 const summary = computed(() => simulations.currentSummary)
@@ -108,7 +136,7 @@ const sampleRows = computed(() => {
   ]
 })
 
-/** Recent jobs of the sidebar. */
+/** Recent jobs of the aside and of the history table. */
 const recent = computed(() => simulations.jobs.slice(0, 15))
 
 const columns = computed(() => [
@@ -170,10 +198,15 @@ function open(id: string): void {
   void router.push({ name: 'simulation', params: { id } })
 }
 
+/** Switches the detail tab, in the URL so a reload lands on the same one. */
+function selectTab(next: Tab): void {
+  void router.replace({ query: { ...route.query, tab: next } })
+}
+
 /** Reads the job's state, its stream and — once it finished — its summary. */
 async function loadJob(): Promise<void> {
   const id = jobId.value
-  if (isNew.value || id === '') {
+  if (id === '') {
     return
   }
   simulations.select(id)
@@ -188,21 +221,9 @@ async function loadJob(): Promise<void> {
   simulations.openStream(id)
 }
 
-/** Submits the assembled request and follows the new job. */
-async function submit(request: SimulationRequest): Promise<void> {
-  if (submitting.value) {
-    return
-  }
-  submitting.value = true
-  try {
-    const id = await simulations.submit(request)
-    await router.replace({ name: 'simulation', params: { id } })
-    notifications.push({ kind: 'success', message: t('simulation.form.submitted') })
-  } catch (error) {
-    notifications.pushError(t('simulation.form.submitFailed'), error)
-  } finally {
-    submitting.value = false
-  }
+/** Reads the job list again. */
+function refresh(): void {
+  void simulations.loadJobs()
 }
 
 /** Cancels the shown job. */
@@ -220,9 +241,10 @@ watch(jobId, () => {
 })
 
 onMounted(() => {
-  void maps.loadMaps()
   void simulations.loadJobs()
-  void loadJob()
+  if (!isList.value) {
+    void loadJob()
+  }
   timer = setInterval(() => simulations.tick(), 1_000)
 })
 
@@ -237,270 +259,335 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="mx-auto max-w-7xl px-8 py-8" data-testid="simulation-view">
-    <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <h1 class="font-semibold text-ink">
-          {{ isNew ? t('simulation.form.title') : t('views.simulation.title') }}
-        </h1>
-        <span v-if="job !== null" class="font-mono text-xs text-muted" data-testid="job-id">
-          {{ job.id }}
-        </span>
-        <TTag
-          v-if="job !== null"
-          variant="light"
-          :theme="stateTheme(job.state)"
-          data-testid="job-state"
-        >
-          {{ t(`simulation.job.${job.state}`) }}
-        </TTag>
-        <TTag
-          v-if="job !== null && !finished"
+    <template v-if="isList">
+      <div class="flex items-center justify-between gap-4">
+        <h1 class="font-semibold text-ink">{{ t('views.runs.title') }}</h1>
+        <div class="flex items-center gap-2">
+          <TButton
+            variant="outline"
+            :loading="simulations.listStatus === 'loading'"
+            data-testid="refresh-runs"
+            @click="refresh()"
+          >
+            {{ t('common.refresh') }}
+          </TButton>
+          <TButton theme="primary" data-testid="new-run" @click="router.push('/run')">
+            {{ t('simulation.form.submit') }}
+          </TButton>
+        </div>
+      </div>
+
+      <div class="mt-6">
+        <p v-if="recentRows.length === 0" class="text-sm text-muted">
+          {{ t('simulation.list.empty') }}
+        </p>
+        <TTable
+          v-else
+          :data="recentRows"
+          :columns="columns"
+          row-key="id"
           size="small"
-          variant="outline"
-          data-testid="job-stage"
+          data-testid="job-list"
         >
-          {{ t(`simulation.stage.${job.stage}`) }}
-        </TTag>
+          <template #state="{ row }">
+            <TTag size="small" variant="light" :theme="row.stateTheme">
+              {{ row.stateLabel }}
+            </TTag>
+          </template>
+          <template #open="{ row }">
+            <TButton variant="text" @click="open(row.id)">
+              {{ t('simulation.list.open') }}
+            </TButton>
+          </template>
+        </TTable>
       </div>
-      <div class="flex items-center gap-2">
-        <TButton v-if="!isNew" variant="outline" data-testid="new-run" @click="router.push('/run')">
-          {{ t('simulation.form.submit') }}
-        </TButton>
-        <TButton
-          v-if="job !== null && !finished"
-          theme="danger"
-          variant="outline"
-          data-testid="cancel-run"
-          @click="cancel()"
+    </template>
+
+    <template v-else>
+      <div class="flex items-center justify-between gap-4">
+        <div class="flex items-center gap-3">
+          <h1 class="font-semibold text-ink">{{ t('views.simulation.title') }}</h1>
+          <span v-if="job !== null" class="font-mono text-xs text-muted" data-testid="job-id">
+            {{ job.id }}
+          </span>
+          <TTag
+            v-if="job !== null"
+            variant="light"
+            :theme="stateTheme(job.state)"
+            data-testid="job-state"
+          >
+            {{ t(`simulation.job.${job.state}`) }}
+          </TTag>
+          <TTag
+            v-if="job !== null && !finished"
+            size="small"
+            variant="outline"
+            data-testid="job-stage"
+          >
+            {{ t(`simulation.stage.${job.stage}`) }}
+          </TTag>
+        </div>
+        <div class="flex items-center gap-2">
+          <TButton variant="outline" data-testid="new-run" @click="router.push('/run')">
+            {{ t('simulation.form.submit') }}
+          </TButton>
+          <TButton
+            v-if="job !== null && !finished"
+            theme="danger"
+            variant="outline"
+            data-testid="cancel-run"
+            @click="cancel()"
+          >
+            {{ t('simulation.live.cancelRun') }}
+          </TButton>
+        </div>
+      </div>
+
+      <div
+        class="mt-6 flex flex-wrap items-center gap-1"
+        role="tablist"
+        :aria-label="t('views.simulation.title')"
+      >
+        <button
+          v-for="entry in TABS"
+          :key="entry.id"
+          type="button"
+          role="tab"
+          class="rounded-control px-2 py-1 text-sm transition-colors"
+          :class="
+            tab === entry.id ? 'bg-surface font-medium text-ink' : 'text-muted hover:text-ink'
+          "
+          :aria-selected="tab === entry.id"
+          :data-testid="`simulation-tab-${entry.id}`"
+          @click="selectTab(entry.id)"
         >
-          {{ t('simulation.live.cancelRun') }}
-        </TButton>
+          {{ t(entry.labelKey) }}
+        </button>
       </div>
-    </div>
 
-    <div class="mt-6 grid grid-cols-4 gap-6">
-      <div class="col-span-3 flex flex-col gap-6">
-        <TCard v-if="isNew" :title="t('simulation.form.title')" size="small">
-          <SimulationForm class="mt-2" :maps="maps.summaries" :busy="submitting" @submit="submit" />
-        </TCard>
-
-        <template v-else>
-          <TAlert
-            v-if="job === null && simulations.listStatus === 'ready'"
-            theme="error"
-            :message="t('simulation.result.noSummary')"
-            data-testid="job-missing"
-          />
-
-          <TCard v-if="job !== null" :title="t('simulation.live.title')" size="small">
-            <div class="grid grid-cols-4 gap-4">
-              <div>
-                <p class="text-xs text-muted">{{ t('simulation.live.state') }}</p>
-                <p class="text-sm text-ink">{{ t(`simulation.job.${job.state}`) }}</p>
-              </div>
-              <div>
-                <p class="text-xs text-muted">{{ t('simulation.live.stage') }}</p>
-                <p class="text-sm text-ink">{{ t(`simulation.stage.${job.stage}`) }}</p>
-              </div>
-              <div>
-                <p class="text-xs text-muted">{{ t('simulation.live.elapsed') }}</p>
-                <p class="font-mono text-sm text-ink" data-testid="elapsed">{{ elapsedText }}</p>
-              </div>
-              <div>
-                <p class="text-xs text-muted">{{ t('simulation.list.columnMode') }}</p>
-                <p class="text-sm text-ink">{{ t(`simulation.mode.${job.mode}`) }}</p>
-              </div>
-            </div>
-            <p class="mt-2 text-xs text-muted">{{ t('simulation.live.progressUnknown') }}</p>
-            <p class="mt-2 text-xs text-muted">
-              {{
-                simulations.streamStatus === 'live'
-                  ? t('simulation.live.streamLive')
-                  : simulations.streamStatus === 'connecting'
-                    ? t('simulation.live.streamConnecting')
-                    : t('simulation.live.streamClosed')
-              }}
-            </p>
-
+      <template v-if="tab === 'overview'">
+        <div class="mt-6 grid grid-cols-4 gap-6">
+          <div class="col-span-3 flex flex-col gap-6">
             <TAlert
-              v-if="job.error !== null && job.error !== undefined"
-              class="mt-3"
+              v-if="job === null && simulations.listStatus === 'ready'"
               theme="error"
-              :message="t('simulation.job.failed')"
-              data-testid="job-error"
-            >
-              <p class="text-sm text-muted">
-                <TTag size="small" variant="light">{{ t('simulation.live.fromService') }}</TTag>
-                <span class="ml-2">{{ job.error }}</span>
+              :message="t('simulation.result.noSummary')"
+              data-testid="job-missing"
+            />
+
+            <TCard v-if="job !== null" :title="t('simulation.live.title')" size="small">
+              <div class="grid grid-cols-4 gap-4">
+                <div>
+                  <p class="text-xs text-muted">{{ t('simulation.live.state') }}</p>
+                  <p class="text-sm text-ink">{{ t(`simulation.job.${job.state}`) }}</p>
+                </div>
+                <div>
+                  <p class="text-xs text-muted">{{ t('simulation.live.stage') }}</p>
+                  <p class="text-sm text-ink">{{ t(`simulation.stage.${job.stage}`) }}</p>
+                </div>
+                <div>
+                  <p class="text-xs text-muted">{{ t('simulation.live.elapsed') }}</p>
+                  <p class="font-mono text-sm text-ink" data-testid="elapsed">{{ elapsedText }}</p>
+                </div>
+                <div>
+                  <p class="text-xs text-muted">{{ t('simulation.list.columnMode') }}</p>
+                  <p class="text-sm text-ink">{{ t(`simulation.mode.${job.mode}`) }}</p>
+                </div>
+              </div>
+              <p class="mt-2 text-xs text-muted">{{ t('simulation.live.progressUnknown') }}</p>
+              <p class="mt-2 text-xs text-muted">
+                {{
+                  simulations.streamStatus === 'live'
+                    ? t('simulation.live.streamLive')
+                    : simulations.streamStatus === 'connecting'
+                      ? t('simulation.live.streamConnecting')
+                      : t('simulation.live.streamClosed')
+                }}
               </p>
-            </TAlert>
-            <TAlert
-              v-else-if="simulations.streamError !== null && !finished"
-              class="mt-3"
-              theme="warning"
-              :message="t('simulation.live.streamFailed')"
-            >
-              <p class="text-sm text-muted">{{ simulations.streamError }}</p>
-            </TAlert>
 
-            <TDivider class="my-3" />
-            <p class="text-sm text-muted">{{ t('simulation.live.log') }}</p>
-            <p v-if="simulations.logLines.length === 0" class="mt-1 text-sm text-muted">
-              {{ t('simulation.live.logEmpty') }}
-            </p>
-            <ul
-              v-else
-              class="mt-1 max-h-64 overflow-y-auto rounded-control bg-page px-3 py-2 font-mono text-xs"
-              data-testid="log-stream"
-            >
-              <li
-                v-for="line in simulations.logLines.slice(-300)"
-                :key="line.id"
-                class="flex gap-2"
+              <TAlert
+                v-if="job.error !== null && job.error !== undefined"
+                class="mt-3"
+                theme="error"
+                :message="t('simulation.job.failed')"
+                data-testid="job-error"
               >
-                <span class="text-muted">{{ line.elapsed_s.toFixed(2) }}s</span>
-                <span :class="line.level === 'error' ? 'text-danger' : 'text-ink'">
-                  {{ line.message }}
-                </span>
-              </li>
-            </ul>
-          </TCard>
-
-          <TCard v-if="finished" :title="t('simulation.result.title')" size="small">
-            <TAlert
-              v-if="simulations.summaryStatus === 'failed'"
-              theme="error"
-              :message="t('simulation.result.summaryFailed')"
-              data-testid="summary-error"
-            >
-              <p class="text-sm text-muted">{{ simulations.summaryError }}</p>
-            </TAlert>
-            <p v-else-if="summary === null" class="text-sm text-muted">
-              {{ t('common.loading') }}
-            </p>
-            <template v-else>
-              <div class="grid grid-cols-3 gap-4">
-                <div>
-                  <p class="text-xs text-muted">{{ t('simulation.result.routeLength') }}</p>
-                  <p class="text-sm text-ink" data-testid="route-length">
-                    {{ formatNumber(summary.route_length_m, 1) }} m
-                  </p>
-                </div>
-                <div>
-                  <p class="text-xs text-muted">{{ t('simulation.result.duration') }}</p>
-                  <p class="text-sm text-ink">{{ formatNumber(summary.duration_s, 2) }} s</p>
-                </div>
-                <div>
-                  <p class="text-xs text-muted">{{ t('simulation.result.backend') }}</p>
-                  <p class="text-sm text-ink">{{ summary.backend }}</p>
-                </div>
-              </div>
+                <p class="text-sm text-muted">
+                  <TTag size="small" variant="light">{{ t('simulation.live.fromService') }}</TTag>
+                  <span class="ml-2">{{ job.error }}</span>
+                </p>
+              </TAlert>
+              <TAlert
+                v-else-if="simulations.streamError !== null && !finished"
+                class="mt-3"
+                theme="warning"
+                :message="t('simulation.live.streamFailed')"
+              >
+                <p class="text-sm text-muted">{{ simulations.streamError }}</p>
+              </TAlert>
 
               <TDivider class="my-3" />
-              <p class="text-sm text-muted">{{ t('simulation.result.samples') }}</p>
-              <dl class="mt-1 grid grid-cols-3 gap-x-6 gap-y-1 text-sm">
-                <div v-for="row in sampleRows" :key="row.key" class="flex justify-between gap-3">
-                  <dt class="text-muted">{{ t(row.labelKey) }}</dt>
-                  <dd class="text-ink">{{ formatNumber(row.value, 0) }}</dd>
-                </div>
-              </dl>
+              <p class="text-sm text-muted">{{ t('simulation.live.log') }}</p>
+              <p v-if="simulations.logLines.length === 0" class="mt-1 text-sm text-muted">
+                {{ t('simulation.live.logEmpty') }}
+              </p>
+              <ul
+                v-else
+                class="mt-1 max-h-64 overflow-y-auto rounded-control bg-page px-3 py-2 font-mono text-xs"
+                data-testid="log-stream"
+              >
+                <li
+                  v-for="line in simulations.logLines.slice(-300)"
+                  :key="line.id"
+                  class="flex gap-2"
+                >
+                  <span class="text-muted">{{ line.elapsed_s.toFixed(2) }}s</span>
+                  <span :class="line.level === 'error' ? 'text-danger' : 'text-ink'">
+                    {{ line.message }}
+                  </span>
+                </li>
+              </ul>
+            </TCard>
 
-              <TDivider class="my-3" />
-              <p class="text-sm text-muted">{{ t('simulation.result.metrics') }}</p>
-              <p v-if="metricTable.length === 0" class="mt-1 text-sm text-muted">
-                {{ t('simulation.result.noMetrics') }}
+            <TCard v-if="finished" :title="t('simulation.result.title')" size="small">
+              <TAlert
+                v-if="simulations.summaryStatus === 'failed'"
+                theme="error"
+                :message="t('simulation.result.summaryFailed')"
+                data-testid="summary-error"
+              >
+                <p class="text-sm text-muted">{{ simulations.summaryError }}</p>
+              </TAlert>
+              <p v-else-if="summary === null" class="text-sm text-muted">
+                {{ t('common.loading') }}
+              </p>
+              <template v-else>
+                <div class="grid grid-cols-3 gap-4">
+                  <div>
+                    <p class="text-xs text-muted">{{ t('simulation.result.routeLength') }}</p>
+                    <p class="text-sm text-ink" data-testid="route-length">
+                      {{ formatNumber(summary.route_length_m, 1) }} m
+                    </p>
+                  </div>
+                  <div>
+                    <p class="text-xs text-muted">{{ t('simulation.result.duration') }}</p>
+                    <p class="text-sm text-ink">{{ formatNumber(summary.duration_s, 2) }} s</p>
+                  </div>
+                  <div>
+                    <p class="text-xs text-muted">{{ t('simulation.result.backend') }}</p>
+                    <p class="text-sm text-ink">{{ summary.backend }}</p>
+                  </div>
+                </div>
+
+                <TDivider class="my-3" />
+                <p class="text-sm text-muted">{{ t('simulation.result.samples') }}</p>
+                <dl class="mt-1 grid grid-cols-3 gap-x-6 gap-y-1 text-sm">
+                  <div v-for="row in sampleRows" :key="row.key" class="flex justify-between gap-3">
+                    <dt class="text-muted">{{ t(row.labelKey) }}</dt>
+                    <dd class="text-ink">{{ formatNumber(row.value, 0) }}</dd>
+                  </div>
+                </dl>
+
+                <TDivider class="my-3" />
+                <p class="text-sm text-muted">{{ t('simulation.result.metrics') }}</p>
+                <p v-if="metricTable.length === 0" class="mt-1 text-sm text-muted">
+                  {{ t('simulation.result.noMetrics') }}
+                </p>
+                <TTable
+                  v-else
+                  class="mt-1"
+                  :data="metricTable"
+                  :columns="[
+                    { colKey: 'label', title: t('simulation.audit.metric') },
+                    { colKey: 'value', title: t('simulation.audit.value') },
+                    { colKey: 'unit', title: t('simulation.audit.unit'), width: 90 },
+                  ]"
+                  row-key="key"
+                  size="small"
+                  data-testid="headline-metrics"
+                />
+
+                <TDivider class="my-3" />
+                <p class="text-sm text-muted">{{ t('simulation.result.manifest') }}</p>
+                <dl class="mt-1 grid grid-cols-2 gap-x-6 gap-y-1 text-sm">
+                  <div
+                    v-for="row in manifestRows"
+                    :key="row.key"
+                    class="flex justify-between gap-3"
+                  >
+                    <dt class="text-muted">{{ t(row.labelKey) }}</dt>
+                    <dd class="font-mono text-xs text-ink">{{ row.value }}</dd>
+                  </div>
+                </dl>
+
+                <div class="mt-4 flex items-center gap-3">
+                  <TButton
+                    theme="primary"
+                    variant="outline"
+                    data-testid="open-trajectory"
+                    @click="selectTab('trajectory')"
+                  >
+                    {{ t('simulation.result.openTrajectory') }}
+                  </TButton>
+                  <TButton
+                    variant="outline"
+                    data-testid="open-sensors"
+                    @click="selectTab('sensors')"
+                  >
+                    {{ t('simulation.result.openSensors') }}
+                  </TButton>
+                  <TButton variant="outline" data-testid="open-audit" @click="selectTab('audit')">
+                    {{ t('simulation.result.openAudit') }}
+                  </TButton>
+                </div>
+              </template>
+            </TCard>
+          </div>
+
+          <aside class="flex flex-col gap-4">
+            <TCard :title="t('dashboard.recentJobs')" size="small">
+              <p v-if="recentRows.length === 0" class="text-sm text-muted">
+                {{ t('simulation.list.empty') }}
               </p>
               <TTable
                 v-else
-                class="mt-1"
-                :data="metricTable"
-                :columns="[
-                  { colKey: 'label', title: t('simulation.audit.metric') },
-                  { colKey: 'value', title: t('simulation.audit.value') },
-                  { colKey: 'unit', title: t('simulation.audit.unit'), width: 90 },
-                ]"
-                row-key="key"
+                :data="recentRows"
+                :columns="columns"
+                row-key="id"
                 size="small"
-                data-testid="headline-metrics"
-              />
+                data-testid="job-list"
+              >
+                <template #state="{ row }">
+                  <TTag size="small" variant="light" :theme="row.stateTheme">
+                    {{ row.stateLabel }}
+                  </TTag>
+                </template>
+                <template #open="{ row }">
+                  <TButton variant="text" @click="open(row.id)">
+                    {{ t('simulation.list.open') }}
+                  </TButton>
+                </template>
+              </TTable>
+            </TCard>
 
-              <TDivider class="my-3" />
-              <p class="text-sm text-muted">{{ t('simulation.result.manifest') }}</p>
-              <dl class="mt-1 grid grid-cols-2 gap-x-6 gap-y-1 text-sm">
-                <div v-for="row in manifestRows" :key="row.key" class="flex justify-between gap-3">
-                  <dt class="text-muted">{{ t(row.labelKey) }}</dt>
-                  <dd class="font-mono text-xs text-ink">{{ row.value }}</dd>
-                </div>
-              </dl>
-
-              <div class="mt-4 flex items-center gap-3">
-                <TButton
-                  theme="primary"
-                  variant="outline"
-                  data-testid="open-trajectory"
-                  @click="router.push(`/simulations/${jobId}/trajectory`)"
-                >
-                  {{ t('simulation.result.openTrajectory') }}
-                </TButton>
-                <TButton
-                  variant="outline"
-                  data-testid="open-sensors"
-                  @click="router.push(`/simulations/${jobId}/sensors`)"
-                >
-                  {{ t('simulation.result.openSensors') }}
-                </TButton>
-                <TButton
-                  variant="outline"
-                  data-testid="open-audit"
-                  @click="router.push(`/simulations/${jobId}/audit`)"
-                >
-                  {{ t('simulation.result.openAudit') }}
-                </TButton>
-              </div>
-            </template>
-          </TCard>
-        </template>
-      </div>
-
-      <aside class="flex flex-col gap-4">
-        <TCard :title="t('dashboard.recentJobs')" size="small">
-          <p v-if="recentRows.length === 0" class="text-sm text-muted">
-            {{ t('simulation.list.empty') }}
-          </p>
-          <TTable
-            v-else
-            :data="recentRows"
-            :columns="columns"
-            row-key="id"
-            size="small"
-            data-testid="job-list"
-          >
-            <template #state="{ row }">
-              <TTag size="small" variant="light" :theme="row.stateTheme">
-                {{ row.stateLabel }}
-              </TTag>
-            </template>
-            <template #open="{ row }">
-              <TButton variant="text" @click="open(row.id)">
-                {{ t('simulation.list.open') }}
-              </TButton>
-            </template>
-          </TTable>
-        </TCard>
-
-        <div
-          v-for="notice in notifications.notices"
-          :key="notice.id"
-          class="rounded-card border border-line bg-surface px-4 py-3"
-          :data-testid="`notice-${notice.kind}`"
-        >
-          <p class="text-sm font-medium text-ink">{{ notice.message }}</p>
-          <p v-if="notice.fromService !== undefined" class="mt-1 text-sm text-muted">
-            <TTag size="small" variant="light">{{ t('error.fromService') }}</TTag>
-            <span class="ml-2">{{ notice.fromService }}</span>
-          </p>
+            <div
+              v-for="notice in notifications.notices"
+              :key="notice.id"
+              class="rounded-card border border-line bg-surface px-4 py-3"
+              :data-testid="`notice-${notice.kind}`"
+            >
+              <p class="text-sm font-medium text-ink">{{ notice.message }}</p>
+              <p v-if="notice.fromService !== undefined" class="mt-1 text-sm text-muted">
+                <TTag size="small" variant="light">{{ t('error.fromService') }}</TTag>
+                <span class="ml-2">{{ notice.fromService }}</span>
+              </p>
+            </div>
+          </aside>
         </div>
-      </aside>
-    </div>
+      </template>
+      <TrajectoryPanel v-else-if="tab === 'trajectory'" class="mt-6" :job-id="jobId" />
+      <SensorPanel v-else-if="tab === 'sensors'" class="mt-6" :job-id="jobId" />
+      <AuditPanel v-else class="mt-6" :job-id="jobId" />
+    </template>
   </section>
 </template>

@@ -31,21 +31,22 @@ export interface PathStyle {
   /** Draw order inside the layer; higher wins a shared depth. */
   zOffset?: number
   /**
-   * Send water running along the line, from its first point to its last.
+   * Send a train of arrows running along the line, from its first point to its last.
    *
-   * See `render/pathFlow.ts`: the water is geometry this module places rather than a dash pattern,
-   * so it covers a multi-segment path in full and its speed is stated in metres per second.
+   * See `render/pathFlow.ts`: the arrows are geometry this module places rather than a
+   * dash pattern, so they cover a multi-segment path in full and their speed is stated in
+   * metres per second.
    */
   flow?: {
-    /** How many slugs are in the pipe at once. */
-    slugs: number
-    /** Length of one slug, metres. */
-    lengthM: number
-    /** Width of a slug, metres. */
+    /** Distance from one arrow to the next, metres. */
+    spacingM: number
+    /** Length of an arrow's wing, metres. */
+    sizeM: number
+    /** Width of the stroke an arrow is drawn with, metres. */
     widthM: number
-    /** How fast the water moves, metres per second. */
+    /** How fast the arrows travel, metres per second. */
     speed: number
-    /** Colour of the water; the line's own colour when absent. */
+    /** Arrow colour; the line's own colour when absent. */
     colour?: string
   }
 }
@@ -164,13 +165,13 @@ export class PathSet {
     if (path.flow !== undefined) {
       this.flows.push(
         new PathFlow(this.mapScene, path.points, {
-          slugs: path.flow.slugs,
-          lengthM: path.flow.lengthM,
+          spacingM: path.flow.spacingM,
+          sizeM: path.flow.sizeM,
           widthM: path.flow.widthM,
           speed: path.flow.speed,
           colour: path.flow.colour ?? path.colour,
-          // Just above the water it runs inside, so the two do not fight for depth.
-          liftM: 0.7,
+          // Just above the band they run inside, so the two do not fight for depth.
+          liftM: 0.6,
         }),
       )
     }

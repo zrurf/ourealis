@@ -15,8 +15,8 @@ pub use map::{
     ChunkData, LayerGridDto, LayerInfo, MapMetadata, MapSummary, Page, SectionJson, SkeletonDto,
 };
 pub use result::{
-    EventDto, MetricSummary, RoutePreview, RoutePreviewCandidate, SampleCountsDto, SensorSampleDto,
-    SummaryDto, TruthSampleDto,
+    EventDto, MetricSummary, RoutePreview, RoutePreviewCandidate, RoutePreviewLeg, SampleCountsDto,
+    SensorSampleDto, SummaryDto, TruthSampleDto,
 };
 pub use simulation::{PersonOverrides, PersonSpec, SimulationRequest, SimulationSettings};
 pub use task::{

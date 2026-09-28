@@ -20,8 +20,8 @@ test.describe('application shell', () => {
     await page.goto('/')
 
     await expect(page).toHaveTitle('Ourealis')
-    await expect(page.locator('h1')).toHaveText('Overview')
-    await expect(page.locator('nav a')).toHaveCount(6)
+    await expect(page.locator('h1')).toHaveText('Maps')
+    await expect(page.locator('nav a')).toHaveCount(4)
     await expect(page.locator('html')).toHaveAttribute('lang', 'en')
   })
 
@@ -37,7 +37,7 @@ test.describe('application shell', () => {
     page.on('pageerror', (error) => problems.push(error.message))
 
     await page.goto('/')
-    await expect(page.locator('h1')).toHaveText('Overview')
+    await expect(page.locator('h1')).toHaveText('Maps')
     await page.waitForLoadState('networkidle')
 
     expect(problems).toEqual([])
@@ -68,15 +68,15 @@ test.describe('application shell', () => {
     service.skipUnlessAvailable()
 
     await page.goto('/')
-    await expect(page.locator('h1')).toHaveText('Overview')
+    await expect(page.locator('h1')).toHaveText('Maps')
 
     await page.locator('.t-select-input').click()
     await page.getByText('简体中文', { exact: true }).click()
 
-    await expect(page.locator('h1')).toHaveText('总览')
+    await expect(page.locator('h1')).toHaveText('地图库')
     await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN')
 
     await page.reload()
-    await expect(page.locator('h1')).toHaveText('总览')
+    await expect(page.locator('h1')).toHaveText('地图库')
   })
 })

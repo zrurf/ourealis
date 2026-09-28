@@ -119,34 +119,51 @@ export function cavityShade(relative: number): number {
 }
 
 /**
- * Colour of one terrain vertex.
+ * Shading multiplier of a terraced wall, relative to the surface above it.
  *
- * `range` is the elevation range of the whole surface being drawn, so the ramp is
- * comparable across chunks rather than rescaled per chunk — a per-chunk range would
- * make each one a different colour for the same height. `shade` carries every lighting
- * term (relief, steepness, occlusion), already multiplied together.
+ * A wall is read as the *side* of the block it carries, so it takes the colour of the
+ * surface at its top and is sunk into shadow by this much.
  */
-export function terrainColour(
-  height: number,
-  shade: number,
-  ramp: readonly Rgb[],
-  range: { min: number; max: number },
-): Rgb {
-  const base = rampAt(ramp, normalize(height, range.min, range.max))
-  return [
-    Math.min(255, Math.max(0, Math.round(base[0] * shade))),
-    Math.min(255, Math.max(0, Math.round(base[1] * shade))),
-    Math.min(255, Math.max(0, Math.round(base[2] * shade))),
-  ]
-}
+export const SLAB_WALL_SHADE = 0.78
 
-/** Colour of a slab face: the surface colour, sunk into shadow. */
-export function slabColour(surface: Rgb, factor = 0.78): Rgb {
-  return [
-    Math.max(0, Math.round(surface[0] * factor)),
-    Math.max(0, Math.round(surface[1] * factor)),
-    Math.max(0, Math.round(surface[2] * factor)),
-  ]
+/** Shading multiplier of the floor under a map, darker than the walls around it. */
+export const SLAB_FLOOR_SHADE = SLAB_WALL_SHADE * 0.6
+
+/**
+ * Colour of a building footprint, in bytes.
+ *
+ * A navigation display draws a building as a near-white block, untextured and barely off the
+ * page's white: a footprint is a *volume* the reader should read as built-up ground, and any
+ * tint or pattern spent on it competes with the layers that carry the actual data.
+ */
+export const BUILDING_COLOUR: readonly [number, number, number] = [242, 242, 242]
+
+/**
+ * Vertex colours of a whole mesh, from the ramp inputs the geometry carries.
+ *
+ * Each pair of floats is one vertex: the elevation normalised against the whole surface's
+ * range, and the shading factor. Splitting the colour out of the geometry is what lets an
+ * appearance change be an upload of this buffer rather than a rebuild of the map.
+ *
+ * `building` is the per-vertex mask {@link BUILDING_COLOUR} replaces the ramp for; without it
+ * every vertex is coloured by the ramp, which is what a map with no mask channel gets.
+ */
+export function terrainColours(
+  rampInput: Float32Array,
+  ramp: readonly Rgb[],
+  building?: Float32Array,
+): Float32Array {
+  const colors = new Float32Array((rampInput.length / 2) * 4)
+  for (let vertex = 0; vertex < rampInput.length / 2; vertex += 1) {
+    const base =
+      building?.[vertex] === 1 ? BUILDING_COLOUR : rampAt(ramp, rampInput[vertex * 2] ?? 0)
+    const shade = rampInput[vertex * 2 + 1] ?? 1
+    colors[vertex * 4] = Math.min(1, Math.max(0, (base[0] * shade) / 255))
+    colors[vertex * 4 + 1] = Math.min(1, Math.max(0, (base[1] * shade) / 255))
+    colors[vertex * 4 + 2] = Math.min(1, Math.max(0, (base[2] * shade) / 255))
+    colors[vertex * 4 + 3] = 1
+  }
+  return colors
 }
 
 /**

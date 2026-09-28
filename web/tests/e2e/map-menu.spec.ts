@@ -35,7 +35,9 @@ test('the map menu places the ends and dismisses', async ({ page, request }) => 
   await page.waitForTimeout(400)
   await page.mouse.click(cx + 80, cy + 60, { button: 'right' })
   await page.getByTestId('menu-set-goal').click()
-  await page.waitForTimeout(1200)
+  await page.waitForTimeout(400)
+  // The plan follows a press of the button, as it does everywhere else in the workspace.
+  await page.getByTestId('plan-run').click()
   await expect(page.getByTestId('plan-summary')).toBeVisible({ timeout: 60_000 })
   await page.screenshot({ path: '.tmp/screens/menu-route.png' })
 

@@ -44,7 +44,6 @@ const PATTERNS: SurfacePattern[] = [
   'asphalt',
   'grass',
   'water',
-  'building',
   'gravel',
   'hatch',
   'contour',
@@ -125,8 +124,10 @@ test.describe('surface materials', () => {
     expect(dims.map((dim) => dim.name)).toEqual(['surface_type', 'traffic'])
     const plan = layerSurfacePlan(4096, 'raster', dims)
     expect(plan.materials).toBe(SURFACE_MATERIALS)
-    expect(materialForValue(plan, 0)?.labelKey).toBe('map.surface.road')
-    expect(materialForValue(plan, 2)?.pattern).toBe('grass')
+    expect(materialForValue(plan, 0)?.labelKey).toBe('map.surface.asphalt')
+    expect(materialForValue(plan, 5)?.pattern).toBe('grass')
+    // The table is the map format's own category count, so the last id resolves too.
+    expect(materialForValue(plan, 8)?.labelKey).toBe('map.surface.building')
     // A value the table does not cover reads as no material rather than as the first one.
     expect(materialForValue(plan, 99)).toBeNull()
     // A scalar dimension carries no materials: it is a field, not a set of classes.

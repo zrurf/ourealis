@@ -15,12 +15,14 @@ use ourealis_core::graph::MixedGraph;
 use ourealis_core::motion::profile::SpeedProfile;
 use ourealis_core::person::PersonParams;
 use ourealis_core::plan::{PlannedRoute, plan, plan_loop};
-use ourealis_core::sim::{MapSource, SimulationConfig, Simulator};
+use ourealis_core::sim::{EnvironmentCache, MapSource, SimulationConfig, Simulator};
 use ourealis_map_format::synthetic::SyntheticMapSpec;
 use tokio::sync::Semaphore;
 
 use crate::api::dto::simulation::MapRef;
-use crate::api::dto::{MapSummary, RoutePreview, RoutePreviewCandidate, SimulationRequest};
+use crate::api::dto::{
+    MapSummary, RoutePreview, RoutePreviewCandidate, RoutePreviewLeg, SimulationRequest,
+};
 use crate::error::{Result, ServiceError};
 use crate::store::MapStore;
 
@@ -37,6 +39,8 @@ pub struct TaskContext {
     pub queue_capacity: usize,
     /// Whether runs evaluate their metrics report by default.
     pub with_metrics: bool,
+    /// Loaded environments, shared by the planning tasks that repeat on one map.
+    pub environments: EnvironmentCache,
 }
 
 /// Submits and runs tasks.
@@ -358,10 +362,11 @@ pub(crate) fn run_planning(
     let mut config = SimulationConfig::default();
     request.settings.apply(&mut config)?;
 
-    // The environment is loaded by the simulator itself, which is what keeps the
-    // weights, the backend selection and the coarse grid identical to a run.
+    // The environment is loaded through the simulator, which is what keeps the
+    // weights, the backend selection and the coarse grid identical to a run; the cache
+    // only decides whether that load is repeated for the next task on the same map.
     let simulator = build_simulator(source, request, person.clone(), config.clone())?;
-    let environment = simulator.environment()?;
+    let environment = simulator.environment_cached(&context.environments)?;
     let mut graph = MixedGraph::with_coarse(
         &environment.cost,
         &environment.hard,
@@ -385,28 +390,27 @@ pub(crate) fn run_planning(
     let planned = plan_route_of(&environment, &mut graph, request, &person, &config)?;
     let planning_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-    let from_library = request.route.mode_name() != "loop"
-        && library_supplies(
+    let from_library = request.route.mode_name() != "loop";
+
+    let mut preview = RoutePreview {
+        legs: legs_of(
             &environment,
             &mut graph,
             &person,
             &config,
-            planned.legs.first().map(|leg| leg.from),
-            planned.legs.last().map(|leg| leg.to),
-        );
-
-    let mut preview = RoutePreview {
-        candidates: candidates_of(&planned, from_library),
-        chosen: planned
-            .legs
-            .first()
-            .map(|leg| leg.chosen)
-            .unwrap_or_default(),
+            &planned,
+            from_library,
+        ),
         length_m: planned.length_m,
         cost_equiv_m: planned.cost_equiv_m,
         straight_line_m: straight_line_m(&planned),
         planning_ms,
-        path: Vec::new(),
+        path: planned
+            .path
+            .points()
+            .iter()
+            .map(|point| crate::api::dto::Vec2::from(*point))
+            .collect(),
         speed_limit_mps: Vec::new(),
         speed_limit_s: Vec::new(),
     };
@@ -415,19 +419,14 @@ pub(crate) fn run_planning(
         let profile = speed_profile(&environment, &person, &config, request, &planned)?;
         preview.speed_limit_s = profile.s.clone();
         preview.speed_limit_mps = profile.s.iter().map(|arc| profile.limit_at(*arc)).collect();
-        preview.path = planned
-            .path
-            .points()
-            .iter()
-            .map(|point| crate::api::dto::Vec2::from(*point))
-            .collect();
     }
+    let candidate_count: usize = preview.legs.iter().map(|leg| leg.candidates.len()).sum();
     task.log(
         "info",
         format!(
-            "planned {:.1} m in {planning_ms:.0} ms with {} candidate(s)",
+            "planned {:.1} m in {planning_ms:.0} ms over {} leg(s) with {candidate_count} candidate(s)",
             preview.length_m,
-            preview.candidates.len()
+            preview.legs.len()
         ),
     );
     Ok(preview)
@@ -491,31 +490,49 @@ fn plan_route_of(
     })
 }
 
-/// The candidate set of the route.
+/// The legs of the route, each with its own candidate set and library verdict.
 ///
-/// A multi-leg request is planned leg by leg with its own Logit draw, and the preview
-/// carries one set, so the first leg's candidates are the ones reported; `chosen`
-/// indexes that same set.
-fn candidates_of(planned: &PlannedRoute, from_library: bool) -> Vec<RoutePreviewCandidate> {
-    let Some(leg) = planned.legs.first() else {
-        return Vec::new();
-    };
-    let probabilities = leg.candidates.probabilities();
-    leg.candidates
-        .candidates
+/// A multi-leg request is planned leg by leg with its own Logit draw, so the preview
+/// mirrors that structure: reporting only the first leg is what made a waypointed route
+/// draw up to its first waypoint and stop.
+fn legs_of(
+    environment: &Environment,
+    graph: &mut MixedGraph<'_>,
+    person: &PersonParams,
+    config: &SimulationConfig,
+    planned: &PlannedRoute,
+    from_library: bool,
+) -> Vec<RoutePreviewLeg> {
+    planned
+        .legs
         .iter()
-        .enumerate()
-        .map(|(index, candidate)| RoutePreviewCandidate {
-            length_m: candidate.length_m,
-            cost_equiv_m: candidate.cost_equiv_m,
-            probability: probabilities.get(index).copied().unwrap_or(0.0),
-            path_size: candidate.path_size,
-            from_library,
-            points: candidate
-                .points
-                .iter()
-                .map(|point| crate::api::dto::Vec2::from(*point))
-                .collect(),
+        .map(|leg| {
+            let stored = from_library
+                && library_supplies(environment, graph, person, config, leg.from, leg.to);
+            let probabilities = leg.candidates.probabilities();
+            RoutePreviewLeg {
+                from: crate::api::dto::Vec2::from(leg.from),
+                to: crate::api::dto::Vec2::from(leg.to),
+                chosen: leg.chosen,
+                candidates: leg
+                    .candidates
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| RoutePreviewCandidate {
+                        length_m: candidate.length_m,
+                        cost_equiv_m: candidate.cost_equiv_m,
+                        probability: probabilities.get(index).copied().unwrap_or(0.0),
+                        path_size: candidate.path_size,
+                        from_library: stored,
+                        points: candidate
+                            .points
+                            .iter()
+                            .map(|point| crate::api::dto::Vec2::from(*point))
+                            .collect(),
+                    })
+                    .collect(),
+            }
         })
         .collect()
 }
@@ -539,12 +556,9 @@ fn library_supplies(
     graph: &mut MixedGraph<'_>,
     person: &PersonParams,
     config: &SimulationConfig,
-    from: Option<glam::DVec2>,
-    to: Option<glam::DVec2>,
+    from: glam::DVec2,
+    to: glam::DVec2,
 ) -> bool {
-    let (Some(from), Some(to)) = (from, to) else {
-        return false;
-    };
     let hit = ourealis_core::plan::library::from_library(
         environment.kpath.as_ref(),
         graph,

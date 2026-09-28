@@ -17,6 +17,11 @@
  * question being asked of it. Everything that changes a vertex colour (the sun) or the
  * geometry (the camera itself) is applied here, and the views rebuild the terrain when
  * a baked parameter changes.
+ *
+ * The light/dark appearance is handled here too, but *without* a rebuild: the scene
+ * re-derives its background, its fog and its lights from the interface tokens, and tells
+ * the layers that own colour of their own — the terrain's ramp — so they recolour their
+ * vertex buffers in place.
  */
 import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera'
 import { Camera } from '@babylonjs/core/Cameras/camera'
@@ -28,6 +33,7 @@ import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color'
 import { Vector3 } from '@babylonjs/core/Maths/math.vector'
 import type { LinesMesh } from '@babylonjs/core/Meshes/linesMesh'
+import { RenderingManager } from '@babylonjs/core/Rendering/renderingManager'
 import { Scene } from '@babylonjs/core/scene'
 import type { Aabb } from '@/api/types'
 import { parseCssColor } from '@/types/colormap'
@@ -120,6 +126,23 @@ export const CAMERA_LIMITS = {
   maxFovDeg: 90,
 } as const
 
+/**
+ * Movement, in map metres, below which the orbit target is left where it is.
+ *
+ * It exists to stop the target being rewritten with the same value on every tick, not to
+ * smooth the follow: a centimetre of ground is far below what the view can show.
+ */
+const GROUND_EPSILON_M = 0.01
+
+/**
+ * Pitch difference, in degrees, below which the camera is left as it is.
+ *
+ * The camera's own pitch is reported back to the host and then asked for again; comparing
+ * against a tenth of a degree keeps that round trip a no-op while staying far finer than
+ * anything the reader can aim at.
+ */
+const PITCH_EPSILON_DEG = 0.1
+
 /** The scene, camera and render loop of the map viewer. */
 export class MapScene {
   /** Babylon scene holding every mesh. */
@@ -137,8 +160,19 @@ export class MapScene {
   private azimuthDeg = DEFAULT_SUN_AZIMUTH_DEG
   private elevationDeg = DEFAULT_SUN_ELEVATION_DEG
   private orthographic = false
+  private dark = false
   private disposed = false
   private loopRunning = false
+  /** Ground height reader, in map metres; `null` while the host has not supplied one. */
+  private groundHeight: ((x: number, z: number) => number | null) | null = null
+  /** Camera orbit as of the previous tick, to tell a settled view from a moving one. */
+  private readonly lastCamera = {
+    alpha: Number.NaN,
+    beta: Number.NaN,
+    radius: Number.NaN,
+    x: Number.NaN,
+    z: Number.NaN,
+  }
   private readonly renderLoop: () => void
   private readonly resizeObserver: ResizeObserver | null = null
 
@@ -152,6 +186,14 @@ export class MapScene {
    */
   private readonly renderTargets = new Set<{ scaling: { y: number } }>()
 
+  /**
+   * Listeners told when the appearance changes, returns a function that removes the listener.
+   *
+   * The scene owns the background, the fog and the lights; the terrain's colour ramp belongs
+   * to the layer that draws it. This is what lets the two follow one switch.
+   */
+  private readonly appearanceListeners = new Set<(dark: boolean) => void>()
+
   private constructor(engine: Engine | WebGPUEngine, options: MapSceneOptions) {
     this.engine = engine
     // A canvas whose CSS size changes without the engine being told renders with the
@@ -164,7 +206,14 @@ export class MapScene {
     }
     const scene = new Scene(engine)
     this.scene = scene
-    scene.clearColor = surfaceColor()
+    // Babylon clears the depth buffer at the start of every rendering group, which left the
+    // terrain in group 0 and a route draped on it in group 1 without a shared depth: the route
+    // stayed painted over the hills it was drawn behind. Groups 1 and up now share the buffer
+    // the ground wrote, so the ground occludes what stands behind it while group order still
+    // settles work that would otherwise fight for the same depth.
+    for (let group = 1; group < RenderingManager.MAX_RENDERINGGROUPS; group += 1) {
+      scene.setRenderingAutoClearDepthStencil(group, false)
+    }
 
     const camera = new ArcRotateCamera(
       'camera',
@@ -210,28 +259,25 @@ export class MapScene {
     // is not; the vertex colours already carry a hillshade, and a bright ambient would
     // flatten both.
     this.sky = new HemisphericLight('sky', new Vector3(0.2, 1, 0.1), scene)
-    this.sky.intensity = 0.42
-    this.sky.groundColor = new Color3(0.3, 0.3, 0.31)
     this.sunLight = new DirectionalLight('sun', this.lightVector(), scene)
-    this.sunLight.intensity = 0.55
 
     // Depth cue: distant terrain fades into the page colour instead of ending at a
     // hard edge, which is most of what makes a large map readable at a glance.
     scene.fogMode = Scene.FOGMODE_LINEAR
-    scene.fogColor = surfaceColor3()
     scene.fogStart = 400
     scene.fogEnd = 4_000
 
     // The optional unit grid shares the furniture colour; it is a ruler, not data.
     this.gridMaterial = new StandardMaterial('gridMaterial', scene)
-    this.gridMaterial.emissiveColor = gridColor()
     this.gridMaterial.diffuseColor = new Color3(0, 0, 0)
     this.gridMaterial.specularColor = new Color3(0, 0, 0)
     this.gridMaterial.disableLighting = true
+    this.applyAppearance()
 
     // The loop is not started here: `start` and `stop` are the host's to call, because
     // a scene whose canvas is parked out of the layout has nothing to draw.
     this.renderLoop = () => {
+      this.followGround()
       scene.render()
       debugState.frames += 1
       debugState.loaded = true
@@ -315,6 +361,104 @@ export class MapScene {
     this.renderTargets.delete(mesh)
   }
 
+  /**
+   * Sets where the camera reads the height of the ground under its target.
+   *
+   * An orbit camera is framed around a target, and the target has to sit on the surface: a
+   * map whose ground stands hundreds of metres above zero puts the target at zero, so the
+   * whole camera drops below the surface as soon as the radius falls under that height and
+   * the terrain — culled from behind — disappears from the view. The reader supplies the
+   * height because only the host knows which layer is the ground and which of its chunks
+   * have arrived; `null` takes the reader away again.
+   */
+  setGroundHeight(provider: ((x: number, z: number) => number | null) | null): void {
+    this.groundHeight = provider
+  }
+
+  /**
+   * Keeps the orbit target on the ground beneath it.
+   *
+   * Only `target.y` is written. That is the one field the camera reads afresh every frame,
+   * while `setTarget` rebuilds the angles and the radius from the current position — which
+   * would undo the reader's zoom and pitch on every frame.
+   *
+   * The correction lands once the view has settled rather than on every tick. A moving camera
+   * is already recomputing its view matrix, and writing the target underneath it would keep
+   * marking it dirty for a whole gesture: the host reads the camera back on every change, so
+   * each of those writes costs a round trip through the host's own state and back into the
+   * camera. One write per gesture leaves the reader with the same view and no loop to run.
+   * An unknown height leaves the target where it was, so a view over terrain that is still
+   * loading does not jump.
+   */
+  private followGround(): void {
+    const camera = this.camera
+    const settled =
+      camera.alpha === this.lastCamera.alpha &&
+      camera.beta === this.lastCamera.beta &&
+      camera.radius === this.lastCamera.radius &&
+      camera.target.x === this.lastCamera.x &&
+      camera.target.z === this.lastCamera.z
+    this.lastCamera.alpha = camera.alpha
+    this.lastCamera.beta = camera.beta
+    this.lastCamera.radius = camera.radius
+    this.lastCamera.x = camera.target.x
+    this.lastCamera.z = camera.target.z
+    if (!settled) {
+      return
+    }
+    const ground = this.heightAt(camera.target.x, camera.target.z)
+    if (ground === null) {
+      return
+    }
+    const height = ground * this.exaggeration
+    // The write itself must not re-arm the loop, so it is skipped once the target is already
+    // on the ground.
+    if (Math.abs(camera.target.y - height) > GROUND_EPSILON_M) {
+      camera.target.y = height
+    }
+  }
+
+  /** Ground height at a map position, in map metres, or `null` when it is not known. */
+  private heightAt(x: number, z: number): number | null {
+    const provider = this.groundHeight
+    if (provider === null) {
+      return null
+    }
+    const height = provider(x, z)
+    return height === null || !Number.isFinite(height) ? null : height
+  }
+
+  /** Whether the scene is drawn for the dark appearance. */
+  get isDark(): boolean {
+    return this.dark
+  }
+
+  /** Registers an appearance listener; the returned function removes it. */
+  onAppearance(listener: (dark: boolean) => void): () => void {
+    this.appearanceListeners.add(listener)
+    return () => {
+      this.appearanceListeners.delete(listener)
+    }
+  }
+
+  /**
+   * Switches the scene to a light or a dark appearance.
+   *
+   * The background, the fog and the lights are re-derived from the interface's own tokens,
+   * which the appearance has already swapped; nothing here rebuilds geometry. A listener
+   * that owns colour of its own — the terrain's ramp — recolours from the same signal.
+   */
+  setAppearance(dark: boolean): void {
+    if (this.dark === dark) {
+      return
+    }
+    this.dark = dark
+    this.applyAppearance()
+    for (const listener of this.appearanceListeners) {
+      listener(dark)
+    }
+  }
+
   /** Zoom applied per wheel notch, as a fraction of the radius. */
   get zoomStep(): number {
     return this.camera.wheelDeltaPercentage
@@ -340,9 +484,19 @@ export class MapScene {
     return 90 - (this.camera.beta * 180) / Math.PI
   }
 
-  /** Sets the pitch, clamped to the hemisphere a map is read from. */
+  /**
+   * Sets the pitch, clamped to the hemisphere a map is read from.
+   *
+   * A pitch the camera already holds is not written back. The reader's own drag rotates the
+   * camera, the host reports that back, and the host's parameter list then asks for the same
+   * pitch again: writing it unconditionally would make the camera dirty in the middle of its
+   * own gesture, which is how a zoom that drifts the pitch turns into a loop.
+   */
   setPitch(deg: number): void {
     const clamped = clamp(deg, CAMERA_LIMITS.minPitchDeg, CAMERA_LIMITS.maxPitchDeg)
+    if (Math.abs(this.pitchDeg - clamped) < PITCH_EPSILON_DEG) {
+      return
+    }
     this.camera.beta = ((90 - clamped) * Math.PI) / 180
   }
 
@@ -412,15 +566,20 @@ export class MapScene {
    * The radius is one and a quarter diagonals rather than more, so a map fills the frame
    * instead of sitting in the middle of empty background; the fog then starts well
    * beyond the far edge so it never washes out the map itself.
+   *
+   * `groundElevation` is the height the target starts at, in map metres. Left out, the
+   * target takes the height the ground reader reports for the map's centre, so reframing a
+   * map does not drop the camera to zero for a frame before the loop corrects it.
    */
-  frameBounds(bounds: Aabb, maxElevation = 0): void {
+  frameBounds(bounds: Aabb, groundElevation?: number): void {
     this.bounds = bounds
     const width = bounds.max_x - bounds.min_x
     const depth = bounds.max_y - bounds.min_y
     const centerX = (bounds.min_x + bounds.max_x) / 2
     const centerZ = (bounds.min_y + bounds.max_y) / 2
     const diagonal = Math.hypot(width, depth)
-    this.camera.setTarget(new Vector3(centerX, (maxElevation * this.exaggeration) / 2, centerZ))
+    const ground = groundElevation ?? this.heightAt(centerX, centerZ) ?? 0
+    this.camera.setTarget(new Vector3(centerX, ground * this.exaggeration, centerZ))
     // More than the diagonal: at a 45-degree tilt a radius of one diagonal puts the
     // map's near edge outside the viewport, so the extent has to be framed with room
     // for the perspective, not merely for its size.
@@ -549,6 +708,23 @@ export class MapScene {
     updateDebug({ loaded: false, error: null, engine: null })
   }
 
+  /** Re-derives everything drawn from the interface tokens; safe to call at any time. */
+  private applyAppearance(): void {
+    const [r, g, b] = pageColour()
+    this.scene.clearColor = new Color4(unitChannel(r), unitChannel(g), unitChannel(b), 1)
+    this.scene.fogColor = new Color3(unitChannel(r), unitChannel(g), unitChannel(b))
+    this.gridMaterial.emissiveColor = gridColor()
+    this.sky.intensity = 0.42
+    // The bounce colour follows the page rather than a fixed grey: on a dark page a fixed
+    // one would light the model's vertical faces from below, which reads as a spotlight.
+    this.sky.groundColor = new Color3(
+      unitChannel(r) * 0.3,
+      unitChannel(g) * 0.3,
+      unitChannel(b) * 0.3,
+    )
+    this.sunLight.intensity = 0.55
+  }
+
   /** Direction from the surface toward the sun, in the scene's own terms. */
   private lightVector(): Vector3 {
     const [x, y, z] = sunDirection(this.azimuthDeg, this.elevationDeg)
@@ -572,9 +748,16 @@ export class MapScene {
   }
 }
 
-/** Creates and initialises a WebGPU engine. */
+/**
+ * Creates and initialises a WebGPU engine.
+ *
+ * `adaptToDeviceRatio` is not the WebGPU engine's default — unlike the WebGL `Engine`, whose
+ * fourth constructor argument is the caller's answer. Left off, the drawing buffer is sized in
+ * CSS pixels and the browser scales it up to the physical panel, which is what makes the whole
+ * map look undersampled on a display with a scaling factor above one.
+ */
 async function createWebGpuEngine(canvas: HTMLCanvasElement): Promise<WebGPUEngine> {
-  const engine = new WebGPUEngine(canvas, { antialias: true })
+  const engine = new WebGPUEngine(canvas, { antialias: true, adaptToDeviceRatio: true })
   await engine.initAsync()
   return engine
 }
@@ -596,18 +779,6 @@ export function tokenColor(name: string, fallback: string): string {
   return value === '' ? fallback : value
 }
 
-/** Scene background: the page's own surface colour, so the canvas does not look like a hole. */
-function surfaceColor(): Color4 {
-  const [r, g, b] = pageColour()
-  return new Color4(r / 255, g / 255, b / 255, 1)
-}
-
-/** The same colour as a `Color3`, for the fog. */
-function surfaceColor3(): Color3 {
-  const [r, g, b] = pageColour()
-  return new Color3(r / 255, g / 255, b / 255)
-}
-
 /** The page colour the canvas and the fog are both built from. */
 function pageColour(): readonly [number, number, number] {
   return parseCssColor(tokenColor('--ourealis-page', '#ffffff'))
@@ -617,4 +788,9 @@ function pageColour(): readonly [number, number, number] {
 function gridColor(): Color3 {
   const [r, g, b] = parseCssColor(tokenColor('--ourealis-muted', '#6e6e73'))
   return new Color3((r / 255) * 0.6, (g / 255) * 0.6, (b / 255) * 0.6)
+}
+
+/** One 0–255 channel as the 0–1 float a scene colour takes. */
+function unitChannel(channel: number): number {
+  return channel / 255
 }

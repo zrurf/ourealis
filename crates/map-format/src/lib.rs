@@ -62,6 +62,7 @@ pub mod quadtree;
 pub mod raster;
 pub mod reader;
 pub mod region;
+pub mod surface;
 pub mod synthetic;
 pub mod tlv;
 pub mod writer;

@@ -8,6 +8,10 @@
  * describes the screen rather than the file — and it never invents a category that no
  * loaded cell carries.
  *
+ * The same question is asked of the vector families — regions, connectors, the roadmap —
+ * which are drawn as coloured ribbons rather than as cells; {@link legendFamilies} answers
+ * those, so the canvas names every colour it draws.
+ *
  * Pure data: names are canonical layer names and the numbers are the samples' own values;
  * the component translates and formats.
  */
@@ -15,8 +19,40 @@ import { CATEGORY_PALETTE, SCALAR_RAMPS, rampCss, rgbToCss, valueRange } from '@
 import type { Rgb } from '@/types/colormap'
 import { flagColour, type ColorMapping } from '@/types/map'
 import { sampleColour } from './layerTexture'
+import { overlayColourCss, overlayStyle, type OverlayKind } from './overlays'
 import type { SurfacePattern } from './patterns'
 import type { SurfaceMaterial } from './surfaces'
+
+/** Translation key of each family's name, shared by the legend and the display controls. */
+export const OVERLAY_LABEL_KEYS: Readonly<Record<OverlayKind, string>> = {
+  regions: 'map.viewer.overlayRegions',
+  connectors: 'map.viewer.overlayConnectors',
+  skeleton: 'map.viewer.overlaySkeleton',
+  prm: 'map.viewer.overlayPrm',
+  direction: 'map.viewport.arrows',
+}
+
+/** One vector family drawn on the ground, as the legend names it. */
+export interface LegendFamily {
+  /** Family id, so a control can address the row. */
+  kind: OverlayKind
+  /** Translation key of the family's name. */
+  labelKey: string
+  /** CSS colour of the family's lines. */
+  colour: string
+  /** Width of the family's lines, metres. */
+  widthM: number
+}
+
+/** The families to describe, in the order they were given. */
+export function legendFamilies(kinds: readonly OverlayKind[]): LegendFamily[] {
+  return kinds.map((kind) => ({
+    kind,
+    labelKey: OVERLAY_LABEL_KEYS[kind],
+    colour: overlayColourCss(kind),
+    widthM: overlayStyle(kind).widthM,
+  }))
+}
 
 /** One colour of a discrete legend, with the value it stands for. */
 export interface LegendSwatch {

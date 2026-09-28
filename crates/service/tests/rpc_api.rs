@@ -513,8 +513,8 @@ async fn a_run_submitted_over_grpc_streams_its_events_and_samples() {
         .expect("result")
         .into_inner();
     assert!(
-        result.result_json.contains("candidates"),
-        "the preview must carry the candidate set: {}",
+        result.result_json.contains("\"legs\""),
+        "the preview must carry the route legs: {}",
         result.result_json
     );
 

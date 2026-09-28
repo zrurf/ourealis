@@ -26,10 +26,12 @@
 
 pub mod config;
 pub mod connector_lift;
+pub mod environment_cache;
 pub mod export;
 pub mod output;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -48,6 +50,7 @@ use crate::sensor;
 use crate::smooth::ElasticBandConfig;
 
 pub use config::{Backend, SimulationConfig};
+pub use environment_cache::EnvironmentCache;
 pub use output::{CandidateSummary, RouteSummary, RunManifest, SimulationOutput};
 
 /// Where the environment comes from.
@@ -230,6 +233,20 @@ impl Simulator {
 
     /// Loads the environment of this simulation.
     pub fn environment(&self) -> Result<Environment> {
+        self.load_environment()
+    }
+
+    /// Loads the environment of this simulation, reusing a cached one when it matches.
+    ///
+    /// The cache is keyed on the map source and the configuration — the inputs the
+    /// environment is derived from — so a task that only moves a route point pays for
+    /// neither the map decode nor the field synthesis.
+    pub fn environment_cached(&self, cache: &EnvironmentCache) -> Result<Arc<Environment>> {
+        cache.get_or_load(&self.source, &self.config, || self.load_environment())
+    }
+
+    /// Builds the environment from the map, the resolved weights and the cost model.
+    fn load_environment(&self) -> Result<Environment> {
         let map = self.source.open()?;
         let weights = self.weights(&map)?;
         let backend = self.compute_backend()?;

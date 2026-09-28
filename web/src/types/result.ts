@@ -139,12 +139,27 @@ export interface RoutePreviewCandidate {
   points: Vec2[]
 }
 
+/** One leg of a route preview. */
+export interface RoutePreviewLeg {
+  /** Requested start of the leg, metres. */
+  from: Vec2
+  /** Requested end of the leg, metres. */
+  to: Vec2
+  /** Index of the candidate the Logit draw selected for this leg. */
+  chosen: number
+  /** Candidate routes of this leg, best first. */
+  candidates: RoutePreviewCandidate[]
+}
+
 /** A route preview: planning only, before any motion or sensor work. */
 export interface RoutePreview {
-  /** Candidate routes, best first. */
-  candidates: RoutePreviewCandidate[]
-  /** Index of the candidate the Logit draw selected. */
-  chosen: number
+  /**
+   * The legs of the route, in travel order.
+   *
+   * A route with waypoints is planned leg by leg, each with its own candidate set and
+   * its own Logit draw.
+   */
+  legs: RoutePreviewLeg[]
   /** Total length of the chosen route, metres. */
   length_m: number
   /** Cost of the chosen route in equivalent metres. */
@@ -153,7 +168,7 @@ export interface RoutePreview {
   straight_line_m: number
   /** Time the planning step took, milliseconds. */
   planning_ms: number
-  /** The smoothed path actually used for motion, when smoothing ran. */
+  /** The chosen route as one polyline, metres. */
   path: Vec2[]
   /** Speed limit along the smoothed path, m/s, sampled at the profile grid. */
   speed_limit_mps: number[]
