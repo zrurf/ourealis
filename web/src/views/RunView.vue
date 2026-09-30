@@ -23,13 +23,21 @@ import { Button as TButton, Tag as TTag } from 'tdesign-vue-next'
 import { isApiError } from '@/api/errors'
 import type { ChunkRef } from '@/api/maps'
 import { channelRange, type Vec2 } from '@/api/types'
-import { LAYER_ELEVATION, chunkKey, drapeSourceLevel, flagColour, selectLevel } from '@/types/map'
+import {
+  LAYER_ELEVATION,
+  chunkKey,
+  drapeSourceLevel,
+  flagColour,
+  levelCellSize,
+  selectLevel,
+} from '@/types/map'
 import { SERIES_PALETTE } from '@/types/colormap'
 import type { RoutePreview } from '@/types/result'
-import { engineFromQuery, probeEngine } from '@/render/engine'
+import { cullingEnabled, engineFromQuery, probeEngine } from '@/render/engine'
 import { updateDebug } from '@/render/scene'
 import { renderHost, type SceneLease } from '@/render/host'
 import type { MapScene } from '@/render/scene'
+import { ChunkCuller } from '@/render/chunkCuller'
 import { TerrainLayer } from '@/render/terrain'
 import { OverlaySet, type OverlayKind } from '@/render/overlays'
 import { DirectionArrows } from '@/render/directionArrows'
@@ -45,8 +53,7 @@ import { drapedMesh, layerTextureData, texelsPerCell } from '@/render/layerTextu
 import { featureDimensions, layerSurfacePlan } from '@/render/surfaces'
 import { RouteHandles, type HandleRole, type HandleSpec } from '@/render/handles'
 import { pickGround } from '@/render/picking'
-import { createSurfaceSampler, elevationAt } from '@/render/inspect'
-import { drapePath, terracedSampler } from '@/render/drape'
+import { drapePath, meshSurfaceSampler } from '@/render/drape'
 import { attachGroundPan, metresPerPixelAt } from '@/render/pan'
 import { PathSet, type PathStyle } from '@/render/lines'
 import type { WorldPoint } from '@/render/overlayGeometry'
@@ -79,6 +86,14 @@ const ROUTE_LIFT_M = 0.4
 
 /** Height the ground-material drape is lifted above the terrain, metres. */
 const DRAPE_LIFT_M = 0.05
+
+/**
+ * Spacing a route is resampled at before it is draped, metres.
+ *
+ * Half a cell is the finest spacing that still follows every rise the surface can express,
+ * so a route chord cannot cut through a hill between two of its vertices.
+ */
+const DRAPE_SPACING_M = 1
 
 /** Drapes built before the frame loop is yielded to, so a whole-map drape does not stall. */
 const DRAPE_BATCH = 16
@@ -127,6 +142,9 @@ const surfaceRange = ref<{ min: number; max: number } | null>(null)
 let scene: MapScene | null = null
 let lease: SceneLease | null = null
 let terrain: TerrainLayer | null = null
+let culler: ChunkCuller | null = null
+/** Publishes what the culler decided; cleared with the scene it belongs to. */
+let cullingReport: ReturnType<typeof setInterval> | null = null
 let drapes: LayerOverlay | null = null
 let overlays: OverlaySet | null = null
 let arrows: DirectionArrows | null = null
@@ -172,11 +190,7 @@ const mapId = computed(() => workspace.mapId)
 const handleSpecs = computed<HandleSpec[]>(() => {
   const draft = workspace.draft
   const specs: HandleSpec[] = []
-  const id = mapId.value
-  const grid = id === null ? null : maps.gridOf(id, LAYER_ELEVATION)
-  const cells = id === null ? 0 : (maps.metadataOf(id)?.summary.chunk_size ?? 0)
-  const level = viewerLevel()
-  const origin = id === null ? { x: 0, y: 0 } : maps.originOf(id)
+  const surface = surfaceOf()
   const push = (
     role: HandleSpec['role'],
     index: number,
@@ -194,7 +208,9 @@ const handleSpecs = computed<HandleSpec[]>(() => {
       index,
       x: point.x,
       y: point.y,
-      z: grid === null ? null : elevationAt(maps.chunks, grid, cells, level, point, origin),
+      // The same sampler the route is draped with, so a handle stands on the surface the
+      // reader can see rather than on the raw cell the terrain quantised away from.
+      z: surface(point.x, point.y),
       illegal: verdict?.legal === false,
     })
   }
@@ -285,7 +301,10 @@ function drawRoute(): void {
         continue
       }
       styles.push({
-        points: drapePath(candidate.points, surface, ROUTE_LIFT_M),
+        points: drapePath(candidate.points, surface, {
+          lift: ROUTE_LIFT_M,
+          spacingM: DRAPE_SPACING_M,
+        }),
         colour: candidateColour(chosen),
         widthM: 1.6,
         alpha: 0.5,
@@ -315,7 +334,7 @@ function drawRoute(): void {
   const draft = routePoints.value
   if (draft.length > 1) {
     styles.push({
-      points: drapePath(draft, surface, ROUTE_LIFT_M),
+      points: drapePath(draft, surface, { lift: ROUTE_LIFT_M, spacingM: DRAPE_SPACING_M }),
       colour: DRAFT_COLOUR,
       widthM: 0.6,
       alpha: 0.7,
@@ -343,7 +362,7 @@ function routeLine(
   const chosen = workspace.chosenCandidates
   const inspected = workspace.inspectedCandidates
   if (!inspected.some((candidate, index) => candidate !== chosen[index])) {
-    return drapePath(preview.path, surface, ROUTE_LIFT_M * 1.2)
+    return drapePath(preview.path, surface, { lift: ROUTE_LIFT_M * 1.2, spacingM: DRAPE_SPACING_M })
   }
   const points: Vec2[] = []
   for (const candidate of inspected) {
@@ -352,7 +371,7 @@ function routeLine(
     }
     points.push(...candidate.points.slice(points.length === 0 ? 0 : 1))
   }
-  return drapePath(points, surface, ROUTE_LIFT_M * 1.2)
+  return drapePath(points, surface, { lift: ROUTE_LIFT_M * 1.2, spacingM: DRAPE_SPACING_M })
 }
 
 /**
@@ -379,8 +398,16 @@ function surfaceOf(): (x: number, y: number) => number | null {
   if (surfaceSamplerCache !== null && surfaceSamplerCache.key === key) {
     return surfaceSamplerCache.sampler
   }
-  const sampler = terracedSampler(
-    createSurfaceSampler(maps.chunks, grid, chunkSize(), level, maps.originOf(id)),
+  const sampler = meshSurfaceSampler(
+    createCellSampler({
+      chunks: maps.chunks,
+      grid,
+      chunkSize: chunkSize(),
+      level,
+      layerId: LAYER_ELEVATION,
+    }),
+    levelCellSize(grid, level),
+    maps.originOf(id),
     terrace,
   )
   surfaceSamplerCache = { key, sampler }
@@ -549,8 +576,10 @@ function surfaceLayerId(): number | null {
   if (info === null) {
     return null
   }
-  return featureDimensions(info.feature_schema).find((entry) => entry.name === 'surface_type')
-    ?.layerId ?? null
+  return (
+    featureDimensions(info.feature_schema).find((entry) => entry.name === 'surface_type')
+      ?.layerId ?? null
+  )
 }
 
 /** How one layer's cells are textured, from the map's own feature schema. */
@@ -615,6 +644,17 @@ async function streamDrapes(): Promise<void> {
     sourceLevel,
   })
   const plan = surfacePlanFor(layerId)
+  // The drape leaves footprints to the white model under it, so it needs the same mask the
+  // surface was built with. Read here rather than shared with the surface pass, because the
+  // two can be at different levels and a stale mask would cut the wrong cells out.
+  const building = createCellSampler({
+    chunks: maps.chunks,
+    grid: elevationGrid,
+    chunkSize: cells,
+    level,
+    layerId: LAYER_ELEVATION,
+    channel: 1,
+  })
   let built = 0
   for (const [key, mesh] of terrainData) {
     if (!live()) {
@@ -630,7 +670,8 @@ async function streamDrapes(): Promise<void> {
           emptyAlpha: 0,
           flag: flagColour(layerId),
           surface: plan,
-          texelsPerCell: texelsPerCell(plan),
+          building,
+          texelsPerCell: texelsPerCell(plan, metresPerPixel(), levelCellSize(elevationGrid, level)),
         },
       ),
       drapedMesh(mesh, DRAPE_LIFT_M),
@@ -672,10 +713,12 @@ function applyViewport(): void {
  */
 function observeCamera(): void {
   const current = scene
+  stopCameraObserver?.()
+  stopCameraObserver = null
   if (current === null) {
     return
   }
-  current.observeCamera((state) => {
+  stopCameraObserver = current.observeCamera((state) => {
     if (applying) {
       return
     }
@@ -686,6 +729,9 @@ function observeCamera(): void {
     scaleBarMetres.value = current.scaleBarLength(groundResolution.value)
   })
 }
+
+/** Detaches the camera listener; the engine outlives this view. */
+let stopCameraObserver: (() => void) | null = null
 
 /** True while the panel's own values are being pushed onto the camera. */
 let applying = false
@@ -715,6 +761,18 @@ async function startScene(): Promise<void> {
   lease = borrowing
   scene = borrowing.scene
   terrain = new TerrainLayer(scene.scene, scene)
+  culler = new ChunkCuller(scene.scene, scene)
+  if (cullingEnabled()) {
+    culler.start()
+    terrain.useCuller(culler)
+  }
+  // Published so the browser lane can see what the culler decided, rather than having to
+  // infer it from a pixel count.
+  cullingReport = setInterval(() => {
+    if (culler !== null) {
+      updateDebug({ culling: culler.report })
+    }
+  }, 500)
   drapes = new LayerOverlay(scene.scene, scene)
   overlays = new OverlaySet(scene)
   arrows = new DirectionArrows(scene)
@@ -1141,6 +1199,9 @@ watch(
 watch(
   () => ({ ...viewer.overlays }),
   () => {
+    // An overlay switch changes what the map shows, which is a change worth a frame even
+    // when it turns into a removal rather than an addition.
+    scene?.invalidate()
     void applyOverlays()
   },
   { deep: true },
@@ -1172,6 +1233,10 @@ watch(
 function stopScene(): void {
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('pointerdown', onMenuDismiss)
+  // The camera and its engine outlive this view, so the listener is detached here rather
+  // than left writing into refs nothing renders any more.
+  stopCameraObserver?.()
+  stopCameraObserver = null
   detachPan?.()
   detachPan = null
   dragging = null
@@ -1187,6 +1252,12 @@ function stopScene(): void {
   drapes = null
   // A drape pass still reading its layer must not resume onto the overlay just disposed.
   drapeGeneration += 1
+  if (cullingReport !== null) {
+    clearInterval(cullingReport)
+    cullingReport = null
+  }
+  culler?.stop()
+  culler = null
   terrain?.dispose()
   terrain = null
   lease?.release()

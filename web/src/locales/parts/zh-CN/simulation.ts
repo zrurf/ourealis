@@ -19,15 +19,20 @@ export default {
       cancelled: '已取消',
     },
     stage: {
+      // 核心运行观察器按流水线顺序上报的阶段。
+      map: '打开地图',
+      fields: '构建代价场',
+      plan: '规划路径',
+      motion: '运行运动模型',
+      sensors: '生成采样',
+      metrics: '计算指标',
+      // 作业自身所处状态的名字，对应一次提交或一次取回。
       queued: '排队',
       running: '运行中',
       failed: '失败',
       cancelled: '已取消',
       environment: '环境',
       planning: '规划',
-      motion: '运动',
-      sensors: '传感器',
-      metrics: '指标',
       done: '结束',
     },
     list: {
@@ -99,6 +104,16 @@ export default {
       strategyEven: '匀速',
       strategyPositiveSplit: '前快后慢',
       strategyNegativeSplit: '前慢后快',
+      on: '开',
+      off: '关',
+      group: {
+        physiology: '生理',
+        gait: '步态',
+        decision: '决策',
+        posture: '姿态',
+        sensors: '传感器噪声',
+        identity: '标识',
+      },
     },
     route: {
       mode: '路线模式',
@@ -224,7 +239,8 @@ export default {
       logEmpty: '尚未收到日志。',
       waiting: '等待服务…',
       streamFailed: '事件流已中断。',
-      progressUnknown: '运行期间服务不提供百分比，计时器与日志即为进度。',
+      progressUnknown:
+        '阶段即运行所处位置。进度条按流水线命名步骤计数，并非工作量占比：一次路径搜索可能比其余全部加起来还久。',
       cancelRun: '取消作业',
       cancelFailed: '作业取消失败。',
       streamLive: '事件流已连接',

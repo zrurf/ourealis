@@ -108,11 +108,16 @@ export class RouteHandles {
 
   /** Replaces every handle with the given set. */
   update(specs: readonly HandleSpec[]): void {
+    this.mapScene.invalidate()
     const wanted = new Set(specs.map(handleKey))
     // A handle whose point was deleted goes with it; the rest are moved, which keeps
     // the mesh count stable while a point is being dragged.
     for (const [key, mesh] of Array.from(this.meshes)) {
       if (!wanted.has(key)) {
+        // The scene keeps a strong reference to every tracked mesh, so a handle that is
+        // removed has to be untracked as it goes: a long editing session otherwise leaves
+        // the exaggeration control holding hundreds of disposed meshes.
+        this.mapScene.untrackHeightMesh(mesh)
         mesh.dispose()
         this.meshes.delete(key)
         this.specs.delete(key)
@@ -218,6 +223,7 @@ export class RouteHandles {
   /** Disposes every mark and material. */
   dispose(): void {
     for (const mesh of this.meshes.values()) {
+      this.mapScene.untrackHeightMesh(mesh)
       mesh.dispose()
     }
     for (const flag of this.flags.values()) {

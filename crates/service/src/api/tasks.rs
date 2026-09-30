@@ -132,6 +132,8 @@ pub async fn list(
         limit: query
             .limit
             .unwrap_or_else(crate::api::dto::default_page_limit),
+        // A task list is short and is read whole; a stride is for sample timelines.
+        stride: None,
     });
     let all = match query.kind {
         Some(kind) => state.tasks.list_kind(kind),

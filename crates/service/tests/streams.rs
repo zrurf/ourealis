@@ -543,3 +543,179 @@ fn the_ndjson_stream_yields_one_json_object_per_line() {
         .block_on(service.shutdown(Duration::from_secs(5)))
         .expect("stop");
 }
+
+#[test]
+fn a_gnss_fix_carries_its_local_plane_position() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let (service, port) = runtime.block_on(start());
+    let map_id = runtime.block_on(upload(&service));
+    let id = submit(port, &map_id);
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let (_, body) = http(
+            port,
+            &format!(
+                "GET /api/v1/simulations/{id} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        let state: Value = serde_json::from_str(&body).expect("state");
+        if state["state"] == "succeeded" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "job did not finish: {state}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let (_, body) = http(
+        port,
+        &format!(
+            "GET /api/v1/simulations/{id}/sensors/gnss?offset=0&limit=8 HTTP/1.0\r\n\
+             Host: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    let page: Value = serde_json::from_str(&body).expect("page");
+    let items = page["items"].as_array().expect("items");
+    assert!(!items.is_empty(), "a finished run has GNSS fixes: {page}");
+
+    // The vector payload is what a track and an error cloud are drawn from. A fix that
+    // omits it is not a fix the client can place, and the field is documented as
+    // "position for GNSS" — so an absent `v` is a contract break, not an empty channel.
+    for item in items {
+        let v = item["v"].as_array().expect("every fix carries a position");
+        assert_eq!(v.len(), 3, "a position is a three-component vector");
+        assert!(v[0].as_f64().is_some_and(f64::is_finite));
+        assert!(v[1].as_f64().is_some_and(f64::is_finite));
+    }
+
+    // The same samples over NDJSON, because the page and the stream share one mapping
+    // and a fix that lost its position on one of them would be invisible in the UI.
+    let (_, body) = http(
+        port,
+        &format!(
+            "GET /api/v1/simulations/{id}/sensors/gnss.ndjson HTTP/1.0\r\n\
+             Host: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    let first = body.lines().next().expect("at least one line");
+    let line: Value = serde_json::from_str(first).expect("line");
+    assert!(
+        line["v"].as_array().is_some_and(|v| v.len() == 3),
+        "the streamed fix lost its position: {first}"
+    );
+
+    runtime
+        .block_on(service.shutdown(Duration::from_secs(5)))
+        .expect("stop");
+}
+
+#[test]
+fn a_running_job_streams_the_stages_it_passes_through() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let (service, port) = runtime.block_on(start());
+    let map_id = runtime.block_on(upload(&service));
+    let id = submit(port, &map_id);
+
+    // Subscribe before the job can finish. A stream that only ever carries the outcome
+    // is the defect this guards: a run of any length reported "running" and then
+    // nothing, so the interface had a timer and no idea what the run was doing.
+    let (_, mut reader) = sse_stream(port, &id);
+    reader
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .expect("timeout");
+
+    let mut names: Vec<String> = Vec::new();
+    let mut stages: Vec<String> = Vec::new();
+    let mut initial_stage: Option<String> = None;
+    let mut current = String::new();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => panic!("reading the event stream failed: {error}"),
+        }
+        let line = line.trim_end();
+        if let Some(name) = line.strip_prefix("event: ") {
+            current = name.to_string();
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            let payload: Value = serde_json::from_str(data).expect("event payload is JSON");
+            if current == "stage" {
+                stages.push(
+                    payload["event"]["stage"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            } else if current == "state" && initial_stage.is_none() {
+                // The first frame is a snapshot of where the task is now, so a client
+                // that joined after the run started still learns the stage it is in
+                // rather than sitting on an unknown until the next event.
+                initial_stage = Some(
+                    payload["event"]["stage"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+            if matches!(current.as_str(), "done" | "error") {
+                names.push(current.clone());
+                break;
+            }
+        }
+    }
+
+    assert!(
+        closed || !names.is_empty(),
+        "the stream never reported an outcome"
+    );
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some("done"),
+        "the run must have succeeded: {names:?}"
+    );
+
+    // A run of any length used to report "running" and then nothing until it finished,
+    // which left the interface with a timer and no idea what the run was doing. The
+    // stages the core walks are now published as the run walks them.
+    for expected in ["plan", "motion", "sensors", "metrics", "done"] {
+        assert!(
+            stages.iter().any(|stage| stage == expected),
+            "the stream never reported the {expected} stage: {stages:?}"
+        );
+    }
+    let plan_at = stages
+        .iter()
+        .position(|stage| stage == "plan")
+        .expect("plan");
+    let done_at = stages
+        .iter()
+        .position(|stage| stage == "done")
+        .expect("done");
+    assert!(
+        plan_at < done_at,
+        "stages must be reported in order: {stages:?}"
+    );
+
+    // The opening stages finish before a subscriber can attach, so what a late joiner
+    // relies on is the snapshot: it must already name a real pipeline stage rather than
+    // the generic "running" the task used to report for the whole run.
+    let opening = initial_stage.unwrap_or_default();
+    assert!(
+        [
+            "map", "fields", "plan", "motion", "sensors", "metrics", "done"
+        ]
+        .contains(&opening.as_str()),
+        "the opening snapshot must name the stage the run is in: {opening:?}"
+    );
+
+    runtime
+        .block_on(service.shutdown(Duration::from_secs(5)))
+        .expect("stop");
+}

@@ -52,9 +52,18 @@ stages:
 |---|---|
 | Map | which map to plan against |
 | Route | the mode and the points, drawn by clicking and dragging on the map |
-| Runner | the preset, the seed and — in expert mode — every individual parameter |
+| Runner | the preset, the seed and every individual parameter |
 | Sensors | the sample rates and, in expert mode, the noise and event switches |
 | Run | the name, the metrics switch, and the button that submits |
+
+Every individual parameter is reachable from either mode. The ones a preset does not
+already set are folded into groups — physiology, gait, decision, posture, sensor noise —
+and a group holding an override opens by itself, so returning to a draft shows what was
+changed in it. The schema comes from the service rather than from a copy of
+`PersonParams`: a field `core` adds appears here as soon as the service reports it, and a
+field it removes disappears instead of being sent and refused. A restored draft can carry
+a name the service no longer takes, so an override outside the reported schema is dropped
+rather than failing the whole run with a `400`.
 
 A route is **drawn, not typed**: click the ground to place the start and the goal, drag
 a handle to move it, double-click a handle to remove it. Planning is automatic — as soon
@@ -94,6 +103,7 @@ and the work runs on a blocking worker:
 | `GET /api/v1/tasks/{id}/result/ref` | where the result lives, without fetching it |
 | `DELETE /api/v1/tasks/{id}` | cancel; a queued task stops at once, a running one at the next boundary |
 | `GET /api/v1/tasks/{id}/events` | SSE: state, stage, log, and one terminal event |
+| `GET /api/v1/simulations/{id}/events` | the same, for a run; see [run stages](#run-stages) |
 | `GET /api/v1/tasks/{id}/ws` | the same session over WebSocket |
 | `GET /api/v1/tasks?kind=route_plan` | the tickets, newest first, filtered by kind |
 
@@ -150,6 +160,40 @@ The e2e lane needs a service: `test:e2e` builds it in release and expects it at
 `OUREALIS_SERVICE_URL` (default `http://127.0.0.1:8080`). It fails rather than skipping
 when there is none, unless `OUREALIS_ALLOW_SKIP=1` is set — a lane that silently passes
 without the stack it exists to exercise is worse than one that reports the problem.
+
+## Run stages
+
+A run is one call in `core`, so a client that only saw it start and finish learned
+nothing about a process that takes minutes. `core` therefore reports the stages of the
+pipeline it is already walking, and the service forwards them:
+
+```rust
+use ourealis_core::sim::{RunStage, StageLog};
+
+let log = StageLog::new();
+let output = simulator.run_observed(&log)?;      // run() passes a discarding observer
+assert_eq!(log.names(), ["map", "fields", "plan", "motion", "sensors", "metrics", "done"]);
+```
+
+Over HTTP they arrive as `stage` events on
+`GET /api/v1/simulations/{id}/events`, alongside the `state` and `log` events:
+
+```
+event: stage  data: {"at_ms":…,"event":{"type":"stage","stage":"plan","progress":0.33,"elapsed_s":2.1}}
+event: log    data: {"at_ms":…,"event":{"type":"log","level":"info","message":"plan: 812 m planned"}}
+```
+
+Two things are worth being precise about. The stage names are the pipeline's own
+boundaries, not a progress estimate: how long a stage takes varies with the map and the
+route, and a route search on a coarse graph can outlast everything else combined. The
+`progress` that comes with a stage counts the named steps, so a client that wants a bar
+has one that means "step three of seven" and not "67 % done" — a number that would have
+to be invented.
+
+A subscriber that joins after a run has started still learns where it is: the first frame
+of every event stream is a snapshot of the task's current state, and that snapshot carries
+the stage. A dynamic run repeats its `plan` and `motion` stages once per checkpoint, and
+the repetition is the shape of the run rather than a glitch.
 
 ## Examples
 

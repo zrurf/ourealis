@@ -1,12 +1,17 @@
 /*
  * Panning the map by dragging with a mouse button.
  *
- * Babylon's orbit camera pans on one button and rotates on any other, which leaves the middle
- * button *rotating* — the opposite of what every map and every 3D editor does, where the middle
- * button pans and the left one picks. This attaches that behaviour: a drag with a chosen button
- * slides the camera target across the *ground plane*, so the ground follows the pointer instead
- * of swinging around the target. The camera's own pointer input is restricted to the left
- * button, so the two never fight over the same gesture.
+ * A map is moved with the middle button and rotated with the left one everywhere a 3D editor is
+ * used, and Babylon's orbit camera is the other way round: it rotates on any button it is given,
+ * and this version has no middle-button binding at all. This attaches the missing behaviour, and
+ * the camera's own pointer input is restricted to the left button so the two never fight over
+ * the same gesture.
+ *
+ * The drag slides the camera target across the *ground plane*, so the ground follows the pointer
+ * rather than swinging around the target. That distinction is the whole of it: `setTarget` with
+ * one argument re-aims the camera from where it stands, which reads as an orbit, and only its
+ * `allowSamePosition` and `cloneAlphaBetaRadius` flags make it a translation. Re-aiming is what
+ * the middle button used to do, and it is why a pan looked like a rotation.
  *
  * The arithmetic is a pure function, so "which way the map moves for a given drag" is testable
  * without an engine: dragging right moves the ground right, dragging down moves it down, and the
@@ -38,14 +43,11 @@ export function attachGroundPan(
   options: GroundPanOptions,
 ): () => void {
   // Only the left button rotates: the rest of the buttons belong to panning (and, in the
-  // workspace, to the context menu).
-  const pointers = camera.inputs.attached['pointers'] as
-    | { buttons?: number[]; panningMouseButton?: number }
-    | undefined
+  // workspace, to the context menu). The input is keyed by its own simple name, which is
+  // `pointers`, and it is read per event, so this takes effect whenever it runs.
+  const pointers = camera.inputs.attached['pointers'] as { buttons?: number[] } | undefined
   if (pointers !== undefined) {
     pointers.buttons = [0]
-    // No button pans through Babylon's own input: panning is what this module does.
-    pointers.panningMouseButton = -1
   }
   const buttons = new Set(options.buttons ?? [1])
   const slop = options.slopPx ?? 2
@@ -79,7 +81,10 @@ export function attachGroundPan(
       camera.alpha,
       camera.beta,
     )
-    camera.setTarget(new Vector3(next.x, target.y, next.z))
+    // The flags are what make this a pan. Without them `setTarget` keeps the camera where
+    // it stands and recomputes the angles that aim it at the new target, which moves the
+    // ground *and* swings the view — the reported "middle button rotates".
+    camera.setTarget(new Vector3(next.x, target.y, next.z), false, true, true)
     from = { x: event.clientX, y: event.clientY, button: start.button }
   }
   const onUp = (): void => {

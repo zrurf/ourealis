@@ -6,7 +6,7 @@
 
 use ourealis_core::motion::MotionConfig;
 use ourealis_core::motion::limits::LookAheadMode;
-use ourealis_core::person::{PaceStrategy, PersonParams, Preset};
+use ourealis_core::person::{PaceStrategy, PersonParams, Preset, SensorNoiseParams};
 use ourealis_core::plan::{LoopRequest, StandardRequest, Waypoint};
 use ourealis_core::sensor::DeviceMount;
 use ourealis_core::sim::{Backend, SimulationConfig};
@@ -259,14 +259,79 @@ impl PersonSpec {
     }
 }
 
+/// Overrides of a nested parameter struct.
+///
+/// Same contract as [`person_overrides`] — the names come from one list, so a field
+/// `core` adds cannot be accepted by the wire type and missing from the schema the
+/// client generates its form from, or the other way round.
+macro_rules! nested_overrides {
+    ($group_ty:ident for $target:path { $( $field:ident : $ty:ty ),* $(,)? }) => {
+        /// Overrides of a nested parameter struct.
+        #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct $group_ty {
+            $(
+                #[doc = concat!("Override for `", stringify!($target), "::", stringify!($field), "`.")]
+                pub $field: Option<$ty>,
+            )*
+        }
+
+        impl $group_ty {
+            /// Applies the set fields to the struct it overrides.
+            pub fn apply(&self, target: &mut $target) {
+                $(
+                    if let Some(value) = self.$field {
+                        target.$field = value;
+                    }
+                )*
+            }
+
+            /// Reads every field out of the struct it overrides.
+            pub fn from_group(target: &$target) -> Self {
+                Self {
+                    $( $field: Some(target.$field), )*
+                }
+            }
+
+            /// Names of the fields this type accepts.
+            pub const FIELDS: &'static [&'static str] = &[$( stringify!($field) ),*];
+        }
+    };
+}
+
+nested_overrides! {
+    SensorNoiseOverrides for SensorNoiseParams {
+        gnss_bias_sigma_m: f64,
+        gnss_bias_tau_s: f64,
+        gnss_white_sigma_m: f64,
+        gnss_speed_sigma: f64,
+        gnss_correlated_velocity: bool,
+        accel_bias_sigma: f64,
+        accel_white_sigma: f64,
+        gyro_bias_sigma: f64,
+        gyro_white_sigma: f64,
+        gyro_step_amplitude_rps: f64,
+        mag_bias_sigma_ut: f64,
+        mag_white_sigma_ut: f64,
+        baro_white_sigma_pa: f64,
+    }
+}
+
 /// Field-level overrides of an individual's parameters.
 ///
 /// Generated from a field list so the wire names cannot drift from [`PersonParams`].
 /// Every field is optional; a field left out keeps the preset's value. An unknown
 /// name is rejected with the list of accepted ones, which is what makes the
 /// request self-documenting.
+///
+/// The whole of `PersonParams` is offered, not the part a run happens to read first:
+/// the two step-harmonic ratios and the whole sensor-noise signature are what a
+/// realism audit tunes, and a knob the schema does not name is a knob nobody can turn.
 macro_rules! person_overrides {
-    ($( $field:ident : $ty:ty ),* $(,)?) => {
+    (
+        $( $field:ident : $ty:ty ),* $(,)?
+        ; nested $group:ident : $group_ty:ident
+    ) => {
         /// Overrides of individual parameters.
         #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
         #[serde(default, deny_unknown_fields)]
@@ -275,6 +340,8 @@ macro_rules! person_overrides {
                 #[doc = concat!("Override for `PersonParams::", stringify!($field), "`.")]
                 pub $field: Option<$ty>,
             )*
+            #[doc = concat!("Override for `PersonParams::", stringify!($group), "`.")]
+            pub $group: Option<$group_ty>,
         }
 
         impl PersonOverrides {
@@ -285,17 +352,22 @@ macro_rules! person_overrides {
                         person.$field = value.into();
                     }
                 )*
+                if let Some(value) = self.$group.clone() {
+                    value.apply(&mut person.$group);
+                }
             }
 
             /// Reads every field out of a parameter vector.
             pub fn from_person(person: &PersonParams) -> Self {
                 Self {
                     $( $field: Some(person.$field.clone().into()), )*
+                    $group: Some($group_ty::from_group(&person.$group)),
                 }
             }
 
             /// Names of the fields this type accepts.
-            pub const FIELDS: &'static [&'static str] = &[$( stringify!($field) ),*];
+            pub const FIELDS: &'static [&'static str] =
+                &[$( stringify!($field) ),*, stringify!($group)];
         }
     };
 }
@@ -322,6 +394,9 @@ person_overrides! {
     bounce_amplitude_m: f64,
     head_look_ahead_s: f64,
     turn_omega_max: f64,
+    harmonic_2_ratio: f64,
+    harmonic_3_ratio: f64;
+    nested sensors: SensorNoiseOverrides
 }
 
 /// Pace distribution strategy.

@@ -28,6 +28,7 @@ pub mod config;
 pub mod connector_lift;
 pub mod environment_cache;
 pub mod export;
+pub mod observer;
 pub mod output;
 
 use std::path::PathBuf;
@@ -51,6 +52,7 @@ use crate::smooth::ElasticBandConfig;
 
 pub use config::{Backend, SimulationConfig};
 pub use environment_cache::EnvironmentCache;
+pub use observer::{FnObserver, NoObserver, RunObserver, RunStage, StageLog};
 pub use output::{CandidateSummary, RouteSummary, RunManifest, SimulationOutput};
 
 /// Where the environment comes from.
@@ -346,7 +348,20 @@ impl Simulator {
 
     /// Runs the simulation.
     pub fn run(&self) -> Result<SimulationOutput> {
+        self.run_observed(&NoObserver)
+    }
+
+    /// Runs the simulation, reporting each stage to `observer`.
+    ///
+    /// The stages are the pipeline's own boundaries rather than a progress estimate: a
+    /// run spends an unpredictable share of its time in the route search, so a fraction
+    /// of the work could only be guessed. A client that shows the stage names knows what
+    /// the run is doing, which is the thing a progress bar was standing in for.
+    pub fn run_observed(&self, observer: &dyn RunObserver) -> Result<SimulationOutput> {
+        observer.stage(RunStage::Map, "");
         let map = self.source.open()?;
+
+        observer.stage(RunStage::Fields, "");
         let weights = self.weights(&map)?;
         let backend = self.compute_backend()?;
         let environment = Environment::load_with_coarse(
@@ -367,8 +382,16 @@ impl Simulator {
             self.person.target_speed,
         );
 
+        observer.stage(RunStage::Plan, "");
         let route = self.plan_route(&environment, &mut graph)?;
-        self.finish_run(&environment, route, backend.as_deref())
+        observer.stage(RunStage::Plan, &format!("{:.0} m planned", route.length_m));
+
+        let output = self.finish_run(&environment, route, backend.as_deref(), observer)?;
+        observer.stage(
+            RunStage::Done,
+            &format!("{:.1} s simulated", output.duration_s()),
+        );
+        Ok(output)
     }
 
     /// Plans the route of the configured mode.
@@ -420,6 +443,7 @@ impl Simulator {
         environment: &Environment,
         route: PlannedRoute,
         resolved: Option<&dyn crate::gpu::ComputeBackend>,
+        observer: &dyn RunObserver,
     ) -> Result<SimulationOutput> {
         let mut motion_config = self.config.motion.clone();
         motion_config.profile.modifiers = route.modifiers.clone();
@@ -471,6 +495,7 @@ impl Simulator {
             &environment.connectors,
             &environment.terrain,
         )?;
+        observer.stage(RunStage::Motion, "");
         let trajectory = Trajectory::build_with_backend(
             path,
             &environment.terrain,
@@ -483,6 +508,7 @@ impl Simulator {
             backend,
         )?;
 
+        observer.stage(RunStage::Sensors, "");
         let bundle = sensor::generate(
             &trajectory,
             environment.regions.as_ref(),
@@ -494,6 +520,7 @@ impl Simulator {
             self.individual,
         )?;
 
+        observer.stage(RunStage::Metrics, "");
         let metrics = self.config.with_metrics.then(|| {
             MetricsReport::compute(
                 &trajectory,
@@ -548,12 +575,21 @@ impl Simulator {
 
     /// Runs the simulation with online re-planning for its checkpoints.
     pub fn run_dynamic(&self) -> Result<SimulationOutput> {
+        self.run_dynamic_observed(&NoObserver)
+    }
+
+    /// Runs the simulation with online re-planning, reporting each stage to `observer`.
+    ///
+    /// A dynamic run repeats its planning and motion stages once per checkpoint, so the
+    /// stage sequence repeats too. That repetition is the run's shape, not a glitch: a
+    /// client that counts `plan` arrivals knows how far through the checkpoints it is.
+    pub fn run_dynamic_observed(&self, observer: &dyn RunObserver) -> Result<SimulationOutput> {
         let PlanMode::Dynamic {
             request,
             checkpoints,
         } = &self.mode
         else {
-            return self.run();
+            return self.run_observed(observer);
         };
         let map = self.source.open()?;
         let weights = self.weights(&map)?;
@@ -576,6 +612,9 @@ impl Simulator {
             self.person.target_speed,
         );
 
+        observer.stage(RunStage::Map, "");
+        observer.stage(RunStage::Fields, "");
+        observer.stage(RunStage::Plan, "");
         let mut route = plan(
             &environment,
             &mut graph,
@@ -588,8 +627,10 @@ impl Simulator {
 
         // Build the initial trajectory, then fold in every checkpoint in time
         // order, blending each redirect into the running trajectory.
-        let mut output = self.finish_run(&environment, route.clone(), backend.as_deref())?;
+        let mut output =
+            self.finish_run(&environment, route.clone(), backend.as_deref(), observer)?;
         for checkpoint in checkpoints {
+            observer.stage(RunStage::Plan, "");
             let (new_route, record) = dynamic::replan(
                 &environment,
                 &mut graph,
@@ -628,6 +669,7 @@ impl Simulator {
             // harmonic and the gyroscope, so perturbing it here would put the
             // accelerometer of the whole recording out of phase with the height
             // that the barometer sees.
+            observer.stage(RunStage::Motion, "");
             let replacement = Trajectory::build_with_backend(
                 connector_lift::lift_connector_elevations(
                     &new_route.path,
@@ -650,6 +692,7 @@ impl Simulator {
                 self.config.dynamic.blend_window_s,
                 &environment.hard,
             )?;
+            observer.stage(RunStage::Sensors, "");
             let bundle = sensor::generate(
                 &blended,
                 environment.regions.as_ref(),
@@ -677,6 +720,10 @@ impl Simulator {
             output.route = RouteSummary::from_route(&route);
         }
         output.manifest.duration_s = output.trajectory.duration_s();
+        observer.stage(
+            RunStage::Done,
+            &format!("{:.1} s simulated", output.duration_s()),
+        );
         Ok(output)
     }
 }
@@ -698,6 +745,11 @@ impl BatchRunner {
     /// Individuals are independent and are distributed over the rayon pool. The
     /// random streams are keyed by the individual index rather than by thread, so
     /// a parallel batch produces exactly the same output as a serial one.
+    ///
+    /// There is deliberately no observed variant: the individuals finish in whatever
+    /// order the pool gives them, so their stages interleave and no single sequence
+    /// describes the batch. A caller watching a batch should count completions, which it
+    /// can do from the results themselves, rather than read an invented pipeline.
     pub fn run(&self, people: &[PersonParams]) -> Result<Vec<SimulationOutput>> {
         let map = self.simulator.source.open()?;
         let weights = self.simulator.weights(&map)?;
@@ -757,7 +809,7 @@ impl BatchRunner {
                 let mut per_person = self.simulator.clone();
                 per_person.person = person.clone();
                 per_person.individual = index as u32;
-                per_person.finish_run(&environment, route, backend.as_deref())
+                per_person.finish_run(&environment, route, backend.as_deref(), &NoObserver)
             })
             .collect();
         results

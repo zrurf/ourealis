@@ -167,6 +167,7 @@ function onLocaleChange(value: unknown): void {
             :value="localeStore.locale"
             :options="localeStore.options"
             borderless
+            data-testid="locale-select"
             @change="onLocaleChange"
           />
         </label>

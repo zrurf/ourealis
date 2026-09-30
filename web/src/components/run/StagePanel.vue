@@ -23,15 +23,11 @@ import RouteForm from '@/components/forms/RouteForm.vue'
 import PersonForm from '@/components/forms/PersonForm.vue'
 import SensorForm from '@/components/forms/SensorForm.vue'
 import { RECIPES } from '@/components/forms/recipes'
-import { listPresets, type Preset } from '@/api/presets'
-import { onMounted, ref } from 'vue'
+import { onMounted } from 'vue'
 
 const { t } = useI18n({ useScope: 'global' })
 const workspace = useWorkspaceStore()
 const maps = useMapsStore()
-
-const presets = ref<Preset[]>([])
-const presetStatus = ref<'idle' | 'loading' | 'ready' | 'failed'>('idle')
 
 /** The run stages the panel can show. */
 const stage = computed(() => workspace.stage)
@@ -46,14 +42,8 @@ const recipeCards = computed(() =>
   })),
 )
 
-onMounted(async () => {
-  presetStatus.value = 'loading'
-  try {
-    presets.value = (await listPresets()).items
-    presetStatus.value = 'ready'
-  } catch {
-    presetStatus.value = 'failed'
-  }
+onMounted(() => {
+  void workspace.loadPresets()
 })
 
 /**
@@ -182,8 +172,8 @@ function arm(target: Parameters<typeof workspace.arm>[0]): void {
       </div>
       <PersonForm
         v-model="workspace.draft"
-        :presets="presets"
-        :status="presetStatus"
+        :presets="workspace.presets"
+        :status="workspace.presetStatus"
         :simple="workspace.mode === 'simple'"
         @update:model-value="(next) => workspace.setDraft(next)"
       />

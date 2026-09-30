@@ -26,7 +26,7 @@ use crate::api::dto::{
 use crate::error::{Result, ServiceError};
 use crate::store::MapStore;
 
-use super::{Task, TaskOutcome, TaskPayload, TaskRegistry};
+use super::{Task, TaskObserver, TaskOutcome, TaskPayload, TaskRegistry};
 
 /// Everything a task needs that outlives it.
 #[derive(Debug)]
@@ -303,6 +303,9 @@ fn run_simulation(
             task.map_id()
         ),
     );
+    // The run reports its pipeline into this task's event stream, so a client watching
+    // a long run sees the stage it is in rather than a timer over an unknown.
+    let observer = TaskObserver::new(task);
     let output = match &request.route {
         // A dynamic run only differs once a checkpoint takes effect, but the timeline
         // rewrite lives behind `run_dynamic`; calling it with an empty checkpoint list
@@ -311,9 +314,9 @@ fn run_simulation(
         crate::api::dto::simulation::RouteSpec::Dynamic { checkpoints, .. }
             if !checkpoints.is_empty() =>
         {
-            simulator.run_dynamic()?
+            simulator.run_dynamic_observed(&observer)?
         }
-        _ => simulator.run()?,
+        _ => simulator.run_observed(&observer)?,
     };
     Ok(Arc::new(output))
 }

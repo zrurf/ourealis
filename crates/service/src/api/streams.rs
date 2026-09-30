@@ -74,7 +74,8 @@ pub async fn sensors_any(
         None => {
             let query = query.map_err(query_rejection)?.0;
             let (offset, limit) = state.page(query);
-            Ok(Json(sensor_page(&output, &tail, offset, limit)?).into_response())
+            let stride = query.stride.unwrap_or(1);
+            Ok(Json(sensor_page(&output, &tail, offset, limit, stride)?).into_response())
         }
     }
 }
@@ -94,13 +95,14 @@ pub(crate) fn truth_page(
     output: &SimulationOutput,
     offset: usize,
     limit: usize,
+    stride: usize,
 ) -> Page<TruthSampleDto> {
     Page::new(
-        slice(&output.truth, offset, limit)
-            .iter()
+        slice(&output.truth, offset, limit, stride)
+            .into_iter()
             .map(truth_dto)
             .collect(),
-        output.truth.len(),
+        output.truth.len().div_ceil(stride.max(1)),
         offset,
     )
 }
@@ -111,15 +113,20 @@ pub(crate) fn sensor_page(
     channel: &str,
     offset: usize,
     limit: usize,
+    stride: usize,
 ) -> Result<Page<SensorSampleDto>> {
-    let total = channel_len(output, channel)?;
+    let total = channel_len(output, channel)?.div_ceil(stride.max(1));
+    let step = stride;
     let items = match channel {
-        "gnss" => slice(&output.sensors.gnss, offset, limit)
-            .iter()
+        "gnss" => slice(&output.sensors.gnss, offset, limit, step)
+            .into_iter()
             .map(|sample| SensorSampleDto {
                 time_s: sample.time_s,
                 channel: "gnss",
-                v: None,
+                // The fix's local-plane position, which is what a track and an error cloud
+                // are drawn from; the geographic pair below is a different reading of the
+                // same fix and is absent on a map with no geographic reference.
+                v: Some([sample.x, sample.y, 0.0]),
                 latitude_deg: sample.latitude_deg,
                 longitude_deg: sample.longitude_deg,
                 altitude_m: Some(sample.altitude_m),
@@ -130,20 +137,20 @@ pub(crate) fn sensor_page(
                 pressure_pa: None,
             })
             .collect(),
-        "accel" => slice(&output.sensors.imu.accel, offset, limit)
-            .iter()
+        "accel" => slice(&output.sensors.imu.accel, offset, limit, step)
+            .into_iter()
             .map(|sample| vector_sample(sample.time_s, "accel", sample.accel()))
             .collect(),
-        "gyro" => slice(&output.sensors.imu.gyro, offset, limit)
-            .iter()
+        "gyro" => slice(&output.sensors.imu.gyro, offset, limit, step)
+            .into_iter()
             .map(|sample| vector_sample(sample.time_s, "gyro", sample.omega()))
             .collect(),
-        "mag" => slice(&output.sensors.mag, offset, limit)
-            .iter()
+        "mag" => slice(&output.sensors.mag, offset, limit, step)
+            .into_iter()
             .map(|sample| vector_sample(sample.time_s, "mag", sample.field()))
             .collect(),
-        "baro" => slice(&output.sensors.baro, offset, limit)
-            .iter()
+        "baro" => slice(&output.sensors.baro, offset, limit, step)
+            .into_iter()
             .map(|sample| SensorSampleDto {
                 time_s: sample.time_s,
                 channel: "baro",
@@ -209,12 +216,20 @@ pub(crate) fn truth_dto(sample: &ourealis_core::sensor::TruthState) -> TruthSamp
 }
 
 /// The paged range of a slice, empty when the range starts past the end.
-fn slice<T>(items: &[T], offset: usize, limit: usize) -> &[T] {
-    let end = offset.saturating_add(limit).min(items.len());
+/// A window of a sample list, taking one item in every `stride`.
+///
+/// `offset` and `limit` count items of the *strided* view, so a client that pages through a
+/// strided timeline sees a coherent sequence rather than a sliding window over the raw one.
+fn slice<T>(items: &[T], offset: usize, limit: usize, stride: usize) -> Vec<&T> {
+    let step = stride.max(1);
+    let available = items.len().div_ceil(step);
+    let end = offset.saturating_add(limit).min(available);
     if offset >= end {
-        return &[];
+        return Vec::new();
     }
-    items.get(offset..end).unwrap_or(&[])
+    (offset..end)
+        .filter_map(|at| items.get(at * step))
+        .collect()
 }
 
 /// A sample whose payload is a three-vector.
@@ -281,13 +296,13 @@ fn frame_of(
     let mut text = String::new();
     match channel {
         None => {
-            for sample in slice(&output.truth, offset, frame) {
+            for sample in slice(&output.truth, offset, frame, 1) {
                 text.push_str(&serde_json::to_string(&truth_dto(sample))?);
                 text.push('\n');
             }
         }
         Some(name) => {
-            for sample in sensor_page(output, name, offset, frame)?.items {
+            for sample in sensor_page(output, name, offset, frame, 1)?.items {
                 text.push_str(&serde_json::to_string(&sample)?);
                 text.push('\n');
             }

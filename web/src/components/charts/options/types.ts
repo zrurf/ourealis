@@ -16,6 +16,24 @@ export interface Point {
   y: number
 }
 
+/**
+ * Converts points to the `[x, y]` pairs echarts reads off a value axis.
+ *
+ * A plain object is not a data point to echarts: since v6 any non-primitive item is
+ * classified as an *item option* and its value is read from `item.value`, which a `Point`
+ * does not carry. The series then resolves to `NaN` and draws its axes and nothing else —
+ * a chart that looks empty while the data sits in the option. Every series builder funnels
+ * its points through here so the shape is decided in one place.
+ */
+export function toPairs(points: readonly Point[]): [number, number][] {
+  return points.map((point) => [point.x, point.y])
+}
+
+/** Whether a series payload is points rather than bare values against a category axis. */
+function isPoints(data: readonly (Point | number)[]): data is readonly Point[] {
+  return data.length > 0 && typeof data[0] === 'object'
+}
+
 /** Axis labels a builder carries into the option. */
 export interface AxisLabels {
   /** Label under the x axis. */
@@ -70,7 +88,7 @@ export function lineSeries(
   return {
     name,
     type: 'line',
-    data,
+    data: isPoints(data) ? toPairs(data) : data,
     showSymbol: false,
     sampling: 'lttb',
     lineStyle: { width: options.width ?? 1.5 },
@@ -79,9 +97,10 @@ export function lineSeries(
   }
 }
 
-/** A bar series; `data` is either values or `[x, y]` pairs. */
+/** A bar series; `data` is either bare values against a category axis, or points against a value axis. */
 export function barSeries(name: string, data: number[] | Point[]): Record<string, unknown> {
-  return { name, type: 'bar', data, barMaxWidth: 24 }
+  const values = isPoints(data) ? toPairs(data) : data
+  return { name, type: 'bar', data: values, barMaxWidth: 24 }
 }
 
 /** A scatter series. */
@@ -90,7 +109,7 @@ export function scatterSeries(
   data: Point[],
   options: { symbolSize?: number } = {},
 ): Record<string, unknown> {
-  return { name, type: 'scatter', data, symbolSize: options.symbolSize ?? 6 }
+  return { name, type: 'scatter', data: toPairs(data), symbolSize: options.symbolSize ?? 6 }
 }
 
 /** An option with only the shared skeleton filled in; a builder adds series on top. */

@@ -286,22 +286,44 @@ export function routeSpecOf(state: SimulationFormState): RouteSpec | null {
   }
 }
 
-/** The overrides of the form, with the unset ones left out. */
+/**
+ * The overrides of the form, with the unset ones left out.
+ *
+ * The draft keeps a sensor-noise field as one flat `sensors.<name>` key, which is what
+ * makes clearing a single field and counting the set ones ordinary map operations; the
+ * wire wants a nested object, so the split happens here and only here.
+ */
 export function overridesOf(state: SimulationFormState): PersonOverrides {
-  const out: Record<string, number | string> = {}
+  const out: Record<string, number | string | Record<string, number | string>> = {}
   for (const [key, value] of Object.entries(state.overrides)) {
     if (value === null) {
       continue
     }
+    let sent: number | string | null = null
     if (typeof value === 'number') {
-      if (Number.isFinite(value)) {
-        out[key] = value
-      }
+      // A cleared numeric input reports `undefined`/`''`, and `Number()` turns both into
+      // something wrong: `NaN`, which serialises to `null` and fails validation for the
+      // whole request. A field the reader emptied must not be sent at all.
+      sent = Number.isFinite(value) ? value : null
+    } else if (value === 'true' || value === 'false') {
+      sent = value
+    } else if (value.trim() !== '') {
+      sent = value
+    }
+    if (sent === null) {
       continue
     }
-    if (value.trim() !== '') {
-      out[key] = value
+    const dotted = key.indexOf('.')
+    if (!key.startsWith(`${SENSOR_GROUP}.`)) {
+      out[key] = sent
+      continue
     }
+    const group = dotted < 0 ? key : key.slice(0, dotted)
+    const field = key.slice(dotted + 1)
+    const existing = out[group]
+    const bucket =
+      typeof existing === 'object' ? existing : (out[group] = {} as Record<string, number | string>)
+    bucket[field] = sent
   }
   return out as PersonOverrides
 }
@@ -371,15 +393,31 @@ export function settingsOf(state: SimulationFormState): SimulationSettings {
  *
  * `route` is required by the schema, so a caller has to validate first; this
  * function throws rather than sending a request that would come back as a 400.
+ *
+ * `acceptedFields` is the override schema `/presets` reported. Passing it drops any
+ * override the service no longer takes, which a restored draft can carry; omitting it
+ * sends every set override, which is what a caller that has no schema to filter by wants.
  */
-export function buildSimulationRequest(state: SimulationFormState): SimulationRequest {
+export function buildSimulationRequest(
+  state: SimulationFormState,
+  acceptedFields?: readonly string[],
+): SimulationRequest {
   const route = routeSpecOf(state)
   if (route === null) {
     throw new Error('the route is incomplete: a start, a goal or a checkpoint is missing')
   }
+  // Filtered on the draft, before it is shaped into the wire object, so a stale key is
+  // never given a chance to nest itself into a group.
+  const overrides =
+    acceptedFields === undefined || acceptedFields.length === 0
+      ? state.overrides
+      : filterOverrides(
+          state.overrides,
+          acceptedFields.map((name) => ({ name, kind: 'number' as const })),
+        )
   const request: SimulationRequest = {
     route,
-    person: { preset: state.preset, overrides: overridesOf(state) },
+    person: { preset: state.preset, overrides: overridesOf({ ...state, overrides }) },
     seed: Math.max(0, Math.trunc(state.seed)),
     individual: Math.max(0, Math.trunc(state.individual)),
     settings: settingsOf(state),
@@ -527,7 +565,127 @@ export function overrideFields(names: readonly string[], params: unknown): Overr
   })
 }
 
-/** Keeps only the overrides the field list accepts. */
+/** The nested override group that holds the sensor noise signature. */
+export const SENSOR_GROUP = 'sensors'
+
+/**
+ * Which group an override is shown under.
+ *
+ * A flat list of thirty-odd fields is unreadable, and the ones a reader reaches for are
+ * rarely adjacent: the three that decide how fast someone runs sit between a pace-drift
+ * time constant and a turn rate. The grouping is by what the knob is *about*, so a
+ * reader looking for the cadence finds it with the other physiology rather than by
+ * reading every name.
+ */
+const FIELD_GROUPS: Record<string, string> = {
+  // Physiology: what the body can and wants to do.
+  target_speed: 'physiology',
+  step_frequency: 'physiology',
+  a_max: 'physiology',
+  a_lat_max: 'physiology',
+  critical_speed_ratio: 'physiology',
+  fatigue_tau_s: 'physiology',
+  k_down: 'physiology',
+  // Gait: how the body moves while it runs.
+  bounce_amplitude_m: 'gait',
+  harmonic_2_ratio: 'gait',
+  harmonic_3_ratio: 'gait',
+  lean_max_deg: 'gait',
+  // Decision: how the path and the pace are chosen.
+  beta_logit: 'decision',
+  look_ahead_m: 'decision',
+  pace_strategy: 'decision',
+  split_amplitude: 'decision',
+  pace_drift_sigma: 'decision',
+  pace_drift_tau_s: 'decision',
+  // Posture: where on the path the body is and how it is carried.
+  lateral_offset_mean: 'posture',
+  lateral_offset_std: 'posture',
+  lateral_offset_tau_s: 'posture',
+  head_look_ahead_s: 'posture',
+  turn_omega_max: 'posture',
+  // Identity: carried into the manifest rather than simulated.
+  label: 'identity',
+}
+
+/** The group an override belongs to; a name the table does not know is filed under the sensors. */
+export function groupOf(name: string): string {
+  return FIELD_GROUPS[name] ?? 'sensors'
+}
+
+/**
+ * The override fields of one preset, split into the groups the form draws.
+ *
+ * The nested `sensors` entry in the field list names a group rather than a value, so it
+ * is expanded here from the resolved parameter vector: one level of nesting is enough for
+ * the form, and a form that mirrors the DTO's own nesting would be a second vocabulary to
+ * keep in step.
+ */
+export function overrideGroups(names: readonly string[], params: unknown): OverrideField[][] {
+  const flat = overrideFields(
+    names.filter((name) => name !== SENSOR_GROUP),
+    params,
+  )
+  const sensors = sensorFields(params)
+  const groups: OverrideField[][] = []
+  const byName = new Map<string, OverrideField[]>()
+  for (const field of [...flat, ...sensors]) {
+    const key = groupOf(field.name)
+    const bucket = byName.get(key)
+    if (bucket === undefined) {
+      byName.set(key, [field])
+    } else {
+      bucket.push(field)
+    }
+  }
+  for (const key of GROUP_ORDER) {
+    const bucket = byName.get(key)
+    if (bucket !== undefined) {
+      groups.push(bucket)
+      byName.delete(key)
+    }
+  }
+  // Anything the table has never heard of still has to be reachable.
+  for (const bucket of byName.values()) {
+    groups.push(bucket)
+  }
+  return groups
+}
+
+/** Groups in the order they are drawn. */
+const GROUP_ORDER = ['physiology', 'gait', 'decision', 'posture', 'sensors', 'identity']
+
+/** The sensor noise fields, read out of the resolved parameter vector. */
+function sensorFields(params: unknown): OverrideField[] {
+  const record =
+    typeof params === 'object' && params !== null ? (params as Record<string, unknown>) : {}
+  const noise = record[SENSOR_GROUP]
+  const entries =
+    typeof noise === 'object' && noise !== null ? (noise as Record<string, unknown>) : {}
+  return Object.keys(entries)
+    .map((name) => `${SENSOR_GROUP}.${name}`)
+    .map((name) => {
+      const value = entries[name.split('.')[1] ?? '']
+      return typeof value === 'boolean'
+        ? { name, kind: 'choice' as const, options: BOOLEAN_OPTIONS }
+        : { name, kind: 'number' as const }
+    })
+}
+
+/** The two states of a boolean sensor-noise flag. */
+const BOOLEAN_OPTIONS: Array<{ value: string; labelKey: string }> = [
+  { value: 'true', labelKey: 'simulation.person.on' },
+  { value: 'false', labelKey: 'simulation.person.off' },
+]
+
+/**
+ * Keeps only the overrides the field list accepts.
+ *
+ * The wire type refuses an unknown name, so a key left behind by a draft, a recipe or a
+ * field the service has since renamed takes the whole run down with a 400. A draft is
+ * restored from storage and edited over days; a form that trusted it would break on the
+ * first upgrade rather than on the edit that introduced the stale key.
+ */
 export function filterOverrides(
   overrides: Record<string, OverrideValue>,
   fields: readonly OverrideField[],
@@ -535,7 +693,9 @@ export function filterOverrides(
   const allowed = new Set(fields.map((field) => field.name))
   const out: Record<string, OverrideValue> = {}
   for (const [key, value] of Object.entries(overrides)) {
-    if (allowed.has(key)) {
+    // A dotted sensor-noise key is covered by the group the schema names as a whole.
+    const group = key.startsWith(`${SENSOR_GROUP}.`) ? SENSOR_GROUP : key
+    if (allowed.has(group) || allowed.has(key)) {
       out[key] = value
     }
   }

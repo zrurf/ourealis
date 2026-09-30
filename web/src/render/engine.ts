@@ -181,3 +181,36 @@ export function backendLabel(backend: EngineBackend): string {
       return 'WebGL'
   }
 }
+
+/**
+ * Whether chunks out of view may be switched off.
+ *
+ * `?nocull=1` turns it off, which is the escape hatch for "the surface has a hole in it":
+ * with culling off the map is drawn exactly as it was before any of this existed, so the
+ * question can be settled by looking rather than by reading. It also means a regression
+ * here is never the difference between a usable map and an unusable one.
+ */
+export function cullingEnabled(search: string | undefined = globalThis.location?.search): boolean {
+  if (search === undefined) {
+    return true
+  }
+  const flag = new URLSearchParams(search).get('nocull')
+  return flag !== '1' && flag !== 'true'
+}
+
+/**
+ * Whether a whole-map view may thin the surface's triangles.
+ *
+ * The counterpart to `?nocull=1`, and for the same reason: culling and decimation are
+ * independent, and a surface that looks wrong is only diagnosable if each can be switched
+ * off on its own.
+ */
+export function decimationEnabled(
+  search: string | undefined = globalThis.location?.search,
+): boolean {
+  if (search === undefined) {
+    return true
+  }
+  const flag = new URLSearchParams(search).get('nolod')
+  return flag !== '1' && flag !== 'true'
+}

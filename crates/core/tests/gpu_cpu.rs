@@ -86,7 +86,9 @@ fn a_cost_field_wider_than_the_dispatch_cap_is_covered() {
     let cpu = CpuBackend::new();
 
     let cells = 4_200_000;
-    let features: Vec<f32> = (0..cells).map(|cell| (cell % 1024) as f32 * 0.001).collect();
+    let features: Vec<f32> = (0..cells)
+        .map(|cell| (cell % 1024) as f32 * 0.001)
+        .collect();
     let feature_tensor = FeatureTensor::new(cells, 1, features).expect("tensor");
     let weights = WeightMatrix::from_vectors(&[vec![1.0]]).expect("weights");
 

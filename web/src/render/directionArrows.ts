@@ -45,6 +45,7 @@ export class DirectionArrows {
 
   /** Replaces the field with the arrows of the given samples. */
   set(samples: readonly DirectionSample[], surface: SurfaceHeight): void {
+    this.mapScene.invalidate()
     this.clear()
     const arrows = directionArrows(samples, surface, {
       lengthM: this.lengthM,

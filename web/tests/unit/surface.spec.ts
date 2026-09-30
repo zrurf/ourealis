@@ -15,8 +15,8 @@ import {
   SLAB_FLOOR_SHADE,
   SLAB_WALL_SHADE,
   autoTerraceStep,
+  buildingShade,
   cavityShade,
-  reliefShade,
   slabThickness,
   slopeAccent,
   sunDirection,
@@ -24,7 +24,7 @@ import {
   terrainColours,
 } from '../../src/render/shading'
 import { buildChunkMesh, chunkEdges, chunkGrid } from '../../src/render/terrainMesh'
-import { drapedMesh } from '../../src/render/layerTexture'
+import { drapedMesh, texelsPerCell } from '../../src/render/layerTexture'
 import { createCellSampler } from '../../src/render/cellSampler'
 import {
   effectiveTerraceStep,
@@ -32,7 +32,7 @@ import {
   surfaceKey,
   surfaceStyle,
 } from '../../src/render/surfaceStyle'
-import { drapePath, gridPaths } from '../../src/render/drape'
+import { drapePath, gridPaths, meshSurfaceSampler, resample } from '../../src/render/drape'
 import { TERRAIN_RAMP, TERRAIN_RAMP_DARK } from '../../src/types/colormap'
 import { drapeSourceLevel, mortonEncodeChunk, type DecodedChunk } from '../../src/types/map'
 import type { LayerGrid } from '../../src/api/types'
@@ -121,12 +121,15 @@ test.describe('shading', () => {
     }
   })
 
-  test('a face toward the sun is brighter than one turned away from it', () => {
+  test('a block is white and still readable as a volume', () => {
+    // The two properties that make a footprint look like a model rather than a cutout: it
+    // is bright whichever way it faces, and it is not the same brightness on every face.
     const sun = sunDirection()
-    const facing = reliefShade([sun[0], sun[1], sun[2]], sun)
-    const away = reliefShade([-sun[0], -sun[1], -sun[2]], sun)
-    expect(facing).toBeGreaterThan(away)
-    expect(away).toBeGreaterThan(0)
+    const lit = buildingShade([sun[0], sun[1], sun[2]], sun)
+    const shadowed = buildingShade([-sun[0], -sun[1], -sun[2]], sun)
+    expect(shadowed).toBeGreaterThan(0.75)
+    expect(lit).toBeGreaterThan(shadowed)
+    expect(lit).toBeLessThanOrEqual(1)
   })
 
   test('the sun vector is a unit vector whatever the azimuth', () => {
@@ -200,6 +203,23 @@ test.describe('shading', () => {
     expect(autoTerraceStep({ min: 4, max: 4 })).toBe(0)
   })
 })
+
+/** Coverage a cell on the very edge of a footprint carries. */
+const PARTIAL = 0.3
+
+/** A ground that rises four metres a cell, so the terrain's steep-face term engages. */
+function slopedGround(i: number, _j: number): number {
+  return i * 4
+}
+
+/** The per-vertex shading factors a mesh carries. */
+function shadesOf(mesh: { rampInput: Float32Array }): number[] {
+  const out: number[] = []
+  for (let vertex = 0; vertex < mesh.rampInput.length / 2; vertex += 1) {
+    out.push(mesh.rampInput[vertex * 2 + 1] ?? 0)
+  }
+  return out
+}
 
 test.describe('chunk meshes', () => {
   test('two neighbouring chunks draw the interface between them exactly once', () => {
@@ -337,13 +357,52 @@ test.describe('chunk meshes', () => {
 
     const mesh = buildChunkMesh(spec, () => 7, { building: (i, j) => (i === 1 && j === 1 ? 1 : 0) })
     expect(mesh.building).toHaveLength(mesh.positions.length / 3)
-    // One vertex is the building; every other cell of the chunk is bare ground.
-    const set = [...(mesh.building ?? [])].filter((value) => value === 1).length
-    expect(set).toBe(1)
-    // A mask that only carries fractions — an averaged coarse level — counts as a building
-    // from a half upwards, so a footprint survives the LOD pyramid.
-    const coarse = buildChunkMesh(spec, () => 7, { building: () => 0.5 })
-    expect([...(coarse.building ?? [])].every((value) => value === 1)).toBe(true)
+    // The single built cell and the ring around it, because the mask is dilated before it
+    // becomes a colour: the vertices at the foot of a wall have to count as building or the
+    // lower half of every wall interpolates back towards the ground it stands on.
+    const built = [...(mesh.building ?? [])].filter((value) => value === 1).length
+    expect(built).toBe(9)
+  })
+
+  test('a footprint edge is a gradient, not a step, so it does not read as torn', () => {
+    const spec = chunkGrid(gridOf([6, 6]), 6, 0, 0)
+    // A half-covered cell is what a coarse level of the pyramid carries at a footprint's
+    // boundary. Read as a yes or no it snaps to the drawn grid, which is the ragged edge
+    // this asserts against; carried as a weight it lands between the two colours.
+    const mesh = buildChunkMesh(spec, () => 7, { building: () => PARTIAL })
+    const weights = [...(mesh.building ?? [])]
+    expect(weights.every((value) => value > 0 && value < 1)).toBe(true)
+
+    const t = 0.5
+    const shaded = new Float32Array([t, 1, t, 1])
+    const plain = terrainColours(new Float32Array([t, 1]), TERRAIN_RAMP)
+    const ramp = plain[0] ?? 0
+    const block = BUILDING_COLOUR[0] / 255
+    const mixed = terrainColours(shaded, TERRAIN_RAMP, new Float32Array([0.5, 1]))
+    // Half built: strictly between the two, which a threshold could never produce.
+    expect(mixed[0] ?? 0).toBeGreaterThan(Math.min(ramp, block))
+    expect(mixed[0] ?? 0).toBeLessThan(Math.max(ramp, block))
+    expect(mixed[0] ?? 0).toBeGreaterThan(Math.min(ramp, block))
+    expect(mixed[0] ?? 0).toBeLessThan(Math.max(ramp, block))
+    // Fully built: the block itself, untouched by the ramp.
+    expect(mixed[4] ?? 0).toBeCloseTo(block, 5)
+  })
+
+  test('a building vertex is shaded as a block, not as the ground it stands on', () => {
+    // The terrain's own two terms darken a steep face and a hollow, and a wall is both, so
+    // a footprint shaded by them comes out a grey crust rather than a white model. A slope
+    // is what makes the difference visible: on flat ground the terrain shade is uniform.
+    const spec = chunkGrid(gridOf([8, 8]), 8, 0, 0)
+    const built = buildChunkMesh(spec, slopedGround, { building: () => 1 })
+    const ground = buildChunkMesh(spec, slopedGround)
+    const buildingShades = shadesOf(built)
+    const groundShades = shadesOf(ground)
+    // The block's own narrow band: bright enough to be white, varied enough to read as a
+    // volume. The terrain beside it goes darker than the block ever does.
+    expect(Math.min(...buildingShades)).toBeGreaterThanOrEqual(0.8)
+    expect(Math.max(...buildingShades)).toBeLessThanOrEqual(1)
+    expect(Math.min(...groundShades)).toBeLessThan(Math.min(...buildingShades))
+    expect(Math.max(...groundShades)).toBeGreaterThan(Math.max(...buildingShades))
   })
 
   test('the slab under a chunk is shaded below the surface it carries', () => {
@@ -438,7 +497,7 @@ test.describe('draping', () => {
         { x: 2, y: 0 },
       ],
       groundAt,
-      1,
+      { lift: 1 },
     )
     expect(path).toEqual([
       [0, 11, 0],
@@ -454,7 +513,7 @@ test.describe('draping', () => {
         { x: 3, y: 0 },
       ],
       groundAt,
-      0,
+      { lift: 0 },
     )
     expect(path[1]?.[1]).toBe(11)
     expect(path[2]?.[1]).toBe(13)
@@ -559,5 +618,137 @@ test.describe('reading a layer that lives at another level', () => {
     expect(sample(2, 2)).toBe(1)
     // Beyond the stored extent there is no sample to read.
     expect(sample(4, 4)).toBeNull()
+  })
+})
+
+/** Cell (i, j) is `i + 10 * j`, so the surface climbs 10 m per cell along x and 1 m along y. */
+function climb(i: number, j: number): number {
+  return i + 10 * j
+}
+
+test.describe('the drawn surface', () => {
+  /*
+   * The terrain mesh puts one vertex at each cell's centre and fills the quads between
+   * them, so what a reader sees between two cells is a ramp. A sampler that answers with
+   * the value of the single cell containing a point returns a staircase instead, and a line
+   * draped on it vanishes under every rise and hangs in the air over every dip — which is
+   * exactly the "route half-buried in the ground" report these assertions guard.
+   */
+  const origin = { x: 0, y: 0 }
+
+  test('a point between two cells reads the ramp, not the cell that contains it', () => {
+    const surface = meshSurfaceSampler(climb, 1, origin)
+    // Cell centres sit at 0.5, 1.5, ... so x = 1.0 is the exact midpoint of centres 0.5
+    // and 1.5, which read 0 and 1.
+    expect(surface(1, 0.5)).toBeCloseTo(0.5, 9)
+    expect(surface(0.5, 0.5)).toBeCloseTo(0, 9)
+    expect(surface(1.5, 0.5)).toBeCloseTo(1, 9)
+  })
+
+  test('a cell centre reads that cell exactly, so the mesh and the drape agree there', () => {
+    const surface = meshSurfaceSampler(climb, 1, origin)
+    expect(surface(0.5, 0.5)).toBe(0)
+    expect(surface(1.5, 0.5)).toBe(1)
+    expect(surface(2.5, 1.5)).toBe(12)
+  })
+
+  test('an unloaded cell reads as unknown, not as zero height', () => {
+    const holed = (i: number, j: number) => (i < 0 ? null : climb(i, j))
+    const surface = meshSurfaceSampler(holed, 1, origin)
+    expect(surface(-0.5, 0.5)).toBeNull()
+    // A column that is missing degrades to the one that loaded rather than losing the point.
+    expect(surface(3.5, 0.5)).toBeCloseTo(3, 9)
+  })
+
+  test('a terrace step is applied per cell before the interpolation, not after it', () => {
+    // A step of 10 quantises {0, 1, 2} to {0, 0, 0}, so the whole ramp flattens; the
+    // midpoint must read the same 0 rather than an interpolated half.
+    const flat = meshSurfaceSampler(climb, 1, origin, 10)
+    expect(flat(1, 0.5)).toBe(0)
+    expect(flat(2.5, 0.5)).toBe(0)
+  })
+
+  test('the surface follows the map origin, not the world zero plane', () => {
+    const shifted = meshSurfaceSampler(climb, 1, { x: 100, y: 200 })
+    expect(shifted(100.5, 200.5)).toBe(0)
+    expect(shifted(101.5, 200.5)).toBe(1)
+  })
+})
+
+test.describe('resampling before a drape', () => {
+  test('a long segment is subdivided so it cannot cut through a rise', () => {
+    const out = resample(
+      [
+        { x: 0, y: 0 },
+        { x: 10, y: 0 },
+      ],
+      2,
+    )
+    expect(out.map((point) => point.x)).toEqual([0, 2, 4, 6, 8, 10])
+  })
+
+  test('a segment already shorter than the spacing is left alone', () => {
+    const out = resample(
+      [
+        { x: 0, y: 0 },
+        { x: 1, y: 0 },
+      ],
+      5,
+    )
+    expect(out).toEqual([
+      { x: 0, y: 0 },
+      { x: 1, y: 0 },
+    ])
+  })
+
+  test('no spacing means the vertices are used as they are', () => {
+    const path = [
+      { x: 0, y: 0 },
+      { x: 30, y: 0 },
+    ]
+    expect(resample(path, 0)).toEqual(path)
+  })
+
+  test('a drape over a ridge follows the ridge rather than the chord across it', () => {
+    // A cell that is five metres high between two that are flat: sampling only the two ends
+    // would draw a straight line through the base of the hill.
+    const surface = meshSurfaceSampler((i) => (i === 1 ? 5 : 0), 1, { x: 0, y: 0 })
+    const draped = drapePath(
+      [
+        { x: 0.5, y: 0.5 },
+        { x: 2.5, y: 0.5 },
+      ],
+      surface,
+      { lift: 0, spacingM: 0.5 },
+    )
+    const peak = Math.max(...draped.map((point) => point[1]))
+    expect(peak).toBeCloseTo(5, 9)
+  })
+})
+
+test.describe('texel resolution follows the zoom', () => {
+  const patterned = { pattern: 'asphalt', materials: null } as unknown as NonNullable<
+    ReturnType<(typeof import('../../src/render/surfaces'))['layerSurfacePlan']>
+  >
+  const flat = { pattern: 'flat', materials: null } as unknown as typeof patterned
+
+  test('a pattern needs room when the camera is close, and not when it is far', () => {
+    // A 2 m cell seen at 0.25 m/px fills eight pixels, so the hatch is resolved; the
+    // same cell seen at 20 m/px is a fraction of a pixel and cannot show one.
+    expect(texelsPerCell(patterned, 0.25, 2)).toBe(4)
+    expect(texelsPerCell(patterned, 20, 2)).toBe(1)
+  })
+
+  test('a flat layer is one texel a cell however close the camera is', () => {
+    expect(texelsPerCell(flat, 0.01, 100)).toBe(1)
+  })
+
+  test('an unknown zoom falls back to the closest resolution rather than guessing low', () => {
+    expect(texelsPerCell(patterned)).toBe(4)
+    expect(texelsPerCell(null, 0.25, 2)).toBe(1)
+  })
+
+  test('the resolution never falls below one texel a cell', () => {
+    expect(texelsPerCell(patterned, 1000, 0.5)).toBe(1)
   })
 })

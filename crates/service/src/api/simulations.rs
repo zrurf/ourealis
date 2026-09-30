@@ -237,10 +237,11 @@ pub async fn truth(
 ) -> Result<Json<Page<TruthSampleDto>>> {
     let id = path.map_err(path_rejection)?.0;
     let query = query.map_err(query_rejection)?.0;
+    let stride = query.stride.unwrap_or(1);
     let (offset, limit) = state.page(query);
     let task = state.tasks.get(&id)?;
     let output = finished(&task)?;
-    Ok(Json(truth_page(&output, offset, limit)))
+    Ok(Json(truth_page(&output, offset, limit, stride)))
 }
 
 /// Exports a finished run.

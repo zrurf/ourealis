@@ -238,7 +238,39 @@ Long operations from the page go through **`stores/tasks.ts`**: it submits, trac
 ticket, unpacks the result by the kind the service reported, and reports the outcome.
 Work the interface waits on is shown behind a modal loader with its elapsed time and a
 cancel button; the rest is reported in the header's task tray. Neither shows a percentage
-— the simulator's run is a single call, so there is no fraction to report.
+— the run reports the stage of its pipeline it is in, and a client that wants a bar has a
+fraction that counts named steps rather than a share of work that was never measured. See
+[run stages](usage.md#run-stages).
+
+### What the renderer submits
+
+A map of a few square kilometres is a thousand meshes, and the engine walks all of them
+every frame. Two things keep that walk affordable, and both are in `render/` with the
+decisions they make as pure functions:
+
+* **`render/culling.ts` and `render/chunkCuller.ts`** switch off the chunks a camera
+  cannot see. The viewer streams the camera's footprint and never drops what leaves it,
+  so a map that has been looked over holds far more chunks than are on screen. The planes
+  come from Babylon's own `Frustum.GetPlanes` — the same call its per-mesh culling uses,
+  so the two cannot disagree about where the view volume is — and the box test beside it
+  may only answer "outside" when a box is *provably* outside. A culler that is subtly
+  wrong does not look wrong; it looks like a map with a hole in it, which is why the
+  camera's own position and its orbit target are protected and a small map is left alone.
+  `?nocull=1` draws the map exactly as it was drawn before any of this existed.
+* **`render/chunkLod.ts`** answers a question no level of the map can: a chunk four
+  hundred metres away, a hundred and twenty-eight cells across, filling forty pixels. The
+  map's own pyramid answers "how much detail" by level, and the level is chosen from the
+  whole map's framing, so a surface drawn at once keeps its finest cells. Edge collapse
+  through meshoptimizer removes the triangles that cannot be seen; the *index* buffer is
+  rewritten and the vertices are left alone, so the normals, colours and texture
+  coordinates a chunk was built with stay valid and the surface is still the same surface.
+  Framing the whole cqupt map this way took it from 781 488 triangles to 273 504.
+  `?nolod=1` disables it, independently of culling, so that either can be bisected alone.
+
+Decimation happens once, when the chunk is built, and is spread across frames with the
+rest of the stream. A chunk that cannot be reduced — too small, a ratio the simplifier
+cannot reach, a build without the module — is the chunk that went in, which is always a
+correct answer and only a slower one.
 
 ## Conventions
 

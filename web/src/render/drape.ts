@@ -11,6 +11,8 @@
  * an engine.
  */
 import type { Aabb, Vec2 } from '@/api/types'
+import type { PlaneOrigin } from '@/types/map'
+import type { CellSampler } from './cellSampler'
 import { terrace } from './shading'
 
 /** A point in world metres. */
@@ -40,6 +42,82 @@ export function terracedSampler(surface: SurfaceHeight, step: number): SurfaceHe
 }
 
 /**
+ * The height the terrain mesh is *drawn* at, from the cells it was built from.
+ *
+ * `buildChunkMesh` puts one vertex at each cell's centre and lets the rasteriser fill the
+ * quads between them, so the visible surface between two cells is a ramp, not a step.
+ * Reading back the single cell that contains a point instead gives a staircase, and a line
+ * draped on a staircase disappears under the ramp on the way up and hangs in the air on
+ * the way down — by up to half the height difference between neighbouring cells, which on
+ * a terraced campus map is metres. Quantisation belongs to each cell centre, before the
+ * interpolation, exactly as the mesh builder applies it; re-quantising the interpolated
+ * value would reintroduce the very staircase this removes.
+ *
+ * `null` means one of the four surrounding cells is not loaded, which is different from a
+ * cell whose height is zero.
+ */
+export function meshSurfaceSampler(
+  cell: CellSampler,
+  cellSize: number,
+  origin: PlaneOrigin,
+  step = 0,
+): SurfaceHeight {
+  // Cell centres sit at `(index + 0.5) * cellSize` from the plane origin, so a map position
+  // lands in the cell-centre lattice half a cell further along than its own cell index.
+  const inLattice = (value: number, along: number): number => (value - along) / cellSize - 0.5
+  const height = (i: number, j: number): number | null => {
+    const value = cell(i, j)
+    if (value === null || !Number.isFinite(value)) {
+      return null
+    }
+    return step > 0 ? terrace(value, step) : value
+  }
+  return (x: number, y: number): number | null => {
+    if (!(cellSize > 0)) {
+      return null
+    }
+    const fx = inLattice(x, origin.x)
+    const fy = inLattice(y, origin.y)
+    const i0 = Math.floor(fx)
+    const j0 = Math.floor(fy)
+    const tx = fx - i0
+    const ty = fy - j0
+    const near = height(i0, j0)
+    const nearUp = height(i0, j0 + 1)
+    if (near === null || nearUp === null) {
+      return null
+    }
+    const low = near + (nearUp - near) * ty
+    const far = height(i0 + 1, j0)
+    const farUp = height(i0 + 1, j0 + 1)
+    // A column that has not loaded degrades to the one that has: the line keeps following
+    // the ground it can see instead of dropping the segment.
+    if (far === null || farUp === null) {
+      return low
+    }
+    return low + (far + (farUp - far) * ty - low) * tx
+  }
+}
+
+/** Options of {@link drapePath}. */
+export interface DrapeOptions {
+  /** How far above the ground the line is drawn, metres. */
+  lift?: number
+  /** Height used where the ground is unknown, metres. */
+  fallback?: number
+  /**
+   * Straight-line spacing between samples, metres.
+   *
+   * A planner's vertices can be tens of metres apart, and a straight chord between two of
+   * them cuts through every rise between: sampling only the vertices leaves a line that
+   * disappears under each hill it crosses and reappears on the far side. Half a cell is
+   * the finest spacing that still catches every rise the surface can express. Zero or less
+   * samples the vertices only, which is what a path that is already dense wants.
+   */
+  spacingM?: number
+}
+
+/**
  * Drapes a polyline on the terrain.
  *
  * A point without a known height falls back to the last known one rather than to zero:
@@ -49,17 +127,52 @@ export function terracedSampler(surface: SurfaceHeight, step: number): SurfaceHe
 export function drapePath(
   points: readonly Vec2[],
   surface: SurfaceHeight,
-  lift = PATH_LIFT_M,
-  fallback = 0,
+  options: DrapeOptions = {},
 ): WorldPoint[] {
+  const lift = options.lift ?? PATH_LIFT_M
+  const fallback = options.fallback ?? 0
+  const spacing = options.spacingM ?? 0
   const out: WorldPoint[] = []
   let height = fallback
-  for (const point of points) {
+  for (const point of resample(points, spacing)) {
     const sampled = surface(point.x, point.y)
     if (sampled !== null) {
       height = sampled
     }
     out.push([point.x, height + lift, point.y])
+  }
+  return out
+}
+
+/**
+ * Inserts intermediate points so no segment is longer than `spacingM`.
+ *
+ * A spacing of zero or less returns the input untouched, and a segment shorter than the
+ * spacing is not subdivided at all — the point count stays bounded by the path's own
+ * length rather than by a fixed multiplier.
+ */
+export function resample(points: readonly Vec2[], spacingM: number): Vec2[] {
+  if (!(spacingM > 0) || points.length < 2) {
+    return [...points]
+  }
+  const out: Vec2[] = []
+  for (let index = 0; index + 1 < points.length; index += 1) {
+    const from = points[index]
+    const to = points[index + 1]
+    if (from === undefined || to === undefined) {
+      continue
+    }
+    out.push(from)
+    const span = Math.hypot(to.x - from.x, to.y - from.y)
+    const steps = Math.floor(span / spacingM)
+    for (let step = 1; step < steps; step += 1) {
+      const t = step / steps
+      out.push({ x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t })
+    }
+  }
+  const last = points[points.length - 1]
+  if (last !== undefined) {
+    out.push(last)
   }
   return out
 }
@@ -100,7 +213,7 @@ export function gridPaths(
       const t = index / samples
       line.push({ x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t })
     }
-    return drapePath(line, surface, lift)
+    return drapePath(line, surface, { lift })
   }
   for (let x = bounds.min_x; x <= bounds.max_x + 1e-9; x += step) {
     paths.push(along({ x, y: bounds.min_y }, { x, y: bounds.max_y }))

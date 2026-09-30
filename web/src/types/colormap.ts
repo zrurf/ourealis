@@ -101,6 +101,34 @@ function mix(from: number, to: number, t: number): number {
   return Math.round(from + (to - from) * t)
 }
 
+/**
+ * A ramp sampled into 256 steps, for callers that colour a pixel buffer.
+ *
+ * A map texture asks for a colour per cell and the ramp is one of a handful of module
+ * constants, so the whole ramp is worth keeping rather than interpolating it again for
+ * every cell — and returning a fresh array each time allocated once per cell. The
+ * quantisation to 256 steps is invisible in a texture and invisible in a legend, which
+ * draws from the stops themselves rather than from this table.
+ */
+const RAMP_TABLES = new Map<readonly Rgb[], Uint8Array>()
+
+/** The 256-step table of a ramp, built on first use. */
+export function rampTable(stops: readonly Rgb[]): Uint8Array {
+  const cached = RAMP_TABLES.get(stops)
+  if (cached !== undefined) {
+    return cached
+  }
+  const table = new Uint8Array(256 * 3)
+  for (let index = 0; index < 256; index += 1) {
+    const colour = rampAt(stops, index / 255)
+    table[index * 3] = colour[0]
+    table[index * 3 + 1] = colour[1]
+    table[index * 3 + 2] = colour[2]
+  }
+  RAMP_TABLES.set(stops, table)
+  return table
+}
+
 /** Interpolates a colour ramp at `t` in `[0, 1]`. */
 export function rampAt(stops: readonly Rgb[], t: number): Rgb {
   if (stops.length === 0) {

@@ -19,6 +19,7 @@ import {
   TooltipComponent,
 } from 'echarts/components'
 import { registerTheme, use, type EChartsCoreOption } from 'echarts/core'
+import { LegacyGridContainLabel } from 'echarts/features'
 import { CanvasRenderer } from 'echarts/renderers'
 import { CHART_THEMES, themeNameFor } from './theme'
 import { useThemeStore } from '@/stores/theme'
@@ -26,6 +27,9 @@ import { useThemeStore } from '@/stores/theme'
 /** The chart options this app builds need no other echarts module. */
 use([CanvasRenderer, LineChart, BarChart, ScatterChart])
 use([GridComponent, TooltipComponent, LegendComponent, TitleComponent, MarkLineComponent])
+// `containLabel` moved behind a feature install in echarts 6; without it the shared grid
+// default is ignored and long axis names are clipped by the margins.
+use([LegacyGridContainLabel])
 
 for (const [name, theme] of Object.entries(CHART_THEMES)) {
   registerTheme(name, theme)
@@ -56,7 +60,11 @@ const chart = shallowRef<ChartHandle | null>(null)
 const container = ref<HTMLElement | null>(null)
 let observer: ResizeObserver | null = null
 
-/** Redraws from scratch, which is what a theme change needs: echarts keeps the old palette otherwise. */
+/**
+ * Redraws from scratch, which is what a theme change needs: echarts keeps the old palette
+ * otherwise. The instance only exposes a working `setOption` under `manual-update`, and
+ * with that set the wrapper owns every repaint — including the first one.
+ */
 function rebuild(): void {
   chart.value?.setOption(props.option, true)
 }
@@ -65,6 +73,7 @@ watch(() => props.option, rebuild)
 watch(() => themeStore.theme, rebuild)
 
 onMounted(() => {
+  rebuild()
   if (typeof ResizeObserver === 'undefined' || container.value === null) {
     return
   }
@@ -90,6 +99,7 @@ onBeforeUnmount(() => {
       :option="props.option"
       :theme="themeNameFor(themeStore.isDark)"
       :loading="props.loading"
+      :manual-update="true"
       autoresize
     />
   </div>

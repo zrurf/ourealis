@@ -83,11 +83,24 @@ pub struct PageQuery {
     /// Maximum number of items to return.
     #[serde(default = "default_page_limit")]
     pub limit: usize,
+    /// Take one item in every `stride`, for a client that draws fewer than it can hold.
+    ///
+    /// A timeline is written at the sensor rates and read by a chart with a few thousand
+    /// pixels across, so a client that wants the shape of a run rather than every sample of
+    /// it has no use for nine tenths of what it downloads. Asking for a stride is how it
+    /// says so; the alternative — the client downloading the lot and discarding most of it —
+    /// is what made the trajectory page slow, because the cost is the transfer and not the
+    /// drawing.
+    ///
+    /// `offset` and `limit` count items of the *strided* view, so paging composes with it.
+    #[serde(default)]
+    pub stride: Option<usize>,
 }
 
 impl Default for PageQuery {
     fn default() -> Self {
         Self {
+            stride: None,
             offset: 0,
             limit: default_page_limit(),
         }

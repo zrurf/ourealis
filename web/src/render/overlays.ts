@@ -146,6 +146,7 @@ export class OverlaySet {
     for (const mesh of this.parts.get(kind) ?? []) {
       mesh.setEnabled(visible)
     }
+    this.mapScene.invalidate()
   }
 
   /** True when a family currently has geometry. */
@@ -179,9 +180,11 @@ export class OverlaySet {
   ): void {
     for (const mesh of this.parts.get(kind) ?? []) {
       // The mesh carried its own colour, so its material goes with it; the shared disc
-      // material below is disposed with the set instead.
+      // material below is disposed with the set instead. Babylon only releases a
+      // material when the caller asks for it, and a preview that redraws its overlays on
+      // every camera move leaked one material per move without the second argument.
       this.mapScene.untrackHeightMesh(mesh)
-      mesh.dispose()
+      mesh.dispose(false, true)
     }
     const parts: AbstractMesh[] = []
     if (lines.length > 0) {
@@ -211,7 +214,7 @@ export class OverlaySet {
         // which is the whole point of drawing it as a ribbon rather than as a line.
         sizeAttenuation: false,
         // The ribbon carries the colour itself, so the mesh needs no shared material;
-        // `Mesh.dispose()` releases it with the mesh.
+        // it is disposed with the mesh by the call above.
         colorMode: GreasedLineMeshColorMode.COLOR_MODE_SET,
       },
       this.scene,

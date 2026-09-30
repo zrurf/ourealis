@@ -16,7 +16,7 @@
 import { Color3 } from '@babylonjs/core/Maths/math.color'
 import { CreateGreasedLine } from '@babylonjs/core/Meshes/Builders/greasedLineBuilder'
 import { GreasedLineMeshColorMode } from '@babylonjs/core/Materials/GreasedLine/greasedLineMaterialInterfaces'
-import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh'
+import type { GreasedLineBaseMesh } from '@babylonjs/core/Meshes/GreasedLine/greasedLineBaseMesh'
 import { arcTable, pointAtArc, type ArcTable } from './flow'
 import type { WorldPoint } from './overlayGeometry'
 import type { MapScene } from './scene'
@@ -57,7 +57,7 @@ export class PathFlow {
   private readonly table: ArcTable
   private readonly heights: readonly number[]
   private readonly style: PathFlowStyle
-  private mesh: AbstractMesh | null = null
+  private mesh: GreasedLineBaseMesh | null = null
   private arc = 0
 
   constructor(mapScene: MapScene, points: readonly WorldPoint[], style: PathFlowStyle) {
@@ -78,17 +78,26 @@ export class PathFlow {
   dispose(): void {
     if (this.mesh !== null) {
       this.mapScene.untrackHeightMesh(this.mesh)
-      this.mesh.dispose()
+      // The material is the mesh's own, and Babylon leaves it on the scene unless the
+      // caller asks for it: without the second argument every frame of a running route
+      // leaks one.
+      this.mesh.dispose(false, true)
       this.mesh = null
     }
   }
 
   /**
-   * Rebuilds the train of chevrons.
+   * Moves the train of chevrons to the current phase.
    *
-   * One mesh holds every chevron, so the whole train is one draw call. The phase is kept
-   * below a single spacing: the train then re-enters at the start as it leaves the end,
-   * which reads as a continuous stream rather than as arrows falling off a cliff.
+   * One mesh holds every chevron, so the whole train is one draw call. The mesh is built
+   * once and its points are replaced in place: disposing and rebuilding it every frame
+   * cost a fresh `GreasedLineMaterial` per frame, which the engine never released, and
+   * threw away the scene's active-mesh and rendering-group caches on the way — which is
+   * what made the arrows blink against the band they run on.
+   *
+   * The chevron count is fixed and the positions wrap, so the vertex buffer keeps its size
+   * from frame to frame and the train re-enters at the start as it leaves the end rather
+   * than thinning out to nothing.
    */
   private write(): void {
     const spacing = Math.max(1, this.style.spacingM)
@@ -96,10 +105,10 @@ export class PathFlow {
     if (length <= 0) {
       return
     }
-    const phase = ((this.arc % spacing) + spacing) % spacing
-    const count = Math.floor((length - phase) / spacing)
+    const phase = ((this.arc % length) + length) % length
+    const count = Math.max(1, Math.ceil(length / spacing))
     const paths: number[][] = []
-    for (let index = 0; index <= count; index += 1) {
+    for (let index = 0; index < count; index += 1) {
       const sample = pointAtArc(this.table, phase + index * spacing)
       if (sample === null) {
         continue
@@ -109,10 +118,13 @@ export class PathFlow {
     if (paths.length === 0) {
       return
     }
-    this.mesh?.dispose()
-    this.mesh = CreateGreasedLine(
+    if (this.mesh !== null) {
+      this.mesh.setPoints(paths)
+      return
+    }
+    const mesh = CreateGreasedLine(
       'route-arrows',
-      { points: paths },
+      { points: paths, updatable: true },
       {
         width: this.style.widthM,
         color: Color3.FromHexString(this.style.colour),
@@ -121,13 +133,17 @@ export class PathFlow {
       },
       this.mapScene.scene,
     )
-    this.mesh.isPickable = false
-    this.mesh.renderingGroupId = 3
-    if (this.mesh.material !== null) {
-      this.mesh.material.alpha = 0.95
-      this.mesh.material.zOffset = -10
+    mesh.isPickable = false
+    mesh.renderingGroupId = 3
+    // Above every band, whose own indices come from their depth offsets and stay below
+    // this. Without it the default sort put the band over its own chevrons.
+    mesh.alphaIndex = 10
+    if (mesh.material !== null) {
+      mesh.material.alpha = 0.95
+      mesh.material.zOffset = -10
     }
-    this.mapScene.trackHeightMesh(this.mesh)
+    this.mesh = mesh
+    this.mapScene.trackHeightMesh(mesh)
   }
 
   /** One chevron: two wings swept back from an apex that leads along the route. */

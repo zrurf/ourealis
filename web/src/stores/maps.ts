@@ -74,7 +74,36 @@ export const useMapsStore = defineStore('maps', () => {
   /** In-flight chunk requests, keyed the same way as the cache. */
   const inFlight = new Map<string, Promise<DecodedChunk>>()
 
-  const loadedChunkCount = computed(() => chunks.value.size)
+  /**
+   * Bumped once per batch of chunk arrivals.
+   *
+   * The cache is a plain map mutated in place — replacing it per chunk copied a growing
+   * map once per arrival, which is quadratic over a level — and a `shallowRef` alone
+   * would not notice an in-place write. This is what notices, and arrivals within one
+   * turn are coalesced into a single bump: a level of three hundred chunks then
+   * invalidates the readings that walk the cache a handful of times rather than three
+   * hundred, which is the difference between a histogram that costs milliseconds and one
+   * that costs seconds.
+   */
+  const chunkVersion = ref(0)
+  let notifyScheduled = false
+
+  function notifyChunks(): void {
+    if (notifyScheduled) {
+      return
+    }
+    notifyScheduled = true
+    setTimeout(() => {
+      notifyScheduled = false
+      chunkVersion.value += 1
+    }, 0)
+  }
+
+  const loadedChunkCount = computed(() => {
+    // Read the version so the count is recomputed when the cache is written to.
+    void chunkVersion.value
+    return chunks.value.size
+  })
 
   /** Number of maps in the library. */
   const mapCount = computed(() => summaries.value.length)
@@ -195,7 +224,7 @@ export const useMapsStore = defineStore('maps', () => {
         // previous map's cells under the new map's frame — the ground would look
         // right in shape and wrong in content.
         if (cacheMapId === target.mapId) {
-          chunks.value = new Map(chunks.value).set(key, decoded)
+          chunks.value.set(key, decoded)
           if (failures.value.has(key)) {
             // A plain `delete` would not be seen: `failures` is shallow, so the panel
             // would keep reporting a failure that has since been resolved.
@@ -203,6 +232,7 @@ export const useMapsStore = defineStore('maps', () => {
             remaining.delete(key)
             failures.value = remaining
           }
+          notifyChunks()
         }
         return decoded
       })
@@ -264,6 +294,9 @@ export const useMapsStore = defineStore('maps', () => {
         }
       }
     })
+    // The caller awaited this load, so the arrivals it is waiting for must be visible
+    // when it continues rather than one turn later.
+    chunkVersion.value += 1
   }
 
   /**
@@ -313,6 +346,7 @@ export const useMapsStore = defineStore('maps', () => {
     failures.value = new Map()
     cacheMapId = null
     inFlight.clear()
+    chunkVersion.value += 1
   }
 
   /** The default colour mapping of one layer of a map, or `null` before its metadata is read. */

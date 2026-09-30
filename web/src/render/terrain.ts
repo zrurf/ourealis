@@ -22,6 +22,7 @@ import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData'
 import type { Scene } from '@babylonjs/core/scene'
 import { TERRAIN_RAMP, TERRAIN_RAMP_DARK, type Rgb } from '@/types/colormap'
 import { GRAIN_COMPENSATION, grainTexture } from './grain'
+import type { ChunkCuller } from './chunkCuller'
 import type { MapScene } from './scene'
 import { terrainColours } from './shading'
 import type { ChunkMeshData, MeshData } from './terrainMesh'
@@ -45,7 +46,16 @@ export class TerrainLayer {
   /** Vertex data of every mesh drawn, so a ramp change can recolour without the geometry. */
   private readonly meshData = new Map<Mesh, MeshData>()
   private ramp: readonly Rgb[]
+  /** The grain both materials share, so it is built once and disposed once. */
+  private readonly grain: ReturnType<typeof grainTexture>
   private readonly unbindAppearance: () => void
+  /**
+   * Decides which of these meshes are out of view.
+   *
+   * Optional: a surface built without one is drawn exactly as it always was, which is
+   * what the headless test lanes and the studio want.
+   */
+  private culler: ChunkCuller | null = null
 
   constructor(scene: Scene, mapScene: MapScene) {
     this.scene = scene
@@ -54,6 +64,8 @@ export class TerrainLayer {
     this.unbindAppearance = mapScene.onAppearance((dark) => {
       this.setRamp(rampFor(dark))
     })
+    const grain = grainTexture(scene)
+    this.grain = grain
     this.material = new StandardMaterial('terrainMaterial', scene)
     this.material.specularColor = new Color3(0, 0, 0)
     // The grain is a near-white noise whose mean is below white, so the albedo is scaled up
@@ -63,7 +75,7 @@ export class TerrainLayer {
       GRAIN_COMPENSATION,
       GRAIN_COMPENSATION,
     )
-    this.material.diffuseTexture = grainTexture(scene)
+    this.material.diffuseTexture = grain
     this.material.backFaceCulling = true
     // The slab is seen from outside the model, and its winding follows the map's own
     // rim; not culling it keeps a wall readable from an angle where its front face is
@@ -75,12 +87,13 @@ export class TerrainLayer {
       GRAIN_COMPENSATION,
       GRAIN_COMPENSATION,
     )
-    this.slabMaterial.diffuseTexture = grainTexture(scene)
+    this.slabMaterial.diffuseTexture = grain
     this.slabMaterial.backFaceCulling = false
   }
 
   /** Sets the ramp the surface is coloured with; only the colour buffers are rewritten. */
   setRamp(ramp: readonly Rgb[]): void {
+    this.mapScene.invalidate()
     if (ramp === this.ramp) {
       return
     }
@@ -93,8 +106,37 @@ export class TerrainLayer {
     }
   }
 
+  /**
+   * Hands the surface's meshes to a culler, and takes them back when it is dropped.
+   *
+   * A surface is the thing worth culling: a large map is a thousand of these meshes and
+   * most of them are behind the reader at any moment. The route, the handles and the
+   * grid are a handful and are never registered.
+   */
+  useCuller(culler: ChunkCuller | null): void {
+    if (this.culler === culler) {
+      return
+    }
+    for (const mesh of this.meshes.values()) {
+      this.culler?.remove(mesh)
+    }
+    for (const slab of this.slabs.values()) {
+      this.culler?.remove(slab)
+    }
+    this.culler = culler
+    if (culler !== null) {
+      for (const mesh of this.meshes.values()) {
+        culler.add(mesh)
+      }
+      for (const slab of this.slabs.values()) {
+        culler.add(slab)
+      }
+    }
+  }
+
   /** Adds or replaces the mesh of one chunk and the slab it carries. */
   setChunk(key: string, data: ChunkMeshData): Mesh {
+    this.mapScene.invalidate()
     this.drop(key)
     const mesh = this.create(`terrain:${key}`, data, this.material)
     mesh.isPickable = true
@@ -102,6 +144,10 @@ export class TerrainLayer {
     slab.isPickable = false
     this.meshes.set(key, mesh)
     this.slabs.set(key, slab)
+    // A new mesh is on screen wherever its chunk is, which is inside the view for any
+    // camera that framed it; registering it enabled avoids a frame of missing ground.
+    this.culler?.add(mesh)
+    this.culler?.add(slab)
     return mesh
   }
 
@@ -113,6 +159,8 @@ export class TerrainLayer {
     for (const slab of this.slabs.values()) {
       slab.setEnabled(visible)
     }
+    // The surface is on or off as a whole, so any decision the culler made is stale.
+    this.culler?.invalidate()
   }
 
   /** True when the chunk already has a mesh. */
@@ -132,12 +180,16 @@ export class TerrainLayer {
     }
   }
 
-  /** Disposes the meshes and the materials. */
+  /** Disposes the meshes, the materials and the grain they share. */
   dispose(): void {
     this.unbindAppearance()
+    this.useCuller(null)
     this.clear()
     this.material.dispose()
     this.slabMaterial.dispose()
+    // The grain is a raw texture of its own, and disposing the materials that used it
+    // does not dispose it: without this it stayed on the engine for the session.
+    this.grain.dispose()
   }
 
   /** Builds one mesh of vertex data and registers it with the height exaggeration. */
@@ -155,16 +207,24 @@ export class TerrainLayer {
     mesh.material = material
     this.meshData.set(mesh, data)
     this.mapScene.trackHeightMesh(mesh)
+    // The surface is both: a raised footprint throws the shadow, and the ground beside it
+    // receives one. Nothing else in the scene can do either, because a building is not
+    // separate geometry here — it is part of this mesh.
+    this.mapScene.addShadowCaster(mesh)
+    this.mapScene.receiveShadows(mesh)
     return mesh
   }
 
   /** Disposes one chunk's meshes. */
   private drop(key: string): void {
+    this.mapScene.invalidate()
     for (const mesh of [this.meshes.get(key), this.slabs.get(key)]) {
       if (mesh === undefined) {
         continue
       }
       this.mapScene.untrackHeightMesh(mesh)
+      this.mapScene.removeShadowCaster(mesh)
+      this.culler?.remove(mesh)
       this.meshData.delete(mesh)
       mesh.dispose()
     }

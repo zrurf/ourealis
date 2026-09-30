@@ -70,7 +70,9 @@ test.describe('application shell', () => {
     await page.goto('/')
     await expect(page.locator('h1')).toHaveText('Maps')
 
-    await page.locator('.t-select-input').click()
+    // Scoped to the language control: the maps page carries a preset selector of its own,
+    // so a bare class selector matched two elements and the test could not tell them apart.
+    await page.getByTestId('locale-select').locator('.t-select-input').click()
     await page.getByText('简体中文', { exact: true }).click()
 
     await expect(page.locator('h1')).toHaveText('地图库')

@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use ourealis_core::SimulationOutput;
+use ourealis_core::sim::{RunObserver, RunStage};
 use ourealis_map_format::synthetic::SyntheticMapSpec;
 use tokio::sync::broadcast;
 
@@ -469,6 +470,47 @@ impl Task {
             progress: self.progress(),
             elapsed_s: self.elapsed_s().unwrap_or(0.0),
         });
+    }
+
+    /// Records a stage the core reported and publishes it.
+    ///
+    /// The stage becomes the task's own, so a client that reads the task back over HTTP
+    /// sees the same stage the event stream is carrying, and the progress fraction moves
+    /// with it. A stage that measured something also produces a log line, because "the
+    /// route is 812 m long" is the part a reader actually wants and a stage name alone
+    /// does not say it.
+    pub fn observe(&self, stage: RunStage, note: &str) {
+        let name = stage.name();
+        if let Ok(mut guard) = self.stage.write() {
+            *guard = name.to_string();
+        }
+        self.progress
+            .store(stage.fraction().to_bits(), Ordering::Relaxed);
+        self.emit(events::EventDto::Stage {
+            stage: name.to_string(),
+            progress: Some(stage.fraction()),
+            elapsed_s: self.elapsed_s().unwrap_or(0.0),
+        });
+        if !note.is_empty() {
+            self.log("info", format!("{name}: {note}"));
+        }
+    }
+}
+
+/// Adapts a [`Task`] to the core's run observer, so a run reports its stages into the
+/// task's own event stream.
+pub struct TaskObserver<'a>(&'a Task);
+
+impl<'a> TaskObserver<'a> {
+    /// Observes `task`.
+    pub fn new(task: &'a Task) -> Self {
+        Self(task)
+    }
+}
+
+impl RunObserver for TaskObserver<'_> {
+    fn stage(&self, stage: RunStage, note: &str) {
+        self.0.observe(stage, note);
     }
 }
 

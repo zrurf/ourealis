@@ -121,7 +121,7 @@ test.describe('the two levels of detail', () => {
     await service.probe(request)
   })
 
-  test('expert mode brings the per-individual parameters back', async ({ page }) => {
+  test('every individual parameter is reachable in simple mode too', async ({ page }) => {
     service.skipUnlessAvailable()
     await page.addInitScript(() => {
       globalThis.localStorage.setItem('ourealis.locale', 'en')
@@ -131,13 +131,24 @@ test.describe('the two levels of detail', () => {
     await expect(page.getByTestId('run-ready')).toBeAttached({ timeout: 60_000 })
     await placeStart(page)
     await page.getByTestId('stage-runner').click()
-    // Simple mode: the preset and the individual, and none of the twenty-odd overrides.
     await expect(page.getByTestId('person-form')).toBeVisible()
-    expect(await page.locator('[data-testid^="override-"]').count()).toBe(0)
-    await page.getByTestId('mode-toggle').click()
-    await expect
-      .poll(async () => page.locator('[data-testid^="override-"]').count())
-      .toBeGreaterThan(10)
+    // Simple mode folds the parameter groups away, but they are folded rather than
+    // withheld: opening one shows the whole parameter vector, including the two step
+    // harmonics and the sensor-noise signature that used to be unreachable.
+    const overrides = page.locator('[data-testid^="override-"]')
+    await expect(page.getByTestId('person-overrides')).toBeVisible()
+    await page.getByTestId('person-overrides').locator('.t-collapse-panel').first().click()
+    await expect.poll(async () => overrides.count()).toBeGreaterThan(3)
+    // Each group is opened on its own; the sensor noise is a group of its own.
+    for (const header of await page
+      .getByTestId('person-overrides')
+      .locator('.t-collapse-panel')
+      .all()) {
+      await header.click()
+    }
+    for (const name of ['target_speed', 'harmonic_2_ratio', 'sensors.gnss_white_sigma_m']) {
+      await expect(page.getByTestId(`override-${name}`)).toBeAttached({ timeout: 10_000 })
+    }
   })
 
   test('the runner stage keeps its controls in one column', async ({ page }) => {

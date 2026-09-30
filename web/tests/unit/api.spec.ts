@@ -716,6 +716,45 @@ test.describe('chunk decoding', () => {
     expect(() => fromBase64('****')).toThrow(/not base64/)
   })
 
+  test('padding and whitespace are noise between groups, not content', () => {
+    const bytes = new Uint8Array([72, 101, 108, 108, 111, 33])
+    const encoded = toBase64(bytes)
+    expect([...fromBase64(encoded)]).toEqual([...bytes])
+    // The decoder skips the padding and the line breaks without a separate pass over
+    // the string, so both forms have to give the same bytes as the bare one.
+    expect([...fromBase64(encoded.replace(/=+$/, ''))]).toEqual([...bytes])
+    expect([
+      ...fromBase64(`${encoded.slice(0, 4)}
+  ${encoded.slice(4)}`),
+    ]).toEqual([...bytes])
+  })
+
+  test('the URL-safe alphabet decodes to the same bytes as the standard one', () => {
+    // 0xfb 0xff encodes to the two symbols standard base64 spells `+` and `/`.
+    const bytes = new Uint8Array([251, 255, 190, 255])
+    const standard = toBase64(bytes)
+    const urlSafe = standard.replace(/\+/g, '-').replace(/\//g, '_')
+    expect([...fromBase64(urlSafe)]).toEqual([...bytes])
+  })
+
+  test('a non-ASCII character is rejected rather than silently dropped', () => {
+    // Anything above the lookup table is outside both alphabets. Returning a short
+    // array would hand the caller a chunk that looks valid and holds garbage.
+    expect(() => fromBase64('QUJDéRE')).toThrow(/not base64/)
+  })
+
+  test('a payload larger than one chunk decodes to exactly the right length', () => {
+    // A level-0 chunk of a large map is 128x128 two-channel samples: 32768 floats.
+    const floats = new Float32Array(128 * 128 * 2)
+    for (let index = 0; index < floats.length; index += 1) {
+      floats[index] = index * 0.5 - 4096
+    }
+    const decoded = floatsFromBase64(toBase64(new Uint8Array(floats.buffer)))
+    expect(decoded.length).toBe(floats.length)
+    expect(decoded[0]).toBe(-4096)
+    expect(decoded[decoded.length - 1]).toBe(floats[floats.length - 1])
+  })
+
   test('the quantisation contract is applied when the caller says the samples are raw', () => {
     expect(dequantise(2, 0.5, 10)).toBe(11)
     const quantised = decodeChunk({ ...sampleChunk, scale: 0.5, bias: 10 }, { quantised: true })

@@ -16,12 +16,6 @@
  */
 import { clamp01, normalize, rampAt, type Rgb } from '@/types/colormap'
 
-/** How far the shaded side of a slope is allowed to fall, in luminance terms. */
-const AMBIENT = 0.7
-
-/** How much of the diffuse term a surface facing the sun receives. */
-const DIFFUSE = 0.42
-
 /** Slope at which the steep-face darkening starts, as the normal's y component. */
 const STEEP_FROM = 0.92
 
@@ -79,20 +73,37 @@ export function terrace(height: number, step: number): number {
 }
 
 /**
- * Diffuse-plus-ambient shading of a surface normal.
+ * Shading of a building's own faces, for the near-white block a footprint is drawn as.
  *
- * `AMBIENT + DIFFUSE * max(0, n · sun)`: a surface facing away from the sun keeps the
- * ambient term instead of going black, which is what makes a valley floor readable
- * rather than a silhouette.
+ * Deliberately not the terrain's shading. That one is occlusion only — a hollow, a face too
+ * steep to hold much sky — because the sun's own term is evaluated per fragment by the
+ * scene's light. A wall is both a hollow and a steep face, so applying it to a footprint
+ * paints every wall in the shadow its own footprint would cast, which is what made a campus
+ * of buildings look like a grey crust rather than a model.
+ *
+ * What is left is a gentle diffuse term over a high ambient: enough that two faces of the
+ * same block differ and the form reads, not enough to stop it being white. The range is
+ * narrower than the terrain's for the same reason — a building is one material, and a
+ * material does not swing from black to white as it turns.
  */
-export function reliefShade(
+export function buildingShade(
   normal: readonly [number, number, number],
-  sun: readonly [number, number, number] = sunDirection(),
+  sun: readonly [number, number, number],
 ): number {
-  const dot = normal[0] * sun[0] + normal[1] * sun[1] + normal[2] * sun[2]
-  const lit = AMBIENT + DIFFUSE * Math.max(0, dot)
-  return Math.min(SHADE_RANGE[1], Math.max(SHADE_RANGE[0], lit))
+  const facing = Math.max(
+    0,
+    (normal[0] ?? 0) * (sun[0] ?? 0) +
+      (normal[1] ?? 0) * (sun[1] ?? 0) +
+      (normal[2] ?? 0) * (sun[2] ?? 0),
+  )
+  return BUILDING_AMBIENT + BUILDING_DIFFUSE * facing
 }
+
+/** Share of a building's brightness that does not depend on the sun. */
+const BUILDING_AMBIENT = 0.8
+
+/** Share that does, over a full turn from facing the sun to facing away. */
+const BUILDING_DIFFUSE = 0.2
 
 /**
  * Darkening of a steep face, from the normal's vertical component.
@@ -145,8 +156,14 @@ export const BUILDING_COLOUR: readonly [number, number, number] = [242, 242, 242
  * range, and the shading factor. Splitting the colour out of the geometry is what lets an
  * appearance change be an upload of this buffer rather than a rebuild of the map.
  *
- * `building` is the per-vertex mask {@link BUILDING_COLOUR} replaces the ramp for; without it
- * every vertex is coloured by the ramp, which is what a map with no mask channel gets.
+ * `building` is how far each vertex is a footprint, and {@link BUILDING_COLOUR} is mixed in by
+ * that weight rather than switched to. Switching is what left a torn edge: the mask steps by
+ * one cell, so a threshold turns a straight wall into a staircase and throws away the
+ * anti-aliasing the rasteriser would have given it. A vertex at the half-way point of a
+ * footprint's edge is half a building, and drawn as half a building it reads as an edge.
+ *
+ * Without a mask every vertex is coloured by the ramp, which is what a map with no mask
+ * channel gets.
  */
 export function terrainColours(
   rampInput: Float32Array,
@@ -155,8 +172,18 @@ export function terrainColours(
 ): Float32Array {
   const colors = new Float32Array((rampInput.length / 2) * 4)
   for (let vertex = 0; vertex < rampInput.length / 2; vertex += 1) {
-    const base =
-      building?.[vertex] === 1 ? BUILDING_COLOUR : rampAt(ramp, rampInput[vertex * 2] ?? 0)
+    const rampColour = rampAt(ramp, rampInput[vertex * 2] ?? 0)
+    const built = Math.min(1, Math.max(0, building?.[vertex] ?? 0))
+    const base: readonly [number, number, number] =
+      built <= 0
+        ? rampColour
+        : built >= 1
+          ? BUILDING_COLOUR
+          : [
+              rampColour[0] + (BUILDING_COLOUR[0] - rampColour[0]) * built,
+              rampColour[1] + (BUILDING_COLOUR[1] - rampColour[1]) * built,
+              rampColour[2] + (BUILDING_COLOUR[2] - rampColour[2]) * built,
+            ]
     const shade = rampInput[vertex * 2 + 1] ?? 1
     colors[vertex * 4] = Math.min(1, Math.max(0, (base[0] * shade) / 255))
     colors[vertex * 4 + 1] = Math.min(1, Math.max(0, (base[1] * shade) / 255))

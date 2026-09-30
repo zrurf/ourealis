@@ -15,7 +15,7 @@ import { api } from '@/api/client'
 import { isApiError } from '@/api/errors'
 import { JobSocket } from '@/api/ws'
 import type { ChunkRef } from '@/api/maps'
-import { LAYER_ELEVATION, chunkKey, selectLevel } from '@/types/map'
+import { LAYER_ELEVATION, chunkKey, levelCellSize, selectLevel } from '@/types/map'
 import type { TruthSample } from '@/types/result'
 import { engineFromQuery, probeEngine } from '@/render/engine'
 import { updateDebug } from '@/render/scene'
@@ -24,8 +24,8 @@ import type { MapScene } from '@/render/scene'
 import { TerrainLayer } from '@/render/terrain'
 import { buildChunkMesh, chunkGrid } from '@/render/terrainMesh'
 import { createCellSampler } from '@/render/cellSampler'
-import { createSurfaceSampler } from '@/render/inspect'
 import { TrajectoryLine, sampleTrajectory, type TrajectoryChannel } from '@/render/trajectory'
+import { meshSurfaceSampler, type SurfaceHeight } from '@/render/drape'
 import EChart from '@/components/charts/EChart.vue'
 import { lineOption } from '@/components/charts/options/line'
 import ChannelPicker from '@/components/trajectory/ChannelPicker.vue'
@@ -45,6 +45,14 @@ import {
 /** Resolution the camera is treated as showing when the level is chosen, m/px. */
 const TARGET_METRES_PER_PIXEL = 2
 
+/**
+ * How far above the drawn surface the trajectory line is held, metres.
+ *
+ * The samples carry the runner's own altitude, so a line above this reads as a track
+ * hovering over the campus; the lift only has to clear the depth fight with the surface.
+ */
+const TRAJECTORY_LIFT_M = 0.25
+
 const props = defineProps<{ jobId: string }>()
 
 const { t, locale } = useI18n({ useScope: 'global' })
@@ -63,6 +71,7 @@ const failure = ref<string | null>(null)
 let scene: MapScene | null = null
 let lease: SceneLease | null = null
 let terrain: TerrainLayer | null = null
+let surface: SurfaceHeight | null = null
 let line: TrajectoryLine | null = null
 let frame: number | null = null
 let lastFrameMs = 0
@@ -472,16 +481,13 @@ async function loadSurface(): Promise<void> {
         ),
       )
     }
-    // The camera target rides the ground, so a close view does not sink under a campus that
-    // stands hundreds of metres above the map's zero plane.
-    const ground = createSurfaceSampler(
-      maps.chunks,
-      grid,
-      info.summary.chunk_size,
-      level,
-      maps.originOf(mapId),
-    )
+    // One sampler for both jobs the surface height is needed for: the camera target riding
+    // the ground, and the trajectory line being held above it. It reads the height the
+    // mesh is drawn at rather than the raw cell, because a line draped on the raw cells
+    // sinks under the ramp between them and the run disappears in patches.
+    const ground = meshSurfaceSampler(sample, levelCellSize(grid, level), maps.originOf(mapId))
     scene.setGroundHeight((x, y) => ground(x, y))
+    surface = ground
   } catch (error) {
     failure.value = isApiError(error) ? error.message : t('simulation.route.surfaceFailed')
   }
@@ -489,7 +495,38 @@ async function loadSurface(): Promise<void> {
 
 /** Redraws the trajectory line for the current channel and sample count. */
 function redraw(): void {
-  line?.setTrajectory(points.value)
+  line?.setTrajectory(points.value, { surface: surface ?? undefined, lift: TRAJECTORY_LIFT_M })
+}
+
+/**
+ * Draws the part of the line already run.
+ *
+ * The playhead is a *sample* index over the whole recording while the line is drawn from a
+ * downsampled view of it, so the two are matched by time rather than by index: the drawn
+ * point the playhead has reached is the last one whose time is at or before the current
+ * sample's. Matching them by index instead put the band's end at the wrong place on the
+ * line as soon as the recording was longer than the drawing cap.
+ */
+function syncProgress(): void {
+  if (line === null) {
+    return
+  }
+  const sample = current.value
+  if (sample === null) {
+    line.setProgress(0)
+    return
+  }
+  const drawn = points.value
+  let reached = -1
+  for (let at = 0; at < drawn.length; at += 1) {
+    const point = drawn[at]
+    if (point !== undefined && point.time_s <= sample.time_s) {
+      reached = at
+    } else {
+      break
+    }
+  }
+  line.setProgress(reached)
 }
 
 /** Moves the marker to the playhead, orienting it by the sample's own attitude. */
@@ -514,10 +551,14 @@ function syncMarker(): void {
   )
 }
 
-watch(channel, () => redraw())
+watch(channel, () => {
+  redraw()
+  syncProgress()
+})
 
 watch(index, () => {
   syncMarker()
+  syncProgress()
 })
 
 onMounted(() => {
@@ -535,6 +576,7 @@ onBeforeUnmount(() => {
   lease?.release()
   lease = null
   scene = null
+  surface = null
   updateDebug({ mapId: null, loaded: false, error: null })
 })
 </script>

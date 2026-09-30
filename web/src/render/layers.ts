@@ -11,7 +11,6 @@
  * reader could see. The appearance is therefore carried on the drape itself, as a vertex
  * colour the layer rewrites in place, the way the terrain carries its ramp.
  */
-import { VertexBuffer } from '@babylonjs/core/Buffers/buffer'
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
 import { RawTexture } from '@babylonjs/core/Materials/Textures/rawTexture'
 import { Color3 } from '@babylonjs/core/Maths/math.color'
@@ -46,6 +45,7 @@ export {
 /** One layer's drape over the terrain, one mesh per loaded chunk. */
 export class LayerOverlay {
   private readonly scene: Scene
+  private readonly mapScene: MapScene
   private readonly meshes = new Map<string, Mesh>()
   private readonly textures = new Map<string, RawTexture>()
   /** Vertices per chunk, so an appearance change can rewrite one chunk's tint alone. */
@@ -55,6 +55,7 @@ export class LayerOverlay {
 
   constructor(scene: Scene, mapScene: MapScene) {
     this.scene = scene
+    this.mapScene = mapScene
     this.tint = tintFor(mapScene.isDark)
     this.unbindAppearance = mapScene.onAppearance((dark) => {
       this.setTint(tintFor(dark))
@@ -62,27 +63,31 @@ export class LayerOverlay {
   }
 
   /**
-   * Sets the brightness every drape is drawn at; only the colour buffers are rewritten.
+   * Sets the brightness every drape is drawn at.
    *
-   * The chunks already drawn are recoloured here and the ones that arrive later are tinted
-   * on arrival, so a chunk that streams in after the switch is not the one bright island
-   * left on a dark map.
+   * On the material rather than in the vertex colours, which is where it used to live. The
+   * drape is a lit surface now and it carries no vertex colours at all — tinting those was
+   * how a dark page dimmed the map, and leaving the tint there while turning the colours
+   * off made the map the same brightness in both appearances: a white sheet under a dark
+   * frame. The material's own colour is what a lit surface has instead.
    */
   setTint(tint: number): void {
+    this.mapScene.invalidate()
     if (tint === this.tint) {
       return
     }
     this.tint = tint
-    for (const [key, drape] of this.meshes) {
-      const count = this.vertexCounts.get(key) ?? 0
-      if (count > 0) {
-        drape.updateVerticesData(VertexBuffer.ColorKind, tintColours(count, tint))
+    for (const drape of this.meshes.values()) {
+      const material = drape.material
+      if (material instanceof StandardMaterial) {
+        material.diffuseColor = new Color3(tint, tint, tint)
       }
     }
   }
 
   /** Replaces the drape of one chunk. */
   setChunk(key: string, texture: LayerTextureData, mesh: DrapedMeshData): void {
+    this.mapScene.invalidate()
     this.drop(key)
     // Mipmapped and linearly filtered: a pattern sampled per texel aliases badly on a
     // distant drape, and the average of a pattern is its colour.
@@ -108,15 +113,17 @@ export class LayerOverlay {
     vertexData.indices = mesh.indices
     vertexData.uvs = mesh.uvs
     vertexData.normals = mesh.normals
-    vertexData.colors = tintColours(vertexCount, this.tint)
     // Updatable: an appearance change rewrites the colour buffer in place rather than
     // rebuilding a drape whose geometry and pixels did not change.
     vertexData.applyToMesh(drape, true)
     // One material per chunk: a texture belongs to a material, and sharing one
     // would make every drape show the last chunk's pixels.
+    //
+    // Lit, not emissive. A drape painted with its own brightness ignores the sun, which
+    // made the run workspace — where the ground drape covers the whole map — the one view
+    // with no shadows in it at all, and flat because of it: every surface the reader looked
+    // at had the same light no matter which way it faced.
     const material = new StandardMaterial(`layerMaterial:${key}`, this.scene)
-    material.disableLighting = true
-    material.emissiveColor = new Color3(1, 1, 1)
     material.specularColor = new Color3(0, 0, 0)
     material.useAlphaFromDiffuseTexture = texture.hasAlpha
     // Opaque where every cell is painted: blending a solid layer costs fill rate and
@@ -126,9 +133,15 @@ export class LayerOverlay {
       : StandardMaterial.MATERIAL_OPAQUE
     material.zOffset = -2
     material.diffuseTexture = raw
-    material.emissiveTexture = raw
+    // The theme's dimming, which a lit material carries as its own colour.
+    material.diffuseColor = new Color3(this.tint, this.tint, this.tint)
     drape.material = material
     drape.isPickable = false
+    // The colours the surface mesh carries are the white model's own; a drape paints over
+    // them with its material, and multiplying the two would tint every road with the
+    // elevation ramp it happens to lie on.
+    drape.useVertexColors = false
+    this.mapScene.receiveShadows(drape)
     this.textures.set(key, raw)
     this.meshes.set(key, drape)
     this.vertexCounts.set(key, vertexCount)
@@ -136,6 +149,7 @@ export class LayerOverlay {
 
   /** Removes one chunk's drape and the material it owned. */
   drop(key: string): void {
+    this.mapScene.invalidate()
     const mesh = this.meshes.get(key)
     mesh?.material?.dispose()
     mesh?.dispose()
@@ -163,16 +177,4 @@ export class LayerOverlay {
 /** Brightness of the drapes for one appearance. */
 function tintFor(dark: boolean): number {
   return dark ? DARK_TINT : 1
-}
-
-/** `count` vertices of one grey, as a vertex colour buffer. */
-function tintColours(count: number, tint: number): Float32Array {
-  const colours = new Float32Array(count * 4)
-  for (let index = 0; index < colours.length; index += 4) {
-    colours[index] = tint
-    colours[index + 1] = tint
-    colours[index + 2] = tint
-    colours[index + 3] = 1
-  }
-  return colours
 }

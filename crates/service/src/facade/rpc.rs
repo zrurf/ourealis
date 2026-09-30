@@ -140,6 +140,7 @@ impl pb::map_service_server::MapService for MapApi {
         let (offset, limit) = self.state.page(crate::api::dto::PageQuery {
             offset: request.offset as usize,
             limit: request.limit as usize,
+            stride: None,
         });
         let page = maps::entry_page(&self.state, offset, limit);
         let total = page.total as u32;
@@ -427,6 +428,7 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
         let (offset, limit) = self.state.page(crate::api::dto::PageQuery {
             offset: request.offset as usize,
             limit: request.limit as usize,
+            stride: None,
         });
         let all = self.state.tasks.list();
         let total = all.len() as u32;
@@ -504,7 +506,7 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
             // separate bounds query.
             let mut offset = (request.offset as usize).min(total);
             while offset < total {
-                let page = streams::truth_page(&output, offset, frame);
+                let page = streams::truth_page(&output, offset, frame, 1);
                 for sample in &page.items {
                     if sender.send(Ok(truth_sample(sample))).await.is_err() {
                         return;
@@ -534,7 +536,7 @@ impl pb::simulation_service_server::SimulationService for SimulationApi {
             // past the end is an empty stream rather than an error.
             let mut offset = (request.offset as usize).min(total);
             while offset < total {
-                let page = match streams::sensor_page(&output, &channel, offset, frame) {
+                let page = match streams::sensor_page(&output, &channel, offset, frame, 1) {
                     Ok(page) => page,
                     Err(error) => {
                         let _ = sender.send(Err(status(error))).await;
@@ -700,6 +702,7 @@ impl pb::task_service_server::TaskService for TaskApi {
         let (offset, limit) = self.state.page(crate::api::dto::PageQuery {
             offset: request.offset as usize,
             limit: request.limit as usize,
+            stride: None,
         });
         let kind = task_kind_from_pb(request.kind);
         let all = match kind {

@@ -13,10 +13,18 @@
  */
 import type { ColorMapping } from '@/types/map'
 import type { Rgb } from '@/types/colormap'
-import { SCALAR_RAMPS, colorForCategory, normalize, rampAt, valueRange } from '@/types/colormap'
+import {
+  SCALAR_RAMPS,
+  colorForCategory,
+  normalize,
+  rampAt,
+  rampTable,
+  valueRange,
+} from '@/types/colormap'
 import type { CellSampler } from './cellSampler'
-import { applyPattern } from './patterns'
+import { patternFactor } from './patterns'
 import { materialForValue, type LayerSurfacePlan } from './surfaces'
+import { buildingMask } from './terrainMesh'
 import type { ChunkGrid } from './terrainMesh'
 
 /** RGBA texture of one layer chunk, in the chunk's own `[y][x]` order. */
@@ -57,6 +65,19 @@ export interface LayerTextureOptions {
   surface?: LayerSurfacePlan | null
   /** Texels per cell; `1` draws one colour per cell. */
   texelsPerCell?: number
+  /**
+   * Reader of the building mask, so a drape can leave footprints alone.
+   *
+   * A building is not ground and must not be painted as ground. The drape covers the
+   * surface, so a footprint left in it would show the material of the cell it stands on —
+   * and worse, its lower wall vertices belong to the cells *beside* the footprint, so the
+   * foot of every building would be painted with the road or grass next to it. Cutting the
+   * footprint out of the drape is what leaves the white model underneath visible.
+   *
+   * The mask is the one the terrain itself uses, so the two agree about the boundary to
+   * the cell rather than each drawing its own approximation of it.
+   */
+  building?: CellSampler
 }
 
 /**
@@ -109,13 +130,33 @@ export function layerTextureData(
   const range = options.range ?? sampledRange(spec, sample)
   const surface = options.surface ?? null
   const pattern = surface !== null && surface.materials === null ? surface.pattern : 'flat'
-  let hasAlpha = false
+  // The scalar ramp is sampled once for the whole chunk rather than interpolated per
+  // cell, and the colour is written straight into the buffer. A 128-cell chunk at four
+  // texels a cell is 262 144 writes; a fresh colour array for each of them was the
+  // allocation churn that made a draped layer cost seconds.
+  const ramp =
+    options.mapping in SCALAR_RAMPS
+      ? rampTable(SCALAR_RAMPS[options.mapping as keyof typeof SCALAR_RAMPS])
+      : null
+  // Where the footprint is, as a weight. Multiplied into the alpha rather than tested, so
+  // the drape's edge and the white model's edge fade together instead of one stair-stepping
+  // over the other.
+  const built = options.building === undefined ? null : buildingMask(spec, options.building).weight
+  const hasPattern = pattern !== 'flat' || surface?.materials != null
+  // A drape with a mask can always have a cut edge, so it is treated as blended from the
+  // start rather than only if a cell happens to come out translucent.
+  let hasAlpha = built !== null
   for (let cellRow = 0; cellRow < spec.rows; cellRow += 1) {
     for (let cellColumn = 0; cellColumn < spec.columns; cellColumn += 1) {
       const value = cellValue(spec, sample, cellColumn, cellRow)
       // A named material wins over the mapping: a road is drawn as a road.
       const material = surface === null ? null : materialForValue(surface, value)
-      const base = material?.colour ?? sampleColour(value, options.mapping, range, options.flag)
+      const named = material?.colour ?? null
+      const base =
+        named ??
+        (ramp === null
+          ? sampleColour(value, options.mapping, range, options.flag)
+          : rampColour(value, range, ramp))
       if (base === null) {
         const alpha = Math.round(emptyAlpha * 255)
         hasAlpha ||= alpha < 255
@@ -127,16 +168,42 @@ export function layerTextureData(
         }
         continue
       }
+      // How much of this cell the drape paints. A footprint is left to the white model
+      // under it, and a cell half on the edge of one is painted half as much, which is the
+      // sub-cell edge the mask carries and the format's own data cannot express.
+      const cellAlpha =
+        built === null
+          ? 255
+          : Math.round(255 * (1 - (built[cellRow * spec.columns + cellColumn] ?? 0)))
+      if (cellAlpha < 255) {
+        hasAlpha = true
+      }
+      const cellPattern = material?.pattern ?? pattern
+      // A flat cell is one write per texel; only a patterned one needs the per-texel
+      // position, which is what makes a hatch tile across cells.
+      if (!hasPattern) {
+        for (let ty = 0; ty < perCell; ty += 1) {
+          let pixel = ((cellRow * perCell + ty) * width + cellColumn * perCell) * 4
+          for (let tx = 0; tx < perCell; tx += 1) {
+            pixels[pixel] = base[0]
+            pixels[pixel + 1] = base[1]
+            pixels[pixel + 2] = base[2]
+            pixels[pixel + 3] = cellAlpha
+            pixel += 4
+          }
+        }
+        continue
+      }
       for (let ty = 0; ty < perCell; ty += 1) {
         for (let tx = 0; tx < perCell; tx += 1) {
           const worldX = spec.originX + (cellColumn + (tx + 0.5) / perCell) * spec.cell
           const worldY = spec.originY + (cellRow + (ty + 0.5) / perCell) * spec.cell
-          const colour = applyPattern(base, material?.pattern ?? pattern, worldX, worldY, value)
+          const factor = patternFactor(cellPattern, worldX, worldY, value ?? 0)
           const pixel = ((cellRow * perCell + ty) * width + cellColumn * perCell + tx) * 4
-          pixels[pixel] = colour[0]
-          pixels[pixel + 1] = colour[1]
-          pixels[pixel + 2] = colour[2]
-          pixels[pixel + 3] = 255
+          pixels[pixel] = base[0] * factor
+          pixels[pixel + 1] = base[1] * factor
+          pixels[pixel + 2] = base[2] * factor
+          pixels[pixel + 3] = cellAlpha
         }
       }
     }
@@ -144,13 +211,60 @@ export function layerTextureData(
   return { pixels, width, height, hasAlpha }
 }
 
-/** Texels per cell a plan asks for: patterns need room, a flat colour does not. */
-export function texelsPerCell(plan: LayerSurfacePlan | null, requested = 4): number {
+/**
+ * Colour of one scalar sample, read out of a pre-sampled ramp table.
+ *
+ * `Uint8ClampedArray` rounds and clamps on store, so the scale into the ramp and the
+ * scale out of it are both the caller's business; only the zero-means-absent rule is
+ * repeated here, because that is a property of the layers rather than of the ramp.
+ */
+function rampColour(
+  value: number | undefined,
+  range: { min: number; max: number },
+  ramp: Uint8Array,
+): Rgb | null {
+  if (value === undefined || !Number.isFinite(value) || value === 0) {
+    return null
+  }
+  const step = Math.round(normalize(value, range.min, range.max) * 255) * 3
+  return [ramp[step] ?? 0, ramp[step + 1] ?? 0, ramp[step + 2] ?? 0]
+}
+
+/**
+ * Texels per cell a plan asks for, given how close the camera is.
+ *
+ * A pattern needs room: a hatch one texel wide is a different drawing, and one that
+ * thins with distance stops reading as the material it stands for. So the resolution
+ * follows the zoom — a whole map seen at once is a flat wash and needs a texel a cell,
+ * while a chunk filling the screen is where a hatch has to hold up. Asking for the close
+ * range everywhere instead cost sixteen times the work and the memory for detail no one
+ * could see: one draped layer over a 399-chunk map went from about half a gigabyte of
+ * texture to about a twelfth of that.
+ *
+ * `metresPerPixel` is the ground resolution the camera is reading at, and `cellMetres`
+ * the size of a cell on the ground: a texel per cell is right once a cell is wider than
+ * a pixel, which is the whole-map case.
+ */
+export function texelsPerCell(
+  plan: LayerSurfacePlan | null,
+  metresPerPixel: number | null = null,
+  cellMetres: number | null = null,
+  max = 4,
+): number {
   if (plan === null) {
     return 1
   }
   const textured = plan.materials !== null || plan.pattern !== 'flat'
-  return textured ? Math.max(1, requested) : 1
+  if (!textured) {
+    return 1
+  }
+  if (metresPerPixel === null || cellMetres === null || !(cellMetres > 0)) {
+    return Math.max(1, max)
+  }
+  // How many texels a cell could show without the pattern aliasing: a cell no wider
+  // than a pixel on screen has nothing to resolve.
+  const affordable = Math.floor(cellMetres / Math.max(1e-6, metresPerPixel))
+  return Math.max(1, Math.min(max, affordable))
 }
 
 /**

@@ -82,6 +82,19 @@ fn json(bytes: &[u8]) -> Value {
     })
 }
 
+/// Posts a simulation request body and returns the status and the raw reply.
+async fn post(router: &Router, body: &[u8]) -> (StatusCode, Vec<u8>) {
+    let (status, _, bytes) = send(
+        router,
+        "POST",
+        "/api/v1/simulations",
+        Body::from(body.to_vec()),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    (status, bytes)
+}
+
 /// Submits a task and polls the ticket until it reaches a terminal state.
 async fn run_task(router: &Router, body: Value) -> Value {
     let (status, _, bytes) = send(
@@ -600,15 +613,92 @@ async fn the_preset_endpoint_describes_every_individual_knob() {
     assert_eq!(items.len(), 3, "one entry per preset");
     let first = &items[0];
     assert!(first["params"]["target_speed"].as_f64().unwrap_or(0.0) > 0.5);
+    // Every field the service serialises into `params` must be nameable in an override.
+    // The form is generated from this list, so a knob missing from it is a knob the
+    // interface cannot reach at all — which is how the two step-harmonic ratios and the
+    // whole sensor-noise signature went missing in the first place.
+    let accepted: Vec<&str> = first["override_fields"]
+        .as_array()
+        .expect("override field names")
+        .iter()
+        .filter_map(|name| name.as_str())
+        .collect();
+    let params = first["params"].as_object().expect("the parameter vector");
+    for name in params.keys() {
+        assert!(
+            accepted.contains(&name.as_str()),
+            "`{name}` is in the parameter vector but not in the override schema"
+        );
+    }
     assert!(
-        first["override_fields"]
-            .as_array()
-            .map(|fields| fields.len())
-            .unwrap_or(0)
-            >= 20,
-        "the form needs the accepted override names"
+        accepted.contains(&"sensors"),
+        "the sensor-noise signature is a nested group and needs its own name"
     );
     assert!(first["defaults"]["motion"].is_object());
+}
+
+#[tokio::test]
+async fn an_override_reaches_every_part_of_the_parameter_vector() {
+    let (router, _state) = app().await;
+    let (status, _, bytes) = send(
+        &router,
+        "POST",
+        "/api/v1/maps?name=overrides",
+        Body::from(map_image()),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let map_id = json(&bytes)["id"].as_str().expect("a map id").to_string();
+
+    // The nested group and the harmonics, sent together: a request that names them is
+    // accepted rather than refused as an unknown field, and a typo is still refused.
+    let accepted = format!(
+        r#"{{
+        "name": "overrides",
+        "map": {{ "kind": "id", "id": "{map_id}" }},
+        "person": {{
+            "preset": "moderate",
+            "overrides": {{
+                "harmonic_2_ratio": 0.01,
+                "harmonic_3_ratio": 0.107,
+                "target_speed": 3.1,
+                "sensors": {{ "gnss_white_sigma_m": 4.5, "gyro_step_amplitude_rps": 0.7 }}
+            }}
+        }},
+        "route": {{
+            "mode": "standard",
+            "start": {{ "x": 40.0, "y": 60.0 }},
+            "goal": {{ "x": 250.0, "y": 150.0 }}
+        }}
+    }}"#
+    );
+    let (status, bytes) = post(&router, accepted.as_bytes()).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the whole parameter vector is overridable: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let refused = accepted.replace(r#""harmonic_3_ratio""#, r#""harmonic_three_ratio""#);
+    let (status, bytes) = post(&router, refused.as_bytes()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a name that is not in the schema is still refused: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let message = String::from_utf8_lossy(&bytes);
+    assert!(
+        message.contains("harmonic_three_ratio"),
+        "the refusal names the field that was not accepted: {message}"
+    );
 }
 
 #[tokio::test]

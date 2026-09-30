@@ -25,15 +25,20 @@ export default {
       cancelled: 'Cancelled',
     },
     stage: {
+      // The pipeline stages `core`'s run observer reports, in the order a run walks them.
+      map: 'Opening the map',
+      fields: 'Building the cost fields',
+      plan: 'Planning the route',
+      motion: 'Running the motion model',
+      sensors: 'Generating samples',
+      metrics: 'Computing metrics',
+      // The stages a task reports around its own body, which is a submission or a fetch.
       queued: 'Queued',
       running: 'Running',
       failed: 'Failed',
       cancelled: 'Cancelled',
       environment: 'Environment',
       planning: 'Planning',
-      motion: 'Motion',
-      sensors: 'Sensors',
-      metrics: 'Metrics',
       done: 'Done',
     },
     list: {
@@ -107,6 +112,16 @@ export default {
       strategyEven: 'Even pace',
       strategyPositiveSplit: 'Positive split',
       strategyNegativeSplit: 'Negative split',
+      on: 'On',
+      off: 'Off',
+      group: {
+        physiology: 'Physiology',
+        gait: 'Gait',
+        decision: 'Decision',
+        posture: 'Posture',
+        sensors: 'Sensor noise',
+        identity: 'Identity',
+      },
     },
     route: {
       mode: 'Route mode',
@@ -233,7 +248,7 @@ export default {
       waiting: 'Waiting for the service…',
       streamFailed: 'The event stream stopped.',
       progressUnknown:
-        'The service reports no percentage while the run is in flight; the timer and the log are the progress.',
+        'The stage is where the run actually is. The bar counts the pipeline’s named steps, not a share of the work: a route search can outlast everything else combined.',
       cancelRun: 'Cancel run',
       cancelFailed: 'The run could not be cancelled.',
       streamLive: 'stream live',

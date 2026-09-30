@@ -115,7 +115,9 @@ export class PathSet {
     this.flows = []
     for (const mesh of this.items) {
       this.mapScene.untrackHeightMesh(mesh)
-      mesh.dispose()
+      // The second argument releases the mesh's own GreasedLine material, which Babylon
+      // otherwise leaves on the scene for the life of the engine.
+      mesh.dispose(false, true)
     }
     this.items = []
     this.flows = []
@@ -155,6 +157,13 @@ export class PathSet {
     // The highlighted route is drawn above its neighbours, which is the whole point of
     // highlighting it: a line half a metre below another is not "selected".
     mesh.renderingGroupId = path.zOffset !== undefined && path.zOffset <= -6 ? 3 : 1
+    // Transparent ribbons are sorted by this before anything else, and the default is
+    // `Number.MAX_VALUE` — which put the band *after* the arrows that run along it, so the
+    // band blended over its own chevrons and only the tips poked out below it. The sign is
+    // inverted from the depth offset because the two mean the same thing in opposite
+    // directions: the more a path is meant to sit on top, the more negative its offset and
+    // the later it must draw. The arrows hold 10, so every band stays under them.
+    mesh.alphaIndex = -(path.zOffset ?? -2)
     if (mesh.material !== null) {
       mesh.material.alpha = path.alpha ?? 1
       // A small depth offset keeps the band above the ground it hugs; a large one drew

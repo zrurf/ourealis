@@ -28,6 +28,25 @@ export function toBase64(bytes: Uint8Array): string {
 }
 
 /**
+ * Character code to six-bit value, with `-1` for everything outside the alphabet.
+ *
+ * A lookup over character codes rather than a scan of the alphabet with `indexOf`:
+ * a viewer decodes a base64 block per chunk per layer, so this runs tens of
+ * thousands of times over a large map and the linear scan of a 64-character string
+ * was the single hottest step in loading one.
+ */
+const VALUES = (() => {
+  const table = new Int8Array(128).fill(-1)
+  for (let index = 0; index < ALPHABET.length; index += 1) {
+    table[ALPHABET.charCodeAt(index)] = index
+  }
+  // The URL-safe alphabet swaps the last two symbols for `-` and `_`.
+  table['-'.charCodeAt(0)] = 62
+  table['_'.charCodeAt(0)] = 63
+  return table
+})()
+
+/**
  * Decodes standard or URL-safe base64, ignoring padding and whitespace.
  *
  * A character outside the alphabet throws: a payload that is not base64 is a
@@ -35,15 +54,19 @@ export function toBase64(bytes: Uint8Array): string {
  * chunk that looks valid but holds garbage.
  */
 export function fromBase64(text: string): Uint8Array {
-  const clean = text.replace(/[\s=]/g, '')
-  const bytes = new Uint8Array(Math.floor((clean.length * 6) / 8))
+  const bytes = new Uint8Array(Math.floor((text.length * 6) / 8) + 1)
   let accumulator = 0
   let bits = 0
   let written = 0
-  for (const character of clean) {
-    const value = character === '-' ? 62 : character === '_' ? 63 : ALPHABET.indexOf(character)
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    // Padding and whitespace are noise between groups, not content.
+    if (code === 0x3d /* = */ || code <= 0x20) {
+      continue
+    }
+    const value = code < 128 ? (VALUES[code] ?? -1) : -1
     if (value < 0) {
-      throw new Error(`value is not base64: unexpected character ${JSON.stringify(character)}`)
+      throw new Error(`value is not base64: unexpected character ${JSON.stringify(text[index])}`)
     }
     accumulator = (accumulator << 6) | value
     bits += 6
@@ -65,10 +88,28 @@ export function fromBase64(text: string): Uint8Array {
 export function floatsFromBase64(text: string): Float32Array {
   const bytes = fromBase64(text)
   const count = Math.floor(bytes.length / 4)
+  // Taken as one block rather than read value by value: a per-element `getFloat32`
+  // crosses into the DataView for every number, and one chunk carries thousands of them.
+  // The wire is little-endian, so a host that stores numbers that way can adopt the
+  // bytes as they are; the other order reverses each group of four.
   const values = new Float32Array(count)
-  const view = new DataView(bytes.buffer, bytes.byteOffset, count * 4)
+  if (count === 0) {
+    return values
+  }
+  if (LITTLE_ENDIAN_HOST) {
+    values.set(new Float32Array(bytes.buffer, bytes.byteOffset, count))
+    return values
+  }
+  const native = new Uint8Array(values.buffer, 0, count * 4)
   for (let index = 0; index < count; index += 1) {
-    values[index] = view.getFloat32(index * 4, true)
+    const at = index * 4
+    native[at] = bytes[at + 3] ?? 0
+    native[at + 1] = bytes[at + 2] ?? 0
+    native[at + 2] = bytes[at + 1] ?? 0
+    native[at + 3] = bytes[at] ?? 0
   }
   return values
 }
+
+/** Whether this host stores the least significant byte of a number first. */
+const LITTLE_ENDIAN_HOST = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1

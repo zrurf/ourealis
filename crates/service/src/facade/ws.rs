@@ -245,7 +245,7 @@ async fn fetch(session: &Arc<Session>, channel: &str, offset: usize, limit: usiz
         let take = (wanted - sent).min(frame_samples);
         let start = offset.saturating_add(sent);
         let items: Value = if truth {
-            match serde_json::to_value(truth_page(&output, start, take).items) {
+            match serde_json::to_value(truth_page(&output, start, take, 1).items) {
                 Ok(items) => items,
                 Err(error) => {
                     send_error(session, &ServiceError::Json(error)).await;
@@ -253,7 +253,7 @@ async fn fetch(session: &Arc<Session>, channel: &str, offset: usize, limit: usiz
                 }
             }
         } else {
-            match sensor_page(&output, channel, start, take)
+            match sensor_page(&output, channel, start, take, 1)
                 .and_then(|page| Ok(serde_json::to_value(page.items)?))
             {
                 Ok(items) => items,

@@ -28,10 +28,12 @@ import { Camera } from '@babylonjs/core/Cameras/camera'
 import { Engine } from '@babylonjs/core/Engines/engine'
 import { WebGPUEngine } from '@babylonjs/core/Engines/webgpuEngine'
 import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight'
+import { ShadowGenerator } from '@babylonjs/core/Lights/Shadows/shadowGenerator'
 import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight'
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color'
 import { Vector3 } from '@babylonjs/core/Maths/math.vector'
+import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh'
 import type { LinesMesh } from '@babylonjs/core/Meshes/linesMesh'
 import { RenderingManager } from '@babylonjs/core/Rendering/renderingManager'
 import { Scene } from '@babylonjs/core/scene'
@@ -60,6 +62,38 @@ export interface OurealisDebug {
   canvasId: string | null
   /** Failure message, or `null` while the viewer is healthy. */
   error: string | null
+  /**
+   * What the frustum culler is doing, for the browser lane.
+   *
+   * `culled` is the number of chunks switched off and `tracked` the number it is
+   * deciding about, so a test can assert both that culling happened and that it did not
+   * grow without bound. `drops` counts the chunks the culler has *not* been allowed to
+   * drop because they hold the camera or its target: a culler that has to rescue its own
+   * culling is a culler whose bounds are wrong, and the number is here to make that
+   * visible rather than to look at.
+   */
+  culling: {
+    /** Whether culling is running at all. */
+    active: boolean
+    /** Chunks currently switched off. */
+    culled: number
+    /** Chunks the culler is deciding about. */
+    tracked: number
+    /** Decisions taken so far. */
+    passes: number
+    /** Chunks kept only because they hold a protected point. */
+    rescues: number
+    /** Triangles the tracked chunks hold, on screen or not. */
+    triangles: number
+  }
+  /**
+   * Triangles the surface holds, published by the view rather than the culler.
+   *
+   * Separate because the culler does not exist when culling is switched off, and the
+   * question "how much is the renderer being asked for" has to have an answer in both
+   * configurations for the two to be comparable.
+   */
+  surfaceTriangles: number
 }
 
 /** Extends the global scope with the debug hook the e2e lane expects. */
@@ -79,6 +113,8 @@ const debugState: OurealisDebug = {
   mapId: null,
   canvasId: null,
   error: null,
+  culling: { active: false, culled: 0, tracked: 0, passes: 0, rescues: 0, triangles: 0 },
+  surfaceTriangles: 0,
 }
 
 /**
@@ -135,6 +171,44 @@ export const CAMERA_LIMITS = {
 const GROUND_EPSILON_M = 0.01
 
 /**
+ * Resolution of the sun's shadow map, texels a side.
+ *
+ * The map covers whatever the shadow casters span, so this is a trade against the size of
+ * the map being drawn rather than a fixed ground resolution: at the finest level of a large
+ * map a texel is a few metres, and at a campus it is centimetres. 2048 is the size at which
+ * a campus reads as crisp on hardware this project already targets, and it costs one depth
+ * target of about sixteen megabytes.
+ */
+const SHADOW_MAP_SIZE = 4096
+
+/**
+ * Depth offset applied when a surface is compared against the shadow map.
+ *
+ * In the shadow projection's own normalised depth, so it scales with however far the light
+ * is looking: this is roughly one shadow texel's worth of slope at the sun's angle.
+ */
+const SHADOW_DEPTH_BIAS = 0.003
+
+/**
+ * Offset along the surface normal, in world metres.
+ *
+ * The one that matters for a surface seen edge-on to the sun, where a texel of shadow map
+ * spans metres of the surface behind it. Set to about one texel of a map-sized frustum at
+ * [`SHADOW_MAP_SIZE`]; smaller and walls self-shadow in stripes, larger and a building's
+ * shadow detaches from its own foot.
+ */
+const SHADOW_NORMAL_BIAS_M = 0.8
+
+/**
+ * Share of the remaining height error the camera target closes each frame.
+ *
+ * A sixth or so reaches the ground in a couple of tenths of a second, which reads as the
+ * camera settling rather than as anything moving on its own. Larger and a big correction
+ * is a jump again; smaller and the target visibly lags the ground under it while panning.
+ */
+const GROUND_FOLLOW_RATE = 0.18
+
+/**
  * Pitch difference, in degrees, below which the camera is left as it is.
  *
  * The camera's own pitch is reported back to the host and then asked for again; comparing
@@ -153,6 +227,7 @@ export class MapScene {
   private readonly engine: Engine | WebGPUEngine
   private readonly sky: HemisphericLight
   private readonly sunLight: DirectionalLight
+  private readonly shadows: ShadowGenerator
   private readonly gridMaterial: StandardMaterial
   private cellGrid: LinesMesh | null = null
   private bounds: Aabb | null = null
@@ -165,14 +240,6 @@ export class MapScene {
   private loopRunning = false
   /** Ground height reader, in map metres; `null` while the host has not supplied one. */
   private groundHeight: ((x: number, z: number) => number | null) | null = null
-  /** Camera orbit as of the previous tick, to tell a settled view from a moving one. */
-  private readonly lastCamera = {
-    alpha: Number.NaN,
-    beta: Number.NaN,
-    radius: Number.NaN,
-    x: Number.NaN,
-    z: Number.NaN,
-  }
   private readonly renderLoop: () => void
   private readonly resizeObserver: ResizeObserver | null = null
 
@@ -260,6 +327,23 @@ export class MapScene {
     // flatten both.
     this.sky = new HemisphericLight('sky', new Vector3(0.2, 1, 0.1), scene)
     this.sunLight = new DirectionalLight('sun', this.lightVector(), scene)
+    this.shadows = new ShadowGenerator(SHADOW_MAP_SIZE, this.sunLight)
+    // Filtered rather than hard-edged: a shadow map sampled once per fragment gives every
+    // silhouette a stair-step of its own, which on a campus of a hundred blocks is a second
+    // kind of torn edge to go with the one the footprint mask used to have.
+    this.shadows.usePercentageCloserFiltering = true
+    this.shadows.filteringQuality = ShadowGenerator.QUALITY_HIGH
+    // The offsets are set from the map's *resolution*, and getting that wrong is what put
+    // dark stripes down every wall: a shadow map fitted to a whole 2.5 km map is a metre or
+    // so per texel, and a surface compares its own depth against whichever texel of itself
+    // it happens to land in. A few centimetres of offset cannot cover a metre of texel, so
+    // every wall shadowed itself in bands. The depth term has to be worth a texel's slope
+    // and the normal term worth a texel's width, which is what these two are.
+    this.shadows.bias = SHADOW_DEPTH_BIAS
+    this.shadows.normalBias = SHADOW_NORMAL_BIAS_M
+    // Not black. A cast shadow is sky light without sun, and a hole in the picture reads as
+    // a missing tile rather than as shade.
+    this.shadows.darkness = 0.5
 
     // Depth cue: distant terrain fades into the page colour instead of ending at a
     // hard edge, which is most of what makes a large map readable at a glance.
@@ -296,6 +380,25 @@ export class MapScene {
     this.engine.resize()
   }
 
+  /** Stops drawing. The context and every mesh survive. */
+  stop(): void {
+    if (!this.loopRunning) {
+      return
+    }
+    this.loopRunning = false
+    this.engine.stopRenderLoop()
+  }
+
+  /**
+   * Marks the scene as changed.
+   *
+   * The loop draws every frame, so this draws nothing itself; it exists so that a module
+   * which changes the picture says so where it changes it, which is the only place that
+   * knows *what* changed. It is also the hook an on-demand draw would key on, without any
+   * of those call sites having to move — see the render loop for why that is not done yet.
+   */
+  invalidate(): void {}
+
   /**
    * Uses a reversed depth buffer when the backend supports one.
    *
@@ -309,15 +412,6 @@ export class MapScene {
       // A backend without the extension keeps the plain depth buffer, which the tightened
       // near/far range already helps.
     }
-  }
-
-  /** Stops drawing. The context and every mesh survive. */
-  stop(): void {
-    if (!this.loopRunning) {
-      return
-    }
-    this.loopRunning = false
-    this.engine.stopRenderLoop()
   }
 
   /**
@@ -348,12 +442,40 @@ export class MapScene {
     this.renderTargets.forEach((mesh) => {
       mesh.scaling.y = clamped
     })
+    this.invalidate()
+  }
+
+  /**
+   * Makes a mesh cast the sun's shadow.
+   *
+   * The terrain is its own caster: a building is not separate geometry here but a raised
+   * part of the same surface, so the only thing that can throw a footprint's shadow onto
+   * the ground beside it is the ground itself.
+   */
+  addShadowCaster(mesh: AbstractMesh): void {
+    this.shadows.addShadowCaster(mesh)
+  }
+
+  /** Stops a mesh casting, for a chunk that is being dropped. */
+  removeShadowCaster(mesh: AbstractMesh): void {
+    this.shadows.removeShadowCaster(mesh, true)
+  }
+
+  /**
+   * Makes a mesh receive the sun's shadow.
+   *
+   * Off by default in Babylon, and the default is why an unlit map with two lights still
+   * looked flat: every surface was lit as though nothing stood between it and the sun.
+   */
+  receiveShadows(mesh: AbstractMesh): void {
+    mesh.receiveShadows = true
   }
 
   /** Registers a height-carrying mesh with the exaggeration control. */
   trackHeightMesh(mesh: { scaling: { y: number } }): void {
     mesh.scaling.y = this.exaggeration
     this.renderTargets.add(mesh)
+    this.invalidate()
   }
 
   /** Stops tracking a disposed mesh. */
@@ -382,40 +504,38 @@ export class MapScene {
    * while `setTarget` rebuilds the angles and the radius from the current position — which
    * would undo the reader's zoom and pitch on every frame.
    *
-   * The correction lands once the view has settled rather than on every tick. A moving camera
-   * is already recomputing its view matrix, and writing the target underneath it would keep
-   * marking it dirty for a whole gesture: the host reads the camera back on every change, so
-   * each of those writes costs a round trip through the host's own state and back into the
-   * camera. One write per gesture leaves the reader with the same view and no loop to run.
-   * An unknown height leaves the target where it was, so a view over terrain that is still
-   * loading does not jump.
+   * The write is eased rather than applied at once. It used to wait for the camera to stop
+   * moving and then assign the whole correction in a single frame, which is a visible jump:
+   * panning across a hill leaves the target at the old ground's height, and the difference —
+   * multiplied by the exaggeration, which reaches three — lands the moment the reader lets go.
+   * The same jump fired when terrain streamed in and the ground height became known at all.
+   * Easing every frame moves the same total distance over a fraction of a second and never
+   * moves it faster than the eye reads as the camera having moved on its own.
+   *
+   * An unknown height still leaves the target where it was, so a view over terrain that is
+   * still loading does not jump — but the arrival of that terrain now eases in with everything
+   * else rather than snapping.
    */
   private followGround(): void {
     const camera = this.camera
-    const settled =
-      camera.alpha === this.lastCamera.alpha &&
-      camera.beta === this.lastCamera.beta &&
-      camera.radius === this.lastCamera.radius &&
-      camera.target.x === this.lastCamera.x &&
-      camera.target.z === this.lastCamera.z
-    this.lastCamera.alpha = camera.alpha
-    this.lastCamera.beta = camera.beta
-    this.lastCamera.radius = camera.radius
-    this.lastCamera.x = camera.target.x
-    this.lastCamera.z = camera.target.z
-    if (!settled) {
-      return
-    }
     const ground = this.heightAt(camera.target.x, camera.target.z)
     if (ground === null) {
       return
     }
     const height = ground * this.exaggeration
-    // The write itself must not re-arm the loop, so it is skipped once the target is already
-    // on the ground.
-    if (Math.abs(camera.target.y - height) > GROUND_EPSILON_M) {
-      camera.target.y = height
+    const delta = height - camera.target.y
+    if (Math.abs(delta) <= GROUND_EPSILON_M) {
+      // Close enough that the difference is below the near plane's own precision, so the
+      // target is pinned and the camera stops being marked dirty every frame.
+      if (delta !== 0) {
+        camera.target.y = height
+      }
+      return
     }
+    // A fixed share of what is left, not a fixed distance: a small correction lands in a
+    // couple of frames and a sixty-metre one takes about a fifth of a second, and neither
+    // ever overshoots.
+    camera.target.y += delta * GROUND_FOLLOW_RATE
   }
 
   /** Ground height at a map position, in map metres, or `null` when it is not known. */
@@ -449,6 +569,7 @@ export class MapScene {
    * that owns colour of its own — the terrain's ramp — recolours from the same signal.
    */
   setAppearance(dark: boolean): void {
+    this.invalidate()
     if (this.dark === dark) {
       return
     }
@@ -466,6 +587,7 @@ export class MapScene {
 
   /** Sets the zoom step a wheel notch applies, clamped to a usable range. */
   setZoomStep(step: number): void {
+    this.invalidate()
     this.camera.wheelDeltaPercentage = clamp(
       step,
       CAMERA_LIMITS.minZoomStep,
@@ -493,6 +615,7 @@ export class MapScene {
    * own gesture, which is how a zoom that drifts the pitch turns into a loop.
    */
   setPitch(deg: number): void {
+    this.invalidate()
     const clamped = clamp(deg, CAMERA_LIMITS.minPitchDeg, CAMERA_LIMITS.maxPitchDeg)
     if (Math.abs(this.pitchDeg - clamped) < PITCH_EPSILON_DEG) {
       return
@@ -507,6 +630,7 @@ export class MapScene {
 
   /** Sets the vertical field of view, degrees. */
   setFov(deg: number): void {
+    this.invalidate()
     this.camera.fov = (clamp(deg, CAMERA_LIMITS.minFovDeg, CAMERA_LIMITS.maxFovDeg) * Math.PI) / 180
   }
 
@@ -517,6 +641,7 @@ export class MapScene {
    * parallel and equal distances stay equal, which a perspective view cannot show.
    */
   setOrthographic(on: boolean): void {
+    this.invalidate()
     this.orthographic = on
     this.camera.mode = on ? Camera.ORTHOGRAPHIC_CAMERA : Camera.PERSPECTIVE_CAMERA
     this.applyOrthoWindow()
@@ -529,6 +654,7 @@ export class MapScene {
 
   /** Whether the wheel zooms toward the pointer. */
   setZoomToPointer(on: boolean): void {
+    this.invalidate()
     this.camera.zoomToMouseLocation = on
   }
 
@@ -550,6 +676,7 @@ export class MapScene {
    * moved only the light would draw shadows that disagree with the shading.
    */
   setSun(azimuthDeg: number, elevationDeg = this.elevationDeg): void {
+    this.invalidate()
     this.azimuthDeg = azimuthDeg
     this.elevationDeg = elevationDeg
     this.sunLight.direction = this.lightVector()
@@ -572,6 +699,7 @@ export class MapScene {
    * map does not drop the camera to zero for a frame before the loop corrects it.
    */
   frameBounds(bounds: Aabb, groundElevation?: number): void {
+    this.invalidate()
     this.bounds = bounds
     const width = bounds.max_x - bounds.min_x
     const depth = bounds.max_y - bounds.min_y
@@ -621,10 +749,17 @@ export class MapScene {
     }
   }
 
-  /** Calls `listener` after the view matrix changed, throttled to once per animation frame. */
-  observeCamera(listener: (state: ReturnType<MapScene['cameraState']>) => void): void {
+  /**
+   * Calls `listener` after the view matrix changed, throttled to once per animation frame.
+   *
+   * Returns a function that removes the listener. The camera is shared for the life of
+   * the session — the canvas is moved between views rather than the engine rebuilt — so
+   * an observer that outlives its view keeps firing against a component that is gone,
+   * writing into refs nothing renders and re-rendering the ones that are.
+   */
+  observeCamera(listener: (state: ReturnType<MapScene['cameraState']>) => void): () => void {
     let pending = false
-    this.camera.onViewMatrixChangedObservable.add(() => {
+    const observer = this.camera.onViewMatrixChangedObservable.add(() => {
       if (pending) {
         return
       }
@@ -636,6 +771,7 @@ export class MapScene {
         listener(this.cameraState())
       })
     })
+    return () => this.camera.onViewMatrixChangedObservable.remove(observer)
   }
 
   /**
@@ -645,6 +781,7 @@ export class MapScene {
    * drag it is the only way to find the map again without hunting for it.
    */
   resetView(): void {
+    this.invalidate()
     const bounds = this.bounds
     if (bounds === null) {
       return
@@ -677,6 +814,7 @@ export class MapScene {
    * says at a glance how big what you are looking at is.
    */
   setCellGrid(mesh: LinesMesh | null): void {
+    this.invalidate()
     if (this.cellGrid !== null && this.cellGrid !== mesh) {
       this.untrackHeightMesh(this.cellGrid)
       this.cellGrid.dispose()
@@ -691,6 +829,7 @@ export class MapScene {
 
   /** Frames the whole scene again after the canvas was resized. */
   resize(): void {
+    this.invalidate()
     this.engine.resize()
   }
 
@@ -722,7 +861,13 @@ export class MapScene {
       unitChannel(g) * 0.3,
       unitChannel(b) * 0.3,
     )
-    this.sunLight.intensity = 0.55
+    // Raised from what they were, because the directional term has moved from the vertex
+    // colours to the light itself — see `surfaceShade`. What the two add up to on a level
+    // surface is very nearly what the baked hillshade plus the old pair produced, so the
+    // map does not change brightness; what changes is that the shading is now evaluated per
+    // fragment against a real direction, and that something can stand in the way of it.
+    this.sky.intensity = 0.45
+    this.sunLight.intensity = 0.72
   }
 
   /** Direction from the surface toward the sun, in the scene's own terms. */

@@ -154,7 +154,7 @@ test.describe('scatter option', () => {
     const fitSeries = series(option)[1]
     expect(fitSeries?.type).toBe('line')
     const data = fitSeries?.data
-    expect(Array.isArray(data) ? data[0] : null).toEqual({ x: 1, y: expect.any(Number) })
+    expect(Array.isArray(data) ? data[0] : null).toEqual([1, expect.any(Number)])
     expect(series(option)[0]?.type).toBe('scatter')
   })
 
@@ -174,9 +174,9 @@ test.describe('spectrum option', () => {
       logMagnitude: true,
     })
     expect(series(option)[0]?.data).toEqual([
-      { x: 0, y: 10 },
-      { x: 1, y: 1 },
-      { x: 2, y: 0.1 },
+      [0, 10],
+      [1, 1],
+      [2, 0.1],
     ])
     expect(field(field(option, 'yAxis'), 'type')).toBe('log')
     expect(field(field(option, 'xAxis'), 'type')).toBe('value')
@@ -190,9 +190,9 @@ test.describe('spectrum option', () => {
       magnitudes: [5, 4],
     })
     expect(series(option)[0]?.data).toEqual([
-      { x: 0, y: 5 },
-      { x: 1, y: 4 },
-      { x: 2, y: 0 },
+      [0, 5],
+      [1, 4],
+      [2, 0],
     ])
   })
 })
@@ -322,5 +322,49 @@ test.describe('colour mapping', () => {
     // A value that is not a number has no position on a ramp; the bottom is the
     // readable answer, since a transparent middle would look like data.
     expect(normalize(Number.NaN, 0, 1)).toBe(0)
+  })
+})
+
+test.describe('series data shape', () => {
+  /*
+   * echarts 6 reads a non-primitive data item as an *item option* and takes its value from
+   * `item.value`. A `{ x, y }` object has no `value`, so the series resolves to NaN and the
+   * chart draws its frame with nothing in it — the data is present in the option and the
+   * canvas is still blank. Every builder therefore has to hand over `[x, y]` pairs, and
+   * these assertions are what keeps that from drifting back.
+   */
+  test('a line series hands echarts pairs, never point objects', () => {
+    const option = lineOption({
+      x: 'time (s)',
+      y: 'speed (m/s)',
+      series: [
+        {
+          name: 'run',
+          data: [
+            { x: 0, y: 1.5 },
+            { x: 1, y: 2.5 },
+          ],
+        },
+      ],
+    })
+    expect(series(option)[0]?.data).toEqual([
+      [0, 1.5],
+      [1, 2.5],
+    ])
+  })
+
+  test('a category series keeps bare values, which a pair would break', () => {
+    const option = lineOption({
+      x: 'lap',
+      y: 'lap time (s)',
+      series: [{ name: 'run', data: [58, 61, 59] }],
+      categoryAxis: true,
+    })
+    expect(series(option)[0]?.data).toEqual([58, 61, 59])
+  })
+
+  test('an empty series is left alone rather than guessed at', () => {
+    const option = lineOption({ x: 'x', y: 'y', series: [{ name: 'run', data: [] }] })
+    expect(series(option)[0]?.data).toEqual([])
   })
 })

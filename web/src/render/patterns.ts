@@ -15,14 +15,7 @@
 import { hash2 } from './noise'
 
 /** How a cell is textured. */
-export type SurfacePattern =
-  | 'flat'
-  | 'asphalt'
-  | 'grass'
-  | 'water'
-  | 'gravel'
-  | 'hatch'
-  | 'contour'
+export type SurfacePattern = 'flat' | 'asphalt' | 'grass' | 'water' | 'gravel' | 'hatch' | 'contour'
 
 /** How strongly a pattern is allowed to modulate its colour. */
 export const PATTERN_STRENGTH = 0.14
@@ -58,6 +51,18 @@ export function patternAt(
   }
 }
 
+/**
+ * How much a pattern brightens or darkens a colour at a map position.
+ *
+ * The factor is separated from the colour so a caller writing into a buffer can scale in
+ * place. A texture samples this per *texel*, so a 128-cell chunk at four texels a cell
+ * asks for it 262 144 times — and returning a fresh three-element array each time was
+ * the most allocated memory the renderer made per map.
+ */
+export function patternFactor(pattern: SurfacePattern, x: number, y: number, value = 0): number {
+  return 1 + (patternAt(pattern, x, y, value) - 1) * PATTERN_STRENGTH
+}
+
 /** Applies a pattern to a colour, keeping the hue and modulating the brightness. */
 export function applyPattern(
   colour: readonly [number, number, number],
@@ -66,7 +71,7 @@ export function applyPattern(
   y: number,
   value = 0,
 ): [number, number, number] {
-  const factor = 1 + (patternAt(pattern, x, y, value) - 1) * PATTERN_STRENGTH
+  const factor = patternFactor(pattern, x, y, value)
   return [
     clampByte(colour[0] * factor),
     clampByte(colour[1] * factor),

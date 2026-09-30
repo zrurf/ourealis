@@ -17,6 +17,7 @@ import {
   newCheckpoint,
   newWaypoint,
   overrideFields,
+  overrideGroups,
   overridesOf,
   pointToVec,
   routeSpecOf,
@@ -356,5 +357,119 @@ test.describe('point helpers', () => {
       kind: 'dwell',
       duration_s: 4,
     })
+  })
+})
+
+/** A draft with a complete route and two overrides, one of which the schema dropped. */
+function runnable() {
+  const state = defaultFormState()
+  state.start = { x: 40, y: 60 }
+  state.goal = { x: 250, y: 150 }
+  state.overrides = { target_speed: 3.1, a_field_core_removed: 9 }
+  return state
+}
+
+test.describe('the whole parameter vector is reachable', () => {
+  /*
+   * The form is generated from what the service reports, so these assertions are about
+   * the *shape* of that: a field the schema names must end up with a control, and a
+   * sensor-noise field must be reachable without inventing a vocabulary of its own.
+   */
+  const params = {
+    target_speed: 3.0,
+    step_frequency: 2.6,
+    harmonic_2_ratio: 0.0,
+    harmonic_3_ratio: 0.107,
+    pace_strategy: 'even',
+    label: null,
+    sensors: {
+      gnss_white_sigma_m: 3.0,
+      accel_white_sigma: 0.03,
+      gnss_correlated_velocity: true,
+    },
+  }
+  const names = [
+    'target_speed',
+    'step_frequency',
+    'harmonic_2_ratio',
+    'harmonic_3_ratio',
+    'pace_strategy',
+    'label',
+    'sensors',
+  ]
+
+  test('every reported field lands in a group', () => {
+    const groups = overrideGroups(names, params)
+    const flat = groups.flatMap((group) => group.map((field) => field.name))
+    for (const name of ['target_speed', 'harmonic_3_ratio', 'pace_strategy', 'label']) {
+      expect(flat).toContain(name)
+    }
+    // The nested group is expanded into its own fields rather than left as one opaque
+    // entry, so each of them is individually settable.
+    expect(flat).toContain('sensors.gnss_white_sigma_m')
+    expect(flat).not.toContain('sensors')
+  })
+
+  test('a boolean sensor flag gets a two-choice control, not a number box', () => {
+    const groups = overrideGroups(names, params)
+    const flag = groups.flat().find((field) => field.name === 'sensors.gnss_correlated_velocity')
+    expect(flag?.kind).toBe('choice')
+    expect(flag?.options?.map((option) => option.value)).toEqual(['true', 'false'])
+  })
+
+  test('fields are grouped by subject rather than left in one list', () => {
+    const groups = overrideGroups(names, params)
+    const groupsOf = (name: string) =>
+      groups.findIndex((group) => group.some((f) => f.name === name))
+    // The cadence and the speed it produces belong together; the two harmonics belong
+    // with the bounce, not next to the speed limits they have nothing to do with.
+    expect(groupsOf('target_speed')).toBe(groupsOf('step_frequency'))
+    expect(groupsOf('harmonic_2_ratio')).toBe(groupsOf('harmonic_3_ratio'))
+    expect(groupsOf('target_speed')).not.toBe(groupsOf('harmonic_2_ratio'))
+  })
+
+  test('an unknown field is still filed somewhere rather than dropped', () => {
+    const groups = overrideGroups([...names, 'a_field_added_later'], params)
+    const flat = groups.flatMap((group) => group.map((field) => field.name))
+    expect(flat).toContain('a_field_added_later')
+  })
+})
+
+test.describe('overrides on the way out', () => {
+  test('sensor-noise fields nest under the group the wire wants', () => {
+    const state = defaultFormState()
+    state.overrides = {
+      target_speed: 3.1,
+      'sensors.gnss_white_sigma_m': 4.5,
+      'sensors.gyro_step_amplitude_rps': 0.7,
+    }
+    expect(overridesOf(state)).toEqual({
+      target_speed: 3.1,
+      sensors: { gnss_white_sigma_m: 4.5, gyro_step_amplitude_rps: 0.7 },
+    })
+  })
+
+  test('a cleared numeric field is not sent at all', () => {
+    // `TInputNumber` reports `undefined` when emptied and `Number()` turns that into
+    // NaN, which serialises to null and fails validation for the whole request.
+    const state = defaultFormState()
+    state.overrides = { target_speed: Number.NaN, 'sensors.accel_white_sigma': Number.NaN }
+    expect(overridesOf(state)).toEqual({})
+  })
+
+  test('a boolean flag travels as its own literal, not as a number', () => {
+    const state = defaultFormState()
+    state.overrides = { 'sensors.gnss_correlated_velocity': 'false' }
+    expect(overridesOf(state)).toEqual({ sensors: { gnss_correlated_velocity: 'false' } })
+  })
+
+  test('a stale key from a restored draft is dropped, not sent as a 400', () => {
+    const request = buildSimulationRequest(runnable(), ['target_speed', 'sensors'])
+    expect(request.person.overrides).toEqual({ target_speed: 3.1 })
+  })
+
+  test('without a schema every set override is sent', () => {
+    const request = buildSimulationRequest(runnable())
+    expect(request.person.overrides).toEqual({ target_speed: 3.1, a_field_core_removed: 9 })
   })
 })

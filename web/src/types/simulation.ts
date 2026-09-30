@@ -150,6 +150,26 @@ export interface PersonOverrides {
   bounce_amplitude_m?: number
   head_look_ahead_s?: number
   turn_omega_max?: number
+  harmonic_2_ratio?: number
+  harmonic_3_ratio?: number
+  sensors?: SensorNoiseOverrides
+}
+
+/** Overrides of the individual's sensor noise signature. */
+export interface SensorNoiseOverrides {
+  gnss_bias_sigma_m?: number
+  gnss_bias_tau_s?: number
+  gnss_white_sigma_m?: number
+  gnss_speed_sigma?: number
+  gnss_correlated_velocity?: boolean
+  accel_bias_sigma?: number
+  accel_white_sigma?: number
+  gyro_bias_sigma?: number
+  gyro_white_sigma?: number
+  gyro_step_amplitude_rps?: number
+  mag_bias_sigma_ut?: number
+  mag_white_sigma_ut?: number
+  baro_white_sigma_pa?: number
 }
 
 /** The individual to simulate. */

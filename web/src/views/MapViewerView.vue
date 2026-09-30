@@ -45,10 +45,19 @@ import {
   TERRAIN_RAMP_DARK,
   rampCss,
 } from '@/types/colormap'
-import { backendLabel, engineFromQuery, probeEngine, type EngineReasonCode } from '@/render/engine'
+import {
+  backendLabel,
+  cullingEnabled,
+  decimationEnabled,
+  engineFromQuery,
+  probeEngine,
+  type EngineReasonCode,
+} from '@/render/engine'
 import { updateDebug } from '@/render/scene'
 import { renderHost, type SceneLease } from '@/render/host'
 import type { MapScene } from '@/render/scene'
+import { ChunkCuller } from '@/render/chunkCuller'
+import { decimateIndices } from '@/render/chunkLod'
 import { TerrainLayer } from '@/render/terrain'
 import { buildChunkMesh, chunkGrid, type ChunkMeshData } from '@/render/terrainMesh'
 import { createCellSampler, type CellSampler } from '@/render/cellSampler'
@@ -106,6 +115,17 @@ const HEIGHT_SAMPLE_LIMIT = 20_000
  */
 const STREAM_BATCH = 8
 
+/**
+ * Chunks on screen at which a whole-map view starts thinning the surface.
+ *
+ * Below this the reader is looking at one corner closely enough that the triangles are the
+ * picture rather than the waste.
+ */
+const LOD_CHUNK_THRESHOLD = 24
+
+/** Share of the triangles a chunk keeps once the whole map is in view. */
+const LOD_WHOLE_MAP_RATIO = 0.35
+
 /** Milliseconds a camera change is coalesced before the visible chunks are re-read. */
 const STREAM_DEBOUNCE_MS = 200
 
@@ -156,6 +176,9 @@ const surfaceRange = computed(() => channelRange(metadata.value?.global_stats, L
 let scene: MapScene | null = null
 let lease: SceneLease | null = null
 let terrain: TerrainLayer | null = null
+let culler: ChunkCuller | null = null
+/** Publishes what the culler decided; cleared with the scene it belongs to. */
+let cullingReport: ReturnType<typeof setInterval> | null = null
 let drapes: LayerOverlay | null = null
 let overlays: OverlaySet | null = null
 let arrows: DirectionArrows | null = null
@@ -436,6 +459,32 @@ onMounted(async () => {
   lease = borrowing
   scene = borrowing.scene
   terrain = new TerrainLayer(scene.scene, scene)
+  // Chunks out of view are switched off rather than submitted every frame. The culler
+  // only ever touches the surface's own meshes, and `?nocull=1` turns it off entirely.
+  culler = new ChunkCuller(scene.scene, scene)
+  if (cullingEnabled()) {
+    culler.start()
+    terrain.useCuller(culler)
+  }
+  // Published so the browser lane can see what the culler decided, rather than having to
+  // infer it from a pixel count.
+  cullingReport = setInterval(() => {
+    let surfaceTriangles = 0
+    for (const mesh of terrain?.list ?? []) {
+      surfaceTriangles += mesh.getTotalIndices() / 3
+    }
+    updateDebug({
+      surfaceTriangles,
+      culling: culler?.report ?? {
+        active: false,
+        culled: 0,
+        tracked: surfaceTriangles === 0 ? 0 : 0,
+        passes: 0,
+        rescues: 0,
+        triangles: surfaceTriangles,
+      },
+    })
+  }, 500)
   drapes = new LayerOverlay(scene.scene, scene)
   overlays = new OverlaySet(scene)
   arrows = new DirectionArrows(scene)
@@ -496,13 +545,18 @@ onMounted(async () => {
 
 /** Reports the camera back into the store, so the rail shows what the reader is looking at. */
 function observeCamera(): void {
-  scene?.observeCamera((state) => {
-    // The pointer rotates the camera, so the pitch the panel shows is the camera's own.
-    viewer.pitchDeg = state.pitchDeg
-    groundResolution.value = metresPerPixel()
-    scaleBarMetres.value = scene?.scaleBarLength(groundResolution.value) ?? scaleBarMetres.value
-  })
+  stopCameraObserver?.()
+  stopCameraObserver =
+    scene?.observeCamera((state) => {
+      // The pointer rotates the camera, so the pitch the panel shows is the camera's own.
+      viewer.pitchDeg = state.pitchDeg
+      groundResolution.value = metresPerPixel()
+      scaleBarMetres.value = scene?.scaleBarLength(groundResolution.value) ?? scaleBarMetres.value
+    }) ?? null
 }
+
+/** Detaches the camera listener; the engine outlives this view. */
+let stopCameraObserver: (() => void) | null = null
 
 /** Releases the pinned cell when the reader presses Escape. */
 function onKeyDown(event: KeyboardEvent): void {
@@ -521,6 +575,16 @@ onBeforeUnmount(() => {
   }
   detachPan?.()
   detachPan = null
+  // The camera and its engine outlive this view, so the listener is detached here rather
+  // than left writing into refs nothing renders any more.
+  stopCameraObserver?.()
+  stopCameraObserver = null
+  if (cullingReport !== null) {
+    clearInterval(cullingReport)
+    cullingReport = null
+  }
+  culler?.stop()
+  culler = null
   terrain?.dispose()
   drapes?.dispose()
   overlays?.dispose()
@@ -708,6 +772,9 @@ async function streamLayerDrapes(
     await maps.loadChunks(refs)
     const sample = cellSamplerFor(layer.layerId, layerGrid, chunkSize, level, sourceLevel)
     const plan = surfacePlan(layer)
+    // The elevation layer's second channel is the building mask, and a drape leaves those
+    // cells to the white model rather than painting ground over them.
+    const building = cellSamplerFor(LAYER_ELEVATION, elevationGrid, chunkSize, level, level, 1)
     // The drape is one mesh per *terrain* chunk: its vertices are the surface's own, and
     // its grid is the surface's grid — a chunk id from the layer's own level names a
     // different area and would put the drape somewhere the chunk is not.
@@ -728,7 +795,8 @@ async function streamLayerDrapes(
           emptyAlpha: 0,
           flag: flagColour(layer.layerId),
           surface: plan,
-          texelsPerCell: texelsPerCell(plan),
+          building,
+          texelsPerCell: texelsPerCell(plan, metresPerPixel(), cellSizeOf(level)),
         }),
         drapedMesh(terrainMesh, DRAPE_LIFT_M * drapeOrder(layer.layerId)),
       )
@@ -755,6 +823,12 @@ function metresPerPixel(): number {
     return 1
   }
   return metresPerPixelAt(current.camera.radius, element.clientHeight, current.camera.fov)
+}
+
+/** Size of one cell on the ground at a level, metres. */
+function cellSizeOf(level: number): number {
+  const grid = mapId.value === null ? null : maps.gridOf(mapId.value, LAYER_ELEVATION)
+  return grid === null ? 1 : levelCellSize(grid, level)
 }
 
 /** Area the camera can see, as the map's own metre plane. */
@@ -871,6 +945,12 @@ async function buildTerrain(
   // mask existed has one channel there, the reader answers `null` throughout, and the surface
   // falls back to the ramp with nothing to distinguish.
   const building = cellSamplerFor(LAYER_ELEVATION, grid, chunkSize, level, level, 1)
+  // How much of the map is on screen at once decides how much each chunk is worth. One
+  // chunk filling the viewport is the subject and keeps every triangle; a hundred of them
+  // sharing the viewport are each a few dozen pixels of hillside, and the triangles behind
+  // them are the difference between a map that pans and one that does not.
+  const decimate =
+    refs.length >= LOD_CHUNK_THRESHOLD && decimationEnabled() ? LOD_WHOLE_MAP_RATIO : 1
   let built = 0
   for (const target of refs) {
     if (!live()) {
@@ -885,6 +965,12 @@ async function buildTerrain(
       sample,
       { ...surfaceStyle.value, building },
     )
+    if (decimate < 1) {
+      // Index-only, so the normals, the colours and the texture coordinates the mesh was
+      // just built with all stay valid and this is still the same surface.
+      // oxlint-disable-next-line no-await-in-loop
+      data.indices = (await decimateIndices(data.positions, data.indices, decimate)).indices
+    }
     terrainData.set(key, data)
     manager.setChunk(key, data)
     built += 1
@@ -1086,8 +1172,12 @@ watch(
 
 /** Switches an overlay family on or off. */
 watch(
-  () => ({ ...viewer.overlays }),
+  // Both of the switches the rail carries: the overlay families and the layer list are
+  // separate state, and a change to either is a change to the picture even when it turns
+  // into a removal rather than an addition.
+  () => [viewer.overlays, viewer.layers.map((layer) => layer.visible)],
   () => {
+    scene?.invalidate()
     void syncOverlayFamilies()
   },
   { deep: true },

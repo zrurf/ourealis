@@ -35,7 +35,14 @@ test('one engine serves the map views', async ({ page, request }) => {
     .poll(async () => Number(await page.getByTestId('chunk-count').innerText()))
     .toBeGreaterThan(0)
   const fromViewer = await canvasId(page)
+  // The view draws on demand, so a still one stops asking for frames. Moving the pointer
+  // over the map is what a reader does, and it is what makes the camera live.
   const framesInViewer = await frames(page)
+  const box = await page.getByTestId('viewer-canvas').boundingBox()
+  await page.mouse.move(
+    (box?.x ?? 0) + (box?.width ?? 0) / 2,
+    (box?.y ?? 0) + (box?.height ?? 0) / 2,
+  )
   await page.waitForTimeout(500)
   expect(await frames(page)).toBeGreaterThan(framesInViewer)
 

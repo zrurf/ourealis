@@ -3,11 +3,14 @@
  * Runs: the history at `/runs` and one job's live state, result and detail tabs
  * at `/runs/:id`.
  *
- * The live panel is built around what the service actually reports (doc §4.5):
- * a state, a stage, an elapsed time and a log — never a percentage, because the
- * simulator's run is a single call and `progress` stays null while it runs. The
- * elapsed timer here is therefore the progress indicator, advanced by an interval
- * and never allowed to overtake a value an event carried.
+ * The live panel is built around what the service actually reports: a state, the
+ * pipeline stage the run is in, an elapsed time and a log. `core` reports its stages
+ * through a run observer, so a run of several minutes says what it is doing rather
+ * than only that it started. The fraction that comes with a stage counts the named
+ * steps of the pipeline, not a share of the work — a route search can outlast every
+ * other stage combined — so the stage name is what this panel leads with. The elapsed
+ * timer is advanced by an interval and never allowed to overtake a value an event
+ * carried.
  *
  * The detail tabs are held in the URL query, so a reload and a deep link open the
  * same one; only the selected tab is mounted, which disposes the 3D scene and the

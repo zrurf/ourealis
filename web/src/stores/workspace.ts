@@ -20,6 +20,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { useMapsStore } from '@/stores/maps'
+import { listPresets, type Preset } from '@/api/presets'
 import { isApiError } from '@/api/errors'
 import { planRoute, previewRoutes } from '@/api/routes'
 import { checkFeasibility } from '@/api/maps'
@@ -118,6 +119,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const maps = useMapsStore()
 
   const draft = ref<SimulationFormState>(defaultFormState())
+  const presets = ref<Preset[]>([])
+  const presetStatus = ref<'idle' | 'loading' | 'ready' | 'failed'>('idle')
   const stage = ref<Stage>('route')
   const mode = ref<Mode>(readMode())
   const recipe = ref<RecipeId | null>(null)
@@ -154,6 +157,33 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   let planGeneration = 0
 
   /** Validation issues of the draft as it stands. */
+  /**
+   * The override names the service accepts for the chosen preset.
+   *
+   * The draft is persisted and restored across upgrades, so it can carry a key the
+   * service no longer takes; the wire type refuses an unknown one and takes the whole
+   * run down. Filtering against the schema the service just reported turns that into a
+   * dropped stale key instead.
+   */
+  const overrideFieldNames = computed<readonly string[]>(() => {
+    const preset = presets.value.find((entry) => entry.preset === draft.value.preset)
+    return preset?.override_fields ?? []
+  })
+
+  /** Reads the presets once; their schema is what the person form is generated from. */
+  async function loadPresets(): Promise<void> {
+    if (presetStatus.value === 'ready' || presetStatus.value === 'loading') {
+      return
+    }
+    presetStatus.value = 'loading'
+    try {
+      presets.value = (await listPresets()).items
+      presetStatus.value = 'ready'
+    } catch {
+      presetStatus.value = 'failed'
+    }
+  }
+
   const issues = computed(() => validateForm(draft.value))
 
   /** Whether the route is complete enough to plan and to run. */
@@ -554,7 +584,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     const generation = ++planGeneration
     plan.value = { ...plan.value, busy: true, error: null }
     try {
-      const request = buildSimulationRequest(draft.value)
+      const request = buildSimulationRequest(draft.value, overrideFieldNames.value)
       const preview = await previewRoutes(request)
       if (generation !== planGeneration) {
         // A newer draft has been planned since; this answer describes a route that is
@@ -621,7 +651,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       return
     }
     try {
-      const request = buildSimulationRequest(draft.value)
+      const request = buildSimulationRequest(draft.value, overrideFieldNames.value)
       const planned = await planRoute(request)
       if (generation !== planGeneration) {
         return
@@ -670,6 +700,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   return {
     draft,
+    presets,
+    presetStatus,
+    overrideFieldNames,
+    loadPresets,
     stage,
     mode,
     recipe,

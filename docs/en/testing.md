@@ -113,13 +113,19 @@ Playwright runs all four, one per directory:
 
 | Lane | Command | What it covers |
 |---|---|---|
-| unit (139) | `run test:unit` | Pure logic, no browser: DTO mirrors, unit conversion, colormap mapping, paging windows, SSE and NDJSON parsing, metric formatting, chart option builders, the two catalogues' key sets, the chunk crop, and the render engine's backend probe |
-| e2e (20) | `run test:e2e` | A real browser against a real service: import → list → preview (with `?engine=webgl2`), the workspace (draw a route, watch it plan, pick a candidate, submit, read the result), the map menu, the touch gestures, a refused route point, the whole simulation slice (trajectory, sensors, audit against a second run, OMF round-trip, batch sweep), the shell's theme and language, and one engine across views |
+| unit (258) | `run test:unit` | Pure logic, no browser: DTO mirrors, unit conversion, colormap mapping, paging windows, SSE and NDJSON parsing, metric formatting, chart option builders, the two catalogues' key sets, the chunk crop, frustum-culling arithmetic, chunk decimation, and the render engine's backend probe |
+| e2e (32) | `run test:e2e` | A real browser against a real service: import → list → preview (with `?engine=webgl2`), the workspace (draw a route, watch it plan, pick a candidate, submit, read the result), the map menu, the touch gestures, a refused route point, the whole simulation slice (trajectory, sensors, audit against a second run, OMF round-trip, batch sweep), the shell's theme and language, one engine across views, and frustum culling (a culled map draws the same ground as an unculled one, panning never empties the view, the culler engages and is bounded) |
 | fuzz (6) | `run test:fuzz` | Seeded random input: random bytes as an image, a truncated or bit-flipped image, random job bodies, absurd path parameters, and the persisted-state guards |
 | monkey (3) | `run test:monkey` | Seeded random operation sequences over the stores and the interface, asserting no console error, no unhandled rejection and no failed request outside the expected set |
 
 The browser lanes talk to the service at `OUREALIS_SERVICE_URL` (default
 `http://127.0.0.1:8080`), which they build and start themselves for `test:e2e`.
+
+A rendering feature that can make the map look wrong is only shippable if it can be
+switched off on its own, so the two performance switches are also the two test fixtures:
+`?nocull=1` draws the map as it was before culling and `?nolod=1` as it was before
+decimation. Every assertion about one of them is made against the other as the baseline,
+which is what makes "it looks the same" a measurement rather than an impression.
 
 ## Conventions
 
