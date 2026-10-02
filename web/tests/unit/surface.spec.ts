@@ -10,12 +10,10 @@
  */
 import { expect, test } from '@playwright/test'
 import {
-  BUILDING_COLOUR,
   SHADE_RANGE,
   SLAB_FLOOR_SHADE,
   SLAB_WALL_SHADE,
   autoTerraceStep,
-  buildingShade,
   cavityShade,
   slabThickness,
   slopeAccent,
@@ -121,17 +119,6 @@ test.describe('shading', () => {
     }
   })
 
-  test('a block is white and still readable as a volume', () => {
-    // The two properties that make a footprint look like a model rather than a cutout: it
-    // is bright whichever way it faces, and it is not the same brightness on every face.
-    const sun = sunDirection()
-    const lit = buildingShade([sun[0], sun[1], sun[2]], sun)
-    const shadowed = buildingShade([-sun[0], -sun[1], -sun[2]], sun)
-    expect(shadowed).toBeGreaterThan(0.75)
-    expect(lit).toBeGreaterThan(shadowed)
-    expect(lit).toBeLessThanOrEqual(1)
-  })
-
   test('the sun vector is a unit vector whatever the azimuth', () => {
     for (const azimuth of [0, 45, 90, 180, 270, 359]) {
       const [x, y, z] = sunDirection(azimuth, 52)
@@ -179,21 +166,6 @@ test.describe('shading', () => {
     expect(dark.length).toBe(light.length)
   })
 
-  test('a building vertex takes the near-white block colour, not the ramp', () => {
-    // Two vertices at the same height and shade: the masked one is the block a navigation
-    // display draws, the other keeps the ramp. A masked vertex is deliberately unaffected by
-    // the ramp, which is the whole point — a footprint is a volume, not a height reading.
-    const input = new Float32Array([1, 1, 1, 1])
-    const plain = terrainColours(input, TERRAIN_RAMP)
-    const masked = terrainColours(input, TERRAIN_RAMP, new Float32Array([1, 0]))
-    expect(masked[0]).toBeCloseTo(BUILDING_COLOUR[0] / 255, 6)
-    expect(masked[0]).not.toBeCloseTo(plain[0] ?? 0, 6)
-    expect(masked[4]).toBeCloseTo(plain[4] ?? 0, 6)
-    // The shade still applies, so two faces of the same block stay distinguishable.
-    const shaded = terrainColours(new Float32Array([1, 0.5]), TERRAIN_RAMP, new Float32Array([1]))
-    expect(shaded[0]).toBeCloseTo((BUILDING_COLOUR[0] / 255) * 0.5, 6)
-  })
-
   test('the automatic terrace step is a round number that fits the relief', () => {
     // A dozen levels across the relief, rounded up to one, two or five times a power of
     // ten: an 11 m campus gets 1 m steps, a 100 m valley gets 10 m ones.
@@ -204,21 +176,23 @@ test.describe('shading', () => {
   })
 })
 
-/** Coverage a cell on the very edge of a footprint carries. */
-const PARTIAL = 0.3
-
-/** A ground that rises four metres a cell, so the terrain's steep-face term engages. */
-function slopedGround(i: number, _j: number): number {
-  return i * 4
+/** A field with one raised cell at (2, 2), the footprint the flatten test builds. */
+function footprintField(i: number, j: number): number {
+  return i === 2 && j === 2 ? 20 : 10
 }
 
-/** The per-vertex shading factors a mesh carries. */
-function shadesOf(mesh: { rampInput: Float32Array }): number[] {
-  const out: number[] = []
-  for (let vertex = 0; vertex < mesh.rampInput.length / 2; vertex += 1) {
-    out.push(mesh.rampInput[vertex * 2 + 1] ?? 0)
-  }
-  return out
+/** Mask reader that marks that one cell as built. */
+function isFootprintCell(i: number, j: number): number {
+  return i === 2 && j === 2 ? 1 : 0
+}
+
+/** Height of one vertex of a built mesh. */
+function vertexHeight(
+  mesh: { positions: Float32Array; grid: { columns: number } },
+  i: number,
+  j: number,
+): number {
+  return mesh.positions[(j * mesh.grid.columns + i) * 3 + 1] ?? 0
 }
 
 test.describe('chunk meshes', () => {
@@ -349,60 +323,18 @@ test.describe('chunk meshes', () => {
     }
   })
 
-  test('a chunk carries the building mask when the caller supplies one, and nothing when not', () => {
-    const grid = gridOf([4, 4])
-    const spec = chunkGrid(grid, 4, 0, 0)
-    const plain = buildChunkMesh(spec, () => 7)
-    expect(plain.building).toBeUndefined()
-
-    const mesh = buildChunkMesh(spec, () => 7, { building: (i, j) => (i === 1 && j === 1 ? 1 : 0) })
-    expect(mesh.building).toHaveLength(mesh.positions.length / 3)
-    // The single built cell and the ring around it, because the mask is dilated before it
-    // becomes a colour: the vertices at the foot of a wall have to count as building or the
-    // lower half of every wall interpolates back towards the ground it stands on.
-    const built = [...(mesh.building ?? [])].filter((value) => value === 1).length
-    expect(built).toBe(9)
-  })
-
-  test('a footprint edge is a gradient, not a step, so it does not read as torn', () => {
+  test('a footprint is flattened to its high-water mark, and nothing else changes', () => {
     const spec = chunkGrid(gridOf([6, 6]), 6, 0, 0)
-    // A half-covered cell is what a coarse level of the pyramid carries at a footprint's
-    // boundary. Read as a yes or no it snaps to the drawn grid, which is the ragged edge
-    // this asserts against; carried as a weight it lands between the two colours.
-    const mesh = buildChunkMesh(spec, () => 7, { building: () => PARTIAL })
-    const weights = [...(mesh.building ?? [])]
-    expect(weights.every((value) => value > 0 && value < 1)).toBe(true)
-
-    const t = 0.5
-    const shaded = new Float32Array([t, 1, t, 1])
-    const plain = terrainColours(new Float32Array([t, 1]), TERRAIN_RAMP)
-    const ramp = plain[0] ?? 0
-    const block = BUILDING_COLOUR[0] / 255
-    const mixed = terrainColours(shaded, TERRAIN_RAMP, new Float32Array([0.5, 1]))
-    // Half built: strictly between the two, which a threshold could never produce.
-    expect(mixed[0] ?? 0).toBeGreaterThan(Math.min(ramp, block))
-    expect(mixed[0] ?? 0).toBeLessThan(Math.max(ramp, block))
-    expect(mixed[0] ?? 0).toBeGreaterThan(Math.min(ramp, block))
-    expect(mixed[0] ?? 0).toBeLessThan(Math.max(ramp, block))
-    // Fully built: the block itself, untouched by the ramp.
-    expect(mixed[4] ?? 0).toBeCloseTo(block, 5)
-  })
-
-  test('a building vertex is shaded as a block, not as the ground it stands on', () => {
-    // The terrain's own two terms darken a steep face and a hollow, and a wall is both, so
-    // a footprint shaded by them comes out a grey crust rather than a white model. A slope
-    // is what makes the difference visible: on flat ground the terrain shade is uniform.
-    const spec = chunkGrid(gridOf([8, 8]), 8, 0, 0)
-    const built = buildChunkMesh(spec, slopedGround, { building: () => 1 })
-    const ground = buildChunkMesh(spec, slopedGround)
-    const buildingShades = shadesOf(built)
-    const groundShades = shadesOf(ground)
-    // The block's own narrow band: bright enough to be white, varied enough to read as a
-    // volume. The terrain beside it goes darker than the block ever does.
-    expect(Math.min(...buildingShades)).toBeGreaterThanOrEqual(0.8)
-    expect(Math.max(...buildingShades)).toBeLessThanOrEqual(1)
-    expect(Math.min(...groundShades)).toBeLessThan(Math.min(...buildingShades))
-    expect(Math.max(...groundShades)).toBeGreaterThan(Math.max(...buildingShades))
+    const plain = buildChunkMesh(spec, footprintField)
+    const built = buildChunkMesh(spec, footprintField, { building: isFootprintCell })
+    // The footprint cell stands on its own roof, because the height field under a block is
+    // a plateau — the block's walls are separate geometry now, but the ground under it must
+    // not poke a mesa through the prism.
+    expect(vertexHeight(built, 2, 2)).toBe(20)
+    // The corner is untouched ground, mask or no mask.
+    expect(vertexHeight(built, 0, 0)).toBeCloseTo(10, 5)
+    expect(vertexHeight(plain, 2, 2)).toBe(20)
+    expect(vertexHeight(plain, 0, 0)).toBeCloseTo(10, 5)
   })
 
   test('the slab under a chunk is shaded below the surface it carries', () => {
@@ -484,7 +416,7 @@ test.describe('surface style', () => {
   test('the style carries no appearance, so switching it rebuilds nothing', () => {
     // The key is what a view watches to decide a rebuild. It holds the values that move
     // vertices and nothing else, so a light/dark switch cannot appear in it.
-    expect(surfaceKey(base)).toBe(JSON.stringify([0, 10, 1, 315, null]))
+    expect(surfaceKey(base)).toBe(JSON.stringify([0, 10, 1]))
     expect('ramp' in surfaceStyle(base)).toBe(false)
   })
 })

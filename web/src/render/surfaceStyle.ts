@@ -14,7 +14,7 @@
  * Pure: the inputs are values, not stores, so the mapping from a viewport parameter to a
  * mesh option can be tested without a canvas.
  */
-import { autoTerraceStep, slabThickness, sunDirection } from './shading'
+import { autoTerraceStep, slabThickness } from './shading'
 import type { ChunkMeshOptions } from './terrainMesh'
 
 /** Inputs of {@link surfaceStyle}, as the viewport holds them. */
@@ -47,18 +47,20 @@ export function surfaceStyle(input: SurfaceStyleInput): ChunkMeshOptions {
   return {
     range: input.range ?? undefined,
     terraceM: effectiveTerraceStep(input),
-    sun: sunDirection(input.sunAzimuthDeg, input.sunElevationDeg),
     slabFloorY: slabFloorOf(input),
   }
 }
 
-/** Identity of a style, so a view can rebuild only when a baked value changed. */
+/**
+ * Identity of a style, so a view can rebuild only when a baked value changed.
+ *
+ * The sun is deliberately absent: it no longer bakes into the surface — the scene's light
+ * shades it per fragment — so turning the sun round is a light change, not a rebuild.
+ */
 export function surfaceKey(input: SurfaceStyleInput): string {
   return JSON.stringify([
     input.range?.min ?? null,
     input.range?.max ?? null,
     effectiveTerraceStep(input),
-    input.sunAzimuthDeg,
-    input.sunElevationDeg ?? null,
   ])
 }

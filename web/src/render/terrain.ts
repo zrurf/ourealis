@@ -101,7 +101,7 @@ export class TerrainLayer {
     for (const [mesh, data] of this.meshData) {
       mesh.updateVerticesData(
         VertexBuffer.ColorKind,
-        terrainColours(data.rampInput, ramp, data.building),
+        terrainColours(data.rampInput, ramp),
       )
     }
   }
@@ -199,7 +199,7 @@ export class TerrainLayer {
     vertexData.positions = data.positions
     vertexData.indices = data.indices
     vertexData.normals = data.normals
-    vertexData.colors = terrainColours(data.rampInput, this.ramp, data.building)
+    vertexData.colors = terrainColours(data.rampInput, this.ramp)
     vertexData.uvs = data.uvs
     // Updatable: a light/dark switch rewrites the colour buffer in place rather than
     // rebuilding a mesh whose geometry did not change.

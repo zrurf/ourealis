@@ -47,6 +47,7 @@ import {
   syncOverlays,
 } from '@/render/overlaySync'
 import { buildChunkMesh, chunkGrid, type ChunkMeshData } from '@/render/terrainMesh'
+import { BuildingLayer, buildChunkBuildings } from '@/render/buildingLayer'
 import { createCellSampler } from '@/render/cellSampler'
 import { LayerOverlay } from '@/render/layers'
 import { drapedMesh, layerTextureData, texelsPerCell } from '@/render/layerTexture'
@@ -142,6 +143,7 @@ const surfaceRange = ref<{ min: number; max: number } | null>(null)
 let scene: MapScene | null = null
 let lease: SceneLease | null = null
 let terrain: TerrainLayer | null = null
+let buildings: BuildingLayer | null = null
 let culler: ChunkCuller | null = null
 /** Publishes what the culler decided; cleared with the scene it belongs to. */
 let cullingReport: ReturnType<typeof setInterval> | null = null
@@ -486,18 +488,31 @@ function rebuildSurface(): void {
   })
   const style = surfaceStyle(styleInput())
   current.clear()
+  buildings?.clear()
   terrainData.clear()
   for (const key of terrainChunks) {
     if (maps.chunkOf(key) === null) {
       continue
     }
     const chunkId = Number(key.split('/')[2])
-    const data = buildChunkMesh(chunkGrid(grid, cells, level, chunkId, origin), sample, {
+    const spec = chunkGrid(grid, cells, level, chunkId, origin)
+    const data = buildChunkMesh(spec, sample, {
       ...style,
       building,
     })
     terrainData.set(key, data)
     current.setChunk(key, data)
+    // The block that stands on the footprint, extruded from the mask so the campus reads
+    // as straight-walled volumes rather than as a staircase of flattened cells.
+    const prisms = buildChunkBuildings({
+      spec,
+      building,
+      elevation: sample,
+      terraceM: style.terraceM ?? 0,
+    })
+    if (prisms !== null) {
+      buildings?.setChunk(key, prisms)
+    }
   }
   // The drape rides on the surface's own vertices, so it is rebuilt with the surface it
   // covers rather than kept across a geometry change.
@@ -761,6 +776,7 @@ async function startScene(): Promise<void> {
   lease = borrowing
   scene = borrowing.scene
   terrain = new TerrainLayer(scene.scene, scene)
+  buildings = new BuildingLayer(scene.scene, scene)
   culler = new ChunkCuller(scene.scene, scene)
   if (cullingEnabled()) {
     culler.start()
@@ -1260,6 +1276,8 @@ function stopScene(): void {
   culler = null
   terrain?.dispose()
   terrain = null
+  buildings?.dispose()
+  buildings = null
   lease?.release()
   lease = null
   scene = null

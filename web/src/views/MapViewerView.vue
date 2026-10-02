@@ -60,6 +60,7 @@ import { ChunkCuller } from '@/render/chunkCuller'
 import { decimateIndices } from '@/render/chunkLod'
 import { TerrainLayer } from '@/render/terrain'
 import { buildChunkMesh, chunkGrid, type ChunkMeshData } from '@/render/terrainMesh'
+import { BuildingLayer, buildChunkBuildings } from '@/render/buildingLayer'
 import { createCellSampler, type CellSampler } from '@/render/cellSampler'
 import { cellReport, createSurfaceSampler, type CellReport } from '@/render/inspect'
 import {
@@ -176,6 +177,7 @@ const surfaceRange = computed(() => channelRange(metadata.value?.global_stats, L
 let scene: MapScene | null = null
 let lease: SceneLease | null = null
 let terrain: TerrainLayer | null = null
+let buildings: BuildingLayer | null = null
 let culler: ChunkCuller | null = null
 /** Publishes what the culler decided; cleared with the scene it belongs to. */
 let cullingReport: ReturnType<typeof setInterval> | null = null
@@ -459,6 +461,7 @@ onMounted(async () => {
   lease = borrowing
   scene = borrowing.scene
   terrain = new TerrainLayer(scene.scene, scene)
+  buildings = new BuildingLayer(scene.scene, scene)
   // Chunks out of view are switched off rather than submitted every frame. The culler
   // only ever touches the surface's own meshes, and `?nocull=1` turns it off entirely.
   culler = new ChunkCuller(scene.scene, scene)
@@ -586,6 +589,8 @@ onBeforeUnmount(() => {
   culler?.stop()
   culler = null
   terrain?.dispose()
+  buildings?.dispose()
+  buildings = null
   drapes?.dispose()
   overlays?.dispose()
   arrows?.dispose()
@@ -711,6 +716,7 @@ function nextFrame(): Promise<void> {
 /** Drops the surface so the next pass rebuilds it from the cached chunks. */
 function dropSurface(): void {
   terrain?.clear()
+  buildings?.clear()
   terrainData.clear()
   drapes?.clear()
   drapedChunks.clear()
@@ -960,11 +966,8 @@ async function buildTerrain(
     if (maps.chunkOf(key) === null || terrainData.has(key)) {
       continue
     }
-    const data = buildChunkMesh(
-      chunkGrid(grid, chunkSize, target.level, target.chunkId, origin),
-      sample,
-      { ...surfaceStyle.value, building },
-    )
+    const spec = chunkGrid(grid, chunkSize, target.level, target.chunkId, origin)
+    const data = buildChunkMesh(spec, sample, { ...surfaceStyle.value, building })
     if (decimate < 1) {
       // Index-only, so the normals, the colours and the texture coordinates the mesh was
       // just built with all stay valid and this is still the same surface.
@@ -973,6 +976,17 @@ async function buildTerrain(
     }
     terrainData.set(key, data)
     manager.setChunk(key, data)
+    // The block that stands on the footprint — real geometry, so its walls are straight
+    // where the height field's are a staircase of cells.
+    const prisms = buildChunkBuildings({
+      spec,
+      building,
+      elevation: sample,
+      terraceM: surfaceStyle.value.terraceM ?? 0,
+    })
+    if (prisms !== null) {
+      buildings?.setChunk(key, prisms)
+    }
     built += 1
     if (built % STREAM_BATCH === 0) {
       // oxlint-disable-next-line no-await-in-loop

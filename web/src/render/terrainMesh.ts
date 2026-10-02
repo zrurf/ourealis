@@ -37,10 +37,8 @@ import type { CellSampler } from './cellSampler'
 import {
   SLAB_FLOOR_SHADE,
   SLAB_WALL_SHADE,
-  buildingShade,
   cavityShade,
   slopeAccent,
-  sunDirection,
   terrace,
 } from './shading'
 
@@ -64,20 +62,6 @@ export interface MeshData {
    * on its own is not rescaled into a different range than its neighbours.
    */
   rampInput: Float32Array
-  /**
-   * How far each vertex is a building, `1` on a footprint and `0` on bare ground.
-   *
-   * Present only when the caller supplied a mask: a surface drawn from elevation alone has
-   * nothing to say about buildings. A *fraction* rather than a flag, because a hard boundary
-   * is what made a footprint's edge look torn: the mask steps by one cell, so a threshold
-   * turns a straight wall into a staircase of cells and the anti-aliasing the rasteriser
-   * would have given it is thrown away. The colours blend across this instead.
-   *
-   * It is dilated by one cell before it gets here, so the vertices at the foot of a wall
-   * count as building too — otherwise the lower half of every wall interpolates towards the
-   * ground it stands on and a building keeps the terrain's own colour at its base.
-   */
-  building?: Float32Array
   /**
    * Texture coordinates in *world space*, one period per metre count.
    *
@@ -160,8 +144,6 @@ export interface ChunkMeshOptions {
   range?: { min: number; max: number }
   /** Terrace step, metres; `0` leaves the surface as surveyed. */
   terraceM?: number
-  /** Direction the sun comes from; see `render/shading.ts`. */
-  sun?: readonly [number, number, number]
   /** World height of the slab's underside, metres; the range minimum by default. */
   slabFloorY?: number
   /**
@@ -260,16 +242,13 @@ export function buildChunkMesh(
 
   const normals = heightFieldNormals(positions, columns, rows, cell)
   const range = options.range ?? surfaceRange(heights)
-  const sun = options.sun ?? sunDirection()
-  // Built before the shading because the shading of a footprint is not the shading of the
-  // ground it stands on: a wall is near-vertical, so the terrain's own steep-face and
-  // hollow terms darken it into a grey crust, which is what a map full of buildings looked
-  // like it was covered in.
+  // The footprints are flattened so the height field under each block is a plateau rather
+  // than a mesa; the block itself — its colour and its walls — is separate geometry, built
+  // by `render/buildings.ts`, and the terrain stays ground everywhere it is visible.
   const mask = options.building === undefined ? undefined : buildingMask(spec, options.building)
   if (mask !== null && mask !== undefined) {
     flattenFootprints(heights, mask.coverage, columns, rows)
   }
-  const building = mask?.weight
   // Shading is applied here rather than by the material: the ramp spans the surface, not
   // the chunk, so a chunk drawn on its own is not rescaled into a different range than its
   // neighbours.
@@ -293,10 +272,8 @@ export function buildChunkMesh(
       const ground =
         slopeAccent(normal[1]) *
         cavityShade(relativeDepth(heights, columns, rows, column, row, cell))
-      const onBuilding = building?.[vertex] ?? 0
       rampInput[vertex * 2] = normalize(heights[vertex] ?? 0, range.min, range.max)
-      rampInput[vertex * 2 + 1] =
-        onBuilding <= 0 ? ground : ground + (buildingShade(normal, sun) - ground) * onBuilding
+      rampInput[vertex * 2 + 1] = ground
     }
   }
 
@@ -306,7 +283,6 @@ export function buildChunkMesh(
     normals,
     rampInput,
     uvs,
-    building,
     grid: { columns, rows },
     slab: buildSlab({
       minX: originX,
@@ -346,46 +322,16 @@ function cellHeight(spec: ChunkGrid, sample: CellSampler, column: number, row: n
   return sample(i, j) ?? 0
 }
 
-/**
- * How far each vertex of the mesh is a building, as a blend weight.
- *
- * The mask is box-averaged up the LOD pyramid, so a coarse level carries *coverage* — the
- * share of each cell a footprint covers — and that fraction is the useful part. Reading it as
- * a yes or no at one half throws away the only sub-cell information the format has, and the
- * result is the ragged outline this replaces: neighbouring vertices either side of the
- * threshold flip between white and grey along the drawn grid rather than following the wall.
- *
- * Two passes, and both are needed:
- *
- * - a **dilate** by one cell, so the vertices at the foot of a wall count as building. Without
- *   it the wall's lowest vertices are ground vertices, and since a quad's colour interpolates
- *   between its corners, every wall fades from white at the roof to the terrain's own colour
- *   at its base.
- * - a **smoothstep** over the dilated coverage, so the boundary between footprint and ground
- *   is a soft band a cell or two wide instead of a step. That band is what makes a straight
- *   wall read as straight from a distance; the geometry underneath is still a staircase of
- *   cells, and no colouring can change that, but the eye reads the colour.
- *
- * A map whose elevation layer has no mask channel reads `null` throughout and comes back all
- * zeros, which leaves the whole surface coloured by the ramp as before.
- */
-/** The two readings of the building mask a mesh needs. */
+/** The building mask a mesh reads: how much of each cell a footprint covers. */
 export interface BuildingMask {
   /**
-   * Raw coverage per vertex, `0` to `1`.
+   * Coverage per vertex, `0` to `1`.
    *
    * The footprint itself. This is what decides *which cells belong to the building*, and so
-   * which of them take the block's own height.
+   * which of them take the block's own flattened height. A map whose elevation layer has no
+   * mask channel reads `null` throughout and comes back all zeros.
    */
   coverage: Float32Array
-  /**
-   * The same field dilated by one cell and softened, `0` to `1`.
-   *
-   * What decides *how much a vertex is coloured as a building*, which is a wider set than
-   * the footprint: the ring of ground vertices around it has to be white too, or the lower
-   * half of every wall interpolates back towards the terrain it stands on.
-   */
-  weight: Float32Array
 }
 
 export function buildingMask(spec: ChunkGrid, sample: CellSampler): BuildingMask {
@@ -398,65 +344,9 @@ export function buildingMask(spec: ChunkGrid, sample: CellSampler): BuildingMask
       coverage[row * columns + column] = value === null ? 0 : Math.min(1, Math.max(0, value))
     }
   }
-  const weight = new Float32Array(columns * rows)
-  for (let row = 0; row < rows; row += 1) {
-    for (let column = 0; column < columns; column += 1) {
-      let spread = 0
-      for (let dy = -1; dy <= 1; dy += 1) {
-        for (let dx = -1; dx <= 1; dx += 1) {
-          const x = column + dx
-          const y = row + dy
-          // Outside the mesh there is no neighbour to spread from; the chunk's own cells
-          // decide, and the neighbouring chunk dilates across the seam on its own side.
-          if (x < 0 || y < 0 || x >= columns || y >= rows) {
-            continue
-          }
-          const value = coverage[y * columns + x] ?? 0
-          if (value > spread) {
-            spread = value
-          }
-        }
-      }
-      weight[row * columns + column] = smoothstep(BUILDING_EDGE_FROM, BUILDING_EDGE_TO, spread)
-    }
-  }
-  return { coverage, weight }
+  return { coverage }
 }
 
-/**
- * Coverage at which a cell starts to read as built, and at which it is fully built.
- *
- * The band is narrow on purpose, and what it trades against is worth being explicit about.
- * A wide band gives a softer edge, and it also drags the *foot* of every wall halfway back
- * towards the terrain's own colour, because at a coarse level the cells along a footprint's
- * edge carry partial coverage — that is exactly what the pyramid leaves there. The result
- * is a building with a white roof and a dark, terrain-coloured skirt, which is the thing
- * this mask exists to prevent. A narrow band keeps the feather for the cells that are
- * genuinely half covered and gives the rest to the block.
- *
- * The low edge is well under a half because the mask is dilated before it gets here: a cell
- * inside a footprint's rim has already taken the maximum of its neighbours, so the
- * threshold lands on the ground beside the building rather than under it.
- */
-const BUILDING_EDGE_FROM = 0.2
-const BUILDING_EDGE_TO = 0.45
-
-/**
- * Gives every footprint one height: the highest its own cells reach.
- *
- * A building is a box. The height field is not obliged to store one, and above the finest
- * level it does not: a footprint's edge cells are an average of building and ground, so a
- * nine-metre block arrives as a four-and-a-half-metre rim around a nine-metre middle. Drawn
- * as it stands that is a mesa — a flat top, a sloping shelf, and a sloping shelf again at
- * the next level down — and a mesa's sides are *slopes*, so they take a slope's shading and
- * a slope's silhouette. That is what makes a campus of them look like melted wax rather
- * than like blocks, and no colouring can repair it.
- *
- * Levelling the footprint to its own high-water mark turns the shelf into a wall: the rim
- * cell and its neighbour inside are now the same height, and the only remaining step is the
- * one between the footprint and the ground beside it. The step is a single cell wide and as
- * tall as the building, which is a wall as far as the eye and the shadow map are concerned.
- */
 function flattenFootprints(
   heights: Float32Array,
   coverage: Float32Array,
@@ -507,15 +397,6 @@ const FOOTPRINT_INTERIOR = 0.5
  * a level and the one above it.
  */
 const FOOTPRINT_REACH = 2
-
-/** Hermite ramp from 0 to 1 between two edges, flat at both ends. */
-function smoothstep(from: number, to: number, value: number): number {
-  if (!(to > from)) {
-    return value >= to ? 1 : 0
-  }
-  const t = Math.min(1, Math.max(0, (value - from) / (to - from)))
-  return t * t * (3 - 2 * t)
-}
 
 /**
  * Which sides of a chunk are the map's rim.
@@ -823,4 +704,45 @@ export function elevationRange(mesh: ChunkMeshData): { min: number; max: number 
     max = Math.max(max, value)
   }
   return min === Number.POSITIVE_INFINITY ? { min: 0, max: 0 } : { min, max }
+}
+
+/**
+ * The height the surface *draws* at a map position, from the meshes already built.
+ *
+ * The drawn mesh differs from the raw cells in two ways a reader can see a line cross:
+ * terracing quantises every height to a step, and a building footprint is flattened to its
+ * roof — so a track draped on raw cells dives under the drawn roof and vanishes. Reading
+ * the mesh's own vertex grid and interpolating across its quads gives the height the
+ * reader's eye compares against.
+ *
+ * The parts tile the map, so the sampler walks them per query; a caller that redraws on
+ * chunk arrival rebuilds the sampler the same way it rebuilds its mesh cache.
+ */
+export function drawnSurfaceSampler(
+  parts: Iterable<{ spec: ChunkGrid; mesh: MeshData }>,
+): (x: number, y: number) => number | null {
+  const fields = [...parts]
+  return (x: number, y: number): number | null => {
+    for (const { spec, mesh } of fields) {
+      const { columns, rows, cell, originX, originY } = spec
+      const fx = (x - originX) / cell - 0.5
+      const fy = (y - originY) / cell - 0.5
+      if (fx < -0.5 || fy < -0.5 || fx > columns - 0.5 || fy > rows - 0.5) {
+        continue
+      }
+      const i0 = Math.min(columns - 1, Math.max(0, Math.floor(fx)))
+      const j0 = Math.min(rows - 1, Math.max(0, Math.floor(fy)))
+      const i1 = Math.min(columns - 1, i0 + 1)
+      const j1 = Math.min(rows - 1, j0 + 1)
+      const tx = Math.min(1, Math.max(0, fx - i0))
+      const ty = Math.min(1, Math.max(0, fy - j0))
+      const at = (column: number, row: number): number =>
+        mesh.positions[(row * columns + column) * 3 + 1] ?? 0
+      const top = at(i0, j0) * (1 - tx) + at(i1, j0) * tx
+      const bottom = at(i0, j1) * (1 - tx) + at(i1, j1) * tx
+      const height = top * (1 - ty) + bottom * ty
+      return Number.isFinite(height) ? height : null
+    }
+    return null
+  }
 }

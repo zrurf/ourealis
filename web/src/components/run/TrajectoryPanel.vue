@@ -15,17 +15,29 @@ import { api } from '@/api/client'
 import { isApiError } from '@/api/errors'
 import { JobSocket } from '@/api/ws'
 import type { ChunkRef } from '@/api/maps'
-import { LAYER_ELEVATION, chunkKey, levelCellSize, selectLevel } from '@/types/map'
+import {
+  LAYER_ELEVATION,
+  chunkKey,
+  drapeSourceLevel,
+  flagColour,
+  levelCellSize,
+  selectLevel,
+} from '@/types/map'
 import type { TruthSample } from '@/types/result'
 import { engineFromQuery, probeEngine } from '@/render/engine'
 import { updateDebug } from '@/render/scene'
 import { renderHost, type SceneLease } from '@/render/host'
 import type { MapScene } from '@/render/scene'
 import { TerrainLayer } from '@/render/terrain'
-import { buildChunkMesh, chunkGrid } from '@/render/terrainMesh'
+import { buildChunkMesh, chunkGrid, drawnSurfaceSampler, type ChunkGrid, type ChunkMeshData } from '@/render/terrainMesh'
+import { BuildingLayer, buildChunkBuildings } from '@/render/buildingLayer'
 import { createCellSampler } from '@/render/cellSampler'
+import { LayerOverlay, drapedMesh, layerTextureData } from '@/render/layers'
+import { texelsPerCell } from '@/render/layerTexture'
+import { featureDimensions, layerSurfacePlan } from '@/render/surfaces'
+import { metresPerPixelAt } from '@/render/pan'
 import { TrajectoryLine, sampleTrajectory, type TrajectoryChannel } from '@/render/trajectory'
-import { meshSurfaceSampler, type SurfaceHeight } from '@/render/drape'
+import type { SurfaceHeight } from '@/render/drape'
 import EChart from '@/components/charts/EChart.vue'
 import { lineOption } from '@/components/charts/options/line'
 import ChannelPicker from '@/components/trajectory/ChannelPicker.vue'
@@ -53,6 +65,12 @@ const TARGET_METRES_PER_PIXEL = 2
  */
 const TRAJECTORY_LIFT_M = 0.25
 
+/** Height the ground-material drape is lifted above the terrain, metres. */
+const DRAPE_LIFT_M = 0.05
+
+/** Drapes built before the frame loop is yielded to, so a whole-map drape does not stall. */
+const DRAPE_BATCH = 16
+
 const props = defineProps<{ jobId: string }>()
 
 const { t, locale } = useI18n({ useScope: 'global' })
@@ -71,6 +89,8 @@ const failure = ref<string | null>(null)
 let scene: MapScene | null = null
 let lease: SceneLease | null = null
 let terrain: TerrainLayer | null = null
+let buildings: BuildingLayer | null = null
+let drapes: LayerOverlay | null = null
 let surface: SurfaceHeight | null = null
 let line: TrajectoryLine | null = null
 let frame: number | null = null
@@ -407,6 +427,8 @@ async function startScene(): Promise<void> {
   lease = borrowing
   scene = borrowing.scene
   terrain = new TerrainLayer(scene.scene, scene)
+  buildings = new BuildingLayer(scene.scene, scene)
+  drapes = new LayerOverlay(scene.scene, scene)
   line = new TrajectoryLine(scene.scene)
   updateDebug({
     engine: probe.backend,
@@ -422,7 +444,14 @@ async function startScene(): Promise<void> {
   redraw()
 }
 
-/** Loads the map's elevation chunks once, at a level the whole extent fits. */
+/** Chunk mesh data per loaded terrain chunk, so the drape can reuse the surface geometry. */
+/** Chunk geometry per loaded terrain chunk, so the drape and the surface sampler reuse it. */
+const terrainData = new Map<string, { spec: ChunkGrid; mesh: ChunkMeshData }>()
+
+/**
+ * Loads the map's elevation chunks once, at a level the whole extent fits, and drapes the
+ * map's own ground materials over them.
+ */
 async function loadSurface(): Promise<void> {
   const mapId = simulations.current?.map_id ?? ''
   if (mapId === '' || scene === null || terrain === null) {
@@ -472,25 +501,132 @@ async function loadSurface(): Promise<void> {
       if (maps.chunkOf(key) === null) {
         continue
       }
-      terrain.setChunk(
-        key,
-        buildChunkMesh(
-          chunkGrid(grid, info.summary.chunk_size, level, chunkRef.chunkId, maps.originOf(mapId)),
-          sample,
-          { building },
-        ),
+      const spec = chunkGrid(
+        grid,
+        info.summary.chunk_size,
+        level,
+        chunkRef.chunkId,
+        maps.originOf(mapId),
       )
+      const data = buildChunkMesh(spec, sample, { building })
+      terrainData.set(key, { spec, mesh: data })
+      terrain.setChunk(key, data)
+      // The block that stands on the footprint: the flattened height field draws the roof,
+      // the prism draws the walls, and the two together are the white model.
+      const prisms = buildChunkBuildings({ spec, building, elevation: sample, terraceM: 0 })
+      if (prisms !== null) {
+        buildings?.setChunk(key, prisms)
+      }
     }
     // One sampler for both jobs the surface height is needed for: the camera target riding
-    // the ground, and the trajectory line being held above it. It reads the height the
-    // mesh is drawn at rather than the raw cell, because a line draped on the raw cells
-    // sinks under the ramp between them and the run disappears in patches.
-    const ground = meshSurfaceSampler(sample, levelCellSize(grid, level), maps.originOf(mapId))
+    // the ground, and the trajectory line being held above it. It reads the height the mesh
+    // is *drawn* at — terraced, and flattened to a roof over a footprint — because a line
+    // placed at the raw cell's height dives under a drawn roof and disappears.
+    const ground = drawnSurfaceSampler(terrainData.values())
     scene.setGroundHeight((x, y) => ground(x, y))
     surface = ground
+    await drapeGround(info, grid, level)
   } catch (error) {
     failure.value = isApiError(error) ? error.message : t('simulation.route.surfaceFailed')
   }
+}
+
+/**
+ * Paints the map's ground materials — the feature schema's `surface_type`, shown in the
+ * layer rail as its first feature — over the drawn surface.
+ *
+ * The replay is judged against what the ground is made of, and a bare ramp says nothing:
+ * the workspace drapes this same layer for the same reason. The drape covers every terrain
+ * chunk this view built, because the surface is drawn once at a fixed level and never
+ * streams; a token guard stops a superseded pass painting from a stale chunk cache.
+ */
+async function drapeGround(
+  info: Awaited<ReturnType<typeof maps.loadMetadata>>,
+  elevationGrid: NonNullable<Awaited<ReturnType<typeof maps.loadGrid>>>,
+  level: number,
+): Promise<void> {
+  const manager = drapes
+  const mapId = simulations.current?.map_id ?? ''
+  const layerId =
+    featureDimensions(info.feature_schema).find((entry) => entry.name === 'surface_type')
+      ?.layerId ?? null
+  if (manager === null || mapId === '' || layerId === null) {
+    return
+  }
+  const layerGrid = await maps.loadGrid(mapId, layerId)
+  if (disposed || layerGrid === null) {
+    return
+  }
+  const sourceLevel = drapeSourceLevel(layerGrid, level)
+  if (sourceLevel === null) {
+    return
+  }
+  const refs: ChunkRef[] = (layerGrid.chunks[sourceLevel] ?? []).map((chunkId) => ({
+    mapId,
+    layerId,
+    level: sourceLevel,
+    chunkId,
+  }))
+  await maps.loadChunks(refs, { concurrency: 4 })
+  if (disposed) {
+    return
+  }
+  const cells = info.summary.chunk_size
+  // The layer stores its cells at its own level, which is not necessarily the level the
+  // surface is drawn at; they are read at the level this drape samples from.
+  const sample = createCellSampler({
+    chunks: maps.chunks,
+    grid: layerGrid,
+    chunkSize: cells,
+    level,
+    layerId,
+    sourceLevel,
+  })
+  const kind = info.layers.find((layer) => layer.layer_id === layerId)?.kind ?? 'raster'
+  const plan = layerSurfacePlan(layerId, kind, featureDimensions(info.feature_schema))
+  // The drape leaves footprints to the white model under it, so it needs the same mask the
+  // surface was built with.
+  const building = createCellSampler({
+    chunks: maps.chunks,
+    grid: elevationGrid,
+    chunkSize: cells,
+    level,
+    layerId: LAYER_ELEVATION,
+    channel: 1,
+  })
+  const resolution = metresPerPixelAt(
+    scene?.camera.radius ?? 1000,
+    scene?.camera.getScene().getEngine().getRenderHeight() ?? 900,
+    scene?.camera.fov ?? 0.8,
+  )
+  let built = 0
+  for (const [key, entry] of terrainData) {
+    if (disposed) {
+      return
+    }
+    manager.setChunk(
+      `${layerId}:${level}:${key}`,
+      layerTextureData(entry.spec, sample, {
+        mapping: 'material',
+        emptyAlpha: 0,
+        flag: flagColour(layerId),
+        surface: plan,
+        building,
+        texelsPerCell: texelsPerCell(plan, resolution, levelCellSize(elevationGrid, level)),
+      }),
+      drapedMesh(entry.mesh, DRAPE_LIFT_M),
+    )
+    built += 1
+    if (built % DRAPE_BATCH === 0) {
+      // oxlint-disable-next-line no-await-in-loop
+      await nextFrame()
+    }
+  }
+}
+
+/** Resolves on the next animation frame, so the renderer draws between drape batches. */
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()))
 }
 
 /** Redraws the trajectory line for the current channel and sample count. */
@@ -529,7 +665,7 @@ function syncProgress(): void {
   line.setProgress(reached)
 }
 
-/** Moves the marker to the playhead, orienting it by the sample's own attitude. */
+/** Moves the marker to the playhead; a flat navigation arrow turns with the heading alone. */
 function syncMarker(): void {
   const sample = current.value
   if (sample === null || line === null) {
@@ -543,11 +679,7 @@ function syncMarker(): void {
       z: sample.z,
       value: sample.speed,
     },
-    {
-      heading_rad: sample.heading_rad,
-      pitch_rad: sample.pitch_rad,
-      roll_rad: sample.roll_rad,
-    },
+    { heading_rad: sample.heading_rad },
   )
 }
 
@@ -573,6 +705,11 @@ onBeforeUnmount(() => {
   }
   line?.dispose()
   terrain?.dispose()
+  buildings?.dispose()
+  buildings = null
+  drapes?.dispose()
+  drapes = null
+  terrainData.clear()
   lease?.release()
   lease = null
   scene = null

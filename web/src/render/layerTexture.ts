@@ -71,11 +71,11 @@ export interface LayerTextureOptions {
    * A building is not ground and must not be painted as ground. The drape covers the
    * surface, so a footprint left in it would show the material of the cell it stands on —
    * and worse, its lower wall vertices belong to the cells *beside* the footprint, so the
-   * foot of every building would be painted with the road or grass next to it. Cutting the
-   * footprint out of the drape is what leaves the white model underneath visible.
+   * foot of every building would be painted with the road or grass next to it. The block
+   * itself stands on that footprint; the cut keeps the drape from bleeding up its base.
    *
-   * The mask is the one the terrain itself uses, so the two agree about the boundary to
-   * the cell rather than each drawing its own approximation of it.
+   * The mask is the one the terrain itself flattens by, so the two agree about the
+   * boundary to the cell rather than each drawing its own approximation of it.
    */
   building?: CellSampler
 }
@@ -138,10 +138,10 @@ export function layerTextureData(
     options.mapping in SCALAR_RAMPS
       ? rampTable(SCALAR_RAMPS[options.mapping as keyof typeof SCALAR_RAMPS])
       : null
-  // Where the footprint is, as a weight. Multiplied into the alpha rather than tested, so
-  // the drape's edge and the white model's edge fade together instead of one stair-stepping
-  // over the other.
-  const built = options.building === undefined ? null : buildingMask(spec, options.building).weight
+  // Where the footprint is. Multiplied into the alpha rather than tested, so the drape's
+  // edge fades against the block's wall instead of stair-stepping over it.
+  const built =
+    options.building === undefined ? null : buildingMask(spec, options.building).coverage
   const hasPattern = pattern !== 'flat' || surface?.materials != null
   // A drape with a mask can always have a cut edge, so it is treated as blended from the
   // start rather than only if a cell happens to come out translucent.
